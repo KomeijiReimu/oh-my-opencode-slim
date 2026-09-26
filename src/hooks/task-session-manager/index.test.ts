@@ -19,6 +19,7 @@ import {
   type BackgroundJobTerminalGate,
   createBackgroundJobTerminalGate,
 } from '../../utils/background-job-terminal-gate';
+import { createSameProcessResumeEvidence } from '../../utils/same-process-resume-evidence';
 import { buildPluginInput } from '../../v2/client-shim';
 import {
   createPhaseReminderHook,
@@ -122,6 +123,7 @@ type HookOptions = {
   maxRetainedSnapshots?: number;
   backgroundJobBoard?: BackgroundJobBoard;
   terminalGate?: BackgroundJobTerminalGate;
+  resumeEvidence?: ReturnType<typeof createSameProcessResumeEvidence>;
   hostOutcomeClock?: 'shared-unix-ms';
   sessionStatus?: unknown;
   sessionClient?: Record<string, unknown>;
@@ -205,6 +207,7 @@ function createHook(options?: HookOptions) {
       readContextMaxFiles: options?.readContextMaxFiles,
       backgroundJobBoard: options?.backgroundJobBoard,
       terminalGate: options?.terminalGate,
+      resumeEvidence: options?.resumeEvidence,
       hostOutcomeClock: options?.hostOutcomeClock,
       backgroundJobSupervisor: options?.backgroundJobSupervisor,
       backgroundTaskConcurrency: options?.backgroundTaskConcurrency,
@@ -369,6 +372,50 @@ function recoveryFixture() {
     }),
   };
   return { index, claims, sessionClient, base, childMessages };
+}
+
+function sessionClientWithParentTaskError(
+  sessionClient: Record<string, unknown>,
+  claims: Map<string, { token: string; baseline?: ResumeClaimBaseline }>,
+  error: unknown,
+  offset = 0,
+): Record<string, unknown> {
+  const original = sessionClient.messages as (args: {
+    path: { id: string };
+  }) => Promise<{ data: unknown[] }>;
+  return {
+    ...sessionClient,
+    messages: async (args: { path: { id: string } }) => {
+      const response = await original(args);
+      if (args.path.id !== 'parent-1') return response;
+      const claimedAt =
+        claims.get('ses_recover')?.baseline?.claimedAt ?? Date.now();
+      return {
+        data: [
+          ...response.data,
+          {
+            info: {
+              role: 'assistant',
+              sessionID: 'parent-1',
+              id: 'schema-rejection',
+            },
+            parts: [
+              {
+                type: 'tool',
+                tool: 'task',
+                state: {
+                  status: 'error',
+                  input: { task_id: 'fix-1' },
+                  error,
+                  time: { end: claimedAt + offset },
+                },
+              },
+            ],
+          },
+        ],
+      };
+    },
+  };
 }
 
 function verifiedKnownHost(
@@ -2229,7 +2276,11 @@ describe('task-session-manager hook', () => {
       const { hook } = createHook({ backgroundJobBoard: board });
 
       const beforeAcknowledgement = {
-        args: { subagent_type: 'oracle', task_id: original.alias },
+        args: {
+          subagent_type: 'oracle',
+          description: `${state} review retry`,
+          task_id: original.alias,
+        },
       };
       await expect(
         hook['tool.execute.before'](
@@ -2246,7 +2297,11 @@ describe('task-session-manager hook', () => {
       board.markReconciled(original.taskID);
 
       const resume = {
-        args: { subagent_type: 'oracle', task_id: original.alias },
+        args: {
+          subagent_type: 'oracle',
+          description: `${state} review retry`,
+          task_id: original.alias,
+        },
       };
       await expect(
         hook['tool.execute.before'](
@@ -2272,7 +2327,11 @@ describe('task-session-manager hook', () => {
     const { hook } = createHook({ backgroundJobBoard: board });
 
     const beforeAcknowledgement = {
-      args: { subagent_type: 'oracle', task_id: original.alias },
+      args: {
+        subagent_type: 'oracle',
+        description: 'stopped review retry',
+        task_id: original.alias,
+      },
     };
     await expect(
       hook['tool.execute.before'](
@@ -2285,7 +2344,11 @@ describe('task-session-manager hook', () => {
     board.markReconciled(original.taskID);
 
     const afterAcknowledgement = {
-      args: { subagent_type: 'oracle', task_id: original.alias },
+      args: {
+        subagent_type: 'oracle',
+        description: 'stopped review retry',
+        task_id: original.alias,
+      },
     };
     await expect(
       hook['tool.execute.before'](
@@ -2413,7 +2476,11 @@ describe('task-session-manager hook', () => {
     for (const status of ['busy', 'retry'] as const) {
       hostStatus = status;
       const resume = {
-        args: { subagent_type: 'explorer', task_id: 'exp-1' },
+        args: {
+          subagent_type: 'explorer',
+          description: 'resume timed out session',
+          task_id: 'exp-1',
+        },
       };
       await expect(
         hook['tool.execute.before'](
@@ -2440,7 +2507,11 @@ describe('task-session-manager hook', () => {
       sessionClient: verifiedKnownHost(board, 'child-1'),
     });
     const resume = {
-      args: { subagent_type: 'oracle', task_id: 'ora-1' },
+      args: {
+        subagent_type: 'oracle',
+        description: 'resume review plan',
+        task_id: 'ora-1',
+      },
     };
 
     await hook['tool.execute.before'](
@@ -2537,7 +2608,13 @@ describe('task-session-manager hook', () => {
       identityIndex: identityIndexForBoard(board),
       sessionClient: verifiedKnownHost(board, 'child-1', 'busy'),
     });
-    const resume = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const resume = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'resume fixer task',
+        task_id: 'fix-1',
+      },
+    };
 
     await expect(
       hook['tool.execute.before'](
@@ -2703,7 +2780,13 @@ describe('task-session-manager hook', () => {
 
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'resume-error' },
-      { args: { subagent_type: 'oracle', task_id: 'ora-1' } },
+      {
+        args: {
+          subagent_type: 'oracle',
+          description: 'resume error task',
+          task_id: 'ora-1',
+        },
+      },
     );
     await hook['tool.execute.after'](
       { tool: 'task', sessionID: 'parent-1', callID: 'resume-error' },
@@ -2734,7 +2817,13 @@ describe('task-session-manager hook', () => {
 
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'resume-throw' },
-      { args: { subagent_type: 'oracle', task_id: 'ora-1' } },
+      {
+        args: {
+          subagent_type: 'oracle',
+          description: 'resume throwing task',
+          task_id: 'ora-1',
+        },
+      },
     );
     await expect(
       hook['tool.execute.after'](
@@ -2786,7 +2875,11 @@ describe('task-session-manager hook', () => {
     );
 
     const resumeBeforeLiveBusy = {
-      args: { subagent_type: 'explorer', task_id: 'ses_timeout' },
+      args: {
+        subagent_type: 'explorer',
+        description: 'resume timed out session',
+        task_id: 'ses_timeout',
+      },
     };
     await expect(
       hook['tool.execute.before'](
@@ -2811,7 +2904,11 @@ describe('task-session-manager hook', () => {
     hostBusy = true;
 
     const resumeAfterLiveBusy = {
-      args: { subagent_type: 'explorer', task_id: 'ses_timeout' },
+      args: {
+        subagent_type: 'explorer',
+        description: 'resume timed out session',
+        task_id: 'ses_timeout',
+      },
     };
     await expect(
       hook['tool.execute.before'](
@@ -5472,7 +5569,11 @@ describe('task-session-manager hook', () => {
     board.markReconciled('err-1');
 
     const unreconciled = {
-      args: { subagent_type: 'oracle', task_id: 'ora-1' },
+      args: {
+        subagent_type: 'oracle',
+        description: 'review plan retry',
+        task_id: 'ora-1',
+      },
     };
     await expect(
       hook['tool.execute.before'](
@@ -5484,7 +5585,13 @@ describe('task-session-manager hook', () => {
 
     board.markReconciled('done-1');
 
-    const failed = { args: { subagent_type: 'oracle', task_id: 'ora-2' } };
+    const failed = {
+      args: {
+        subagent_type: 'oracle',
+        description: 'bad review retry',
+        task_id: 'ora-2',
+      },
+    };
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'call-2' },
@@ -5493,7 +5600,13 @@ describe('task-session-manager hook', () => {
     ).rejects.toThrow(/fresh host evidence/);
     expect(failed.args.task_id).toBe('ora-2');
 
-    const completed = { args: { subagent_type: 'oracle', task_id: 'ora-1' } };
+    const completed = {
+      args: {
+        subagent_type: 'oracle',
+        description: 'review plan retry',
+        task_id: 'ora-1',
+      },
+    };
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'call-3' },
       completed,
@@ -5518,7 +5631,13 @@ describe('task-session-manager hook', () => {
       description: 'map hooks',
     });
 
-    const resume = { args: { subagent_type: 'explorer', task_id: 'exp-1' } };
+    const resume = {
+      args: {
+        subagent_type: 'explorer',
+        description: 'map hooks retry',
+        task_id: 'exp-1',
+      },
+    };
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'resume' },
@@ -5573,7 +5692,11 @@ describe('task-session-manager hook', () => {
   test('custom subagent unknown native task_id refuses without spawning', async () => {
     const { hook } = createHook();
     const resume = {
-      args: { subagent_type: 'repro-helper', task_id: 'ses_custom123' },
+      args: {
+        subagent_type: 'repro-helper',
+        description: 'custom task retry',
+        task_id: 'ses_custom123',
+      },
     };
 
     await expect(
@@ -5590,7 +5713,11 @@ describe('task-session-manager hook', () => {
       hasUntrackedRunningChild: async () => true,
     });
     const resume = {
-      args: { subagent_type: 'fixer', task_id: 'fix-99' },
+      args: {
+        subagent_type: 'fixer',
+        description: 'unknown task retry',
+        task_id: 'fix-99',
+      },
     };
 
     await expect(
@@ -5609,7 +5736,11 @@ describe('task-session-manager hook', () => {
       },
     });
     const resume = {
-      args: { subagent_type: 'fixer', task_id: 'fix-99' },
+      args: {
+        subagent_type: 'fixer',
+        description: 'unknown task retry',
+        task_id: 'fix-99',
+      },
     };
 
     await expect(
@@ -5638,7 +5769,11 @@ describe('task-session-manager hook', () => {
     board.markReconciled('child-1');
 
     const resume = {
-      args: { subagent_type: 'repro-helper', task_id: 'rep-1' },
+      args: {
+        subagent_type: 'repro-helper',
+        description: 'ask secret letter retry',
+        task_id: 'rep-1',
+      },
     };
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'resume' },
@@ -5660,7 +5795,13 @@ describe('task-session-manager hook', () => {
     board.updateStatus({ taskID: 'child-1', state: 'completed' });
     board.markReconciled('child-1');
 
-    const wrongAgent = { args: { subagent_type: 'oracle', task_id: 'exp-1' } };
+    const wrongAgent = {
+      args: {
+        subagent_type: 'oracle',
+        description: 'map hooks retry',
+        task_id: 'exp-1',
+      },
+    };
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'agent' },
@@ -5686,7 +5827,13 @@ describe('task-session-manager hook', () => {
     board.updateStatus({ taskID: 'child-1', state: 'completed' });
     board.markReconciled('child-1');
 
-    const resume = { args: { subagent_type: 'explorer', task_id: 'exp-1' } };
+    const resume = {
+      args: {
+        subagent_type: 'explorer',
+        description: 'map hooks retry',
+        task_id: 'exp-1',
+      },
+    };
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'resume' },
       resume,
@@ -5702,6 +5849,171 @@ describe('task-session-manager hook', () => {
       'exp-1 / child-1 / explorer / running',
     );
     expect(boardText(messages)).toContain('#### Reusable Sessions\n- none');
+  });
+
+  test('carries and accepts same-process resume evidence through task reuse', async () => {
+    const board = new BackgroundJobBoard();
+    const resumeEvidence = createSameProcessResumeEvidence();
+    const base = Date.now() - 2_000;
+    const statuslessHost = {
+      get: async () => ({
+        data: {
+          id: 'child-1',
+          parentID: 'parent-1',
+          agent: 'explorer',
+          directory: '/tmp',
+        },
+      }),
+      messages: async ({ path }: { path: { id: string } }) => ({
+        data:
+          path.id === 'parent-1'
+            ? [
+                {
+                  info: {
+                    id: 'delegation',
+                    role: 'assistant',
+                    sessionID: 'parent-1',
+                    time: { created: base },
+                  },
+                  parts: [
+                    {
+                      type: 'tool',
+                      name: 'subagent',
+                      state: {
+                        status: 'completed',
+                        input: {
+                          agent: 'explorer',
+                          background: true,
+                          description: 'map hooks',
+                        },
+                        time: { start: base, end: base + 1 },
+                        content: [
+                          {
+                            type: 'text',
+                            text: 'task_id: child-1\nstate: running',
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+                {
+                  info: {
+                    id: 'retrieval',
+                    role: 'assistant',
+                    sessionID: 'parent-1',
+                    time: { created: base + 101 },
+                  },
+                  parts: [
+                    {
+                      type: 'tool',
+                      name: 'task_result',
+                      state: {
+                        status: 'completed',
+                        input: { task_id: 'child-1' },
+                        time: { start: base + 100, end: base + 110 },
+                        content: [{ type: 'text', text: 'done' }],
+                      },
+                    },
+                  ],
+                },
+                {
+                  info: {
+                    id: 'ack',
+                    role: 'assistant',
+                    sessionID: 'parent-1',
+                    finish: 'stop',
+                    time: { created: base + 120, completed: base + 130 },
+                  },
+                  parts: [{ type: 'text', text: 'Received.' }],
+                },
+              ]
+            : [
+                {
+                  info: {
+                    id: 'child-user',
+                    role: 'user',
+                    sessionID: 'child-1',
+                    time: { created: base + 10 },
+                  },
+                  parts: [{ type: 'text', text: 'Map hooks.' }],
+                },
+                {
+                  info: {
+                    id: 'child-answer',
+                    role: 'assistant',
+                    sessionID: 'child-1',
+                    finish: 'stop',
+                    time: { created: base + 20, completed: base + 30 },
+                  },
+                  parts: [{ type: 'text', text: 'done' }],
+                },
+              ],
+      }),
+    };
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      identityIndex: identityIndexForBoard(board),
+      sessionClient: {
+        ...statuslessHost,
+        status: undefined,
+      },
+      resumeEvidence,
+    });
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'done',
+      now: base + 100,
+    });
+    board.markReconciled('child-1');
+
+    const record = board.get('child-1');
+    if (!record || record.completedAt === undefined) {
+      throw new Error('missing completed board record');
+    }
+    resumeEvidence.observeAdmission({
+      sessionID: 'child-1',
+      messageID: 'child-user',
+      createdAt: base + 10,
+    });
+    resumeEvidence.recordTerminal({
+      taskID: record.taskID,
+      parentSessionID: record.parentSessionID,
+      generation: record.generation,
+      terminalRevision: record.terminalRevision,
+      state: 'completed',
+      resultSummary: record.resultSummary ?? 'done',
+      completedAt: record.completedAt,
+    });
+    resumeEvidence.observeAdmission({
+      sessionID: 'parent-1',
+      messageID: 'parent-user-2',
+      createdAt: base + 101,
+    });
+    const resume = {
+      args: {
+        subagent_type: 'explorer',
+        description: 'map hooks retry',
+        task_id: 'exp-1',
+      },
+    };
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'resume-evidence' },
+      resume,
+    );
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'resume-evidence' },
+      { output: ['task_id: child-1', 'state: running'].join('\n') },
+    );
+
+    expect(board.get('child-1')).toMatchObject({ state: 'running' });
   });
 
   test('bare task id output without state does not create reusable job', async () => {
@@ -5766,7 +6078,13 @@ describe('task-session-manager hook', () => {
       'fix-1 / ses_child / fixer / completed, reconciled',
     );
 
-    const resume = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const resume = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'reuse foreground task',
+        task_id: 'fix-1',
+      },
+    };
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'resume-1' },
       resume,
@@ -5819,6 +6137,7 @@ describe('task-session-manager hook', () => {
     const spawn = {
       args: {
         subagent_type: 'fixer',
+        description: 'verify explicit UUID task',
         task_id: '474bd269-eac6-40a9-9408-9fe430e8cd19',
       },
     };
@@ -5835,7 +6154,13 @@ describe('task-session-manager hook', () => {
 
   test('refuses unknown reusable aliases without a persisted mapping', async () => {
     const { hook } = createHook();
-    const resume = { args: { subagent_type: 'fixer', task_id: 'fix-99' } };
+    const resume = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'unknown reusable task',
+        task_id: 'fix-99',
+      },
+    };
 
     await expect(
       hook['tool.execute.before'](
@@ -5846,6 +6171,150 @@ describe('task-session-manager hook', () => {
     expect(resume.args.task_id).toBe('fix-99');
   });
 
+  test('explicit task_id schema preflight does not inspect identity or claim', async () => {
+    const { index } = recoveryFixture();
+    const originalLookup = index.lookup.bind(index);
+    const originalClaimResume = index.claimResume.bind(index);
+    let lookups = 0;
+    let claims = 0;
+    index.lookup = ((parent: string, key: string) => {
+      lookups += 1;
+      return originalLookup(parent, key);
+    }) as typeof index.lookup;
+    index.claimResume = ((
+      parent: string,
+      taskID: string,
+      baseline?: ResumeClaimBaseline,
+    ) => {
+      claims += 1;
+      return originalClaimResume(parent, taskID, baseline);
+    }) as typeof index.claimResume;
+    const { hook } = createHook({ identityIndex: index });
+
+    for (const [callID, description] of [
+      ['missing', undefined],
+      ['non-string', 42],
+      ['blank', '   '],
+    ] as const) {
+      const args = {
+        args: {
+          subagent_type: 'fixer',
+          task_id: 'fix-46',
+          ...(description === undefined ? {} : { description }),
+        },
+      };
+      await expect(
+        hook['tool.execute.before'](
+          { tool: 'task', sessionID: 'parent-1', callID },
+          args,
+        ),
+      ).rejects.toThrow(/no new session was created/);
+      expect(args.args.task_id).toBe('fix-46');
+    }
+
+    expect(lookups).toBe(0);
+    expect(claims).toBe(0);
+  });
+
+  test('matching missing-description SchemaError settles a claim before retry', async () => {
+    const { index, claims, sessionClient } = recoveryFixture();
+    index.reserve('parent-1', 'ses_recover', 'fixer', 'fix');
+    const first = createHook({
+      identityIndex: index,
+      sessionClient,
+      backgroundJobBoard: new BackgroundJobBoard(),
+    });
+    await first.hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'schema-bad' },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'first attempt',
+          task_id: 'fix-1',
+        },
+      },
+    );
+    const firstToken = claims.get('ses_recover')?.token;
+    expect(firstToken).toBeDefined();
+
+    const retry = createHook({
+      identityIndex: index,
+      sessionClient: sessionClientWithParentTaskError(sessionClient, claims, {
+        name: 'SchemaError',
+        message: 'Missing key at ["description"]',
+      }),
+      backgroundJobBoard: new BackgroundJobBoard(),
+    });
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'corrected retry',
+        task_id: 'fix-1',
+      },
+    };
+    await retry.hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'schema-retry' },
+      args,
+    );
+
+    expect(args.args.task_id).toBe('ses_recover');
+    expect(claims.get('ses_recover')?.token).not.toBe(firstToken);
+  });
+
+  test.each([
+    ['generic error', { name: 'TransportError', message: 'request failed' }, 0],
+    [
+      'old schema error',
+      { name: 'SchemaError', message: 'Missing key at ["description"]' },
+      -2_001,
+    ],
+  ])(
+    'generic or old schema evidence keeps the claim blocked: %s',
+    async (_label, error, offset) => {
+      const { index, claims, sessionClient } = recoveryFixture();
+      index.reserve('parent-1', 'ses_recover', 'fixer', 'fix');
+      const first = createHook({
+        identityIndex: index,
+        sessionClient,
+        backgroundJobBoard: new BackgroundJobBoard(),
+      });
+      await first.hook['tool.execute.before'](
+        { tool: 'task', sessionID: 'parent-1', callID: 'claim' },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'first attempt',
+            task_id: 'fix-1',
+          },
+        },
+      );
+      const token = claims.get('ses_recover')?.token;
+      const retry = createHook({
+        identityIndex: index,
+        sessionClient: sessionClientWithParentTaskError(
+          sessionClient,
+          claims,
+          error,
+          offset,
+        ),
+        backgroundJobBoard: new BackgroundJobBoard(),
+      });
+      await expect(
+        retry.hook['tool.execute.before'](
+          { tool: 'task', sessionID: 'parent-1', callID: 'blocked' },
+          {
+            args: {
+              subagent_type: 'fixer',
+              description: 'corrected retry',
+              task_id: 'fix-1',
+            },
+          },
+        ),
+      ).rejects.toThrow(/another resume is unsettled/);
+      expect(claims.get('ses_recover')?.token).toBe(token);
+    },
+  );
+
   test('restores persisted alias, claims before dispatch, and settles only after exact native output', async () => {
     const { index, claims, sessionClient } = recoveryFixture();
     index.reserve('parent-1', 'ses_recover', 'fixer', 'fix');
@@ -5855,7 +6324,13 @@ describe('task-session-manager hook', () => {
       sessionClient,
       backgroundJobBoard: board,
     });
-    const resume = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const resume = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'fix-1',
+      },
+    };
     await first.hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'first' },
       resume,
@@ -5875,7 +6350,13 @@ describe('task-session-manager hook', () => {
     await expect(
       restarted.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'second' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/another resume is unsettled/);
 
@@ -5897,7 +6378,13 @@ describe('task-session-manager hook', () => {
     });
     await first.hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'crashed' },
-      { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'fix-1',
+        },
+      },
     );
     const token = claims.get('ses_recover')?.token;
     expect(claims.get('ses_recover')?.baseline).toMatchObject({
@@ -5910,7 +6397,13 @@ describe('task-session-manager hook', () => {
       sessionClient,
       backgroundJobBoard: new BackgroundJobBoard(),
     });
-    const args = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'fix-1',
+      },
+    };
     await expect(
       restarted.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'retry' },
@@ -5940,7 +6433,13 @@ describe('task-session-manager hook', () => {
       backgroundJobBoard: board,
       sessionClient: verifiedKnownHost(board, 'ses_child'),
     });
-    const args = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'fix-1',
+      },
+    };
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'no-index' },
@@ -5995,7 +6494,13 @@ describe('task-session-manager hook', () => {
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'bad-baseline' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/latest native child user turn cannot be verified/);
     expect(claims.has('ses_recover')).toBe(false);
@@ -6018,7 +6523,13 @@ describe('task-session-manager hook', () => {
     });
     await first.hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'lost' },
-      { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'fix-1',
+        },
+      },
     );
     childMessages.push({
       info: { role: 'user', id: 'resumed-1', time: { created: base + 900 } },
@@ -6029,7 +6540,13 @@ describe('task-session-manager hook', () => {
       sessionClient,
       backgroundJobBoard: new BackgroundJobBoard(),
     });
-    const args = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'fix-1',
+      },
+    };
     await expect(
       restarted.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'retry' },
@@ -6063,7 +6580,13 @@ describe('task-session-manager hook', () => {
     const first = createHook({ identityIndex: index, sessionClient: v1Client });
     await first.hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'v1-lost' },
-      { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'fix-1',
+        },
+      },
     );
     expect(claims.get('ses_recover')?.baseline?.childLatestUserID).toBe(
       'admission',
@@ -6077,7 +6600,13 @@ describe('task-session-manager hook', () => {
       sessionClient: v1Client,
       backgroundJobBoard: new BackgroundJobBoard(),
     });
-    const args = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'fix-1',
+      },
+    };
     await expect(
       restarted.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'v1-retry' },
@@ -6105,7 +6634,13 @@ describe('task-session-manager hook', () => {
       const first = createHook({ identityIndex: index, sessionClient });
       await first.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'v1-lost' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       );
       childMessages.push({
         info: {
@@ -6200,7 +6735,13 @@ describe('task-session-manager hook', () => {
       await expect(
         retry.hook['tool.execute.before'](
           { tool: 'task', sessionID: 'parent-1', callID: `v1-${conflict}` },
-          { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+          {
+            args: {
+              subagent_type: 'fixer',
+              description: 'recover scheduler task',
+              task_id: 'fix-1',
+            },
+          },
         ),
       ).rejects.toThrow(/another resume is unsettled/);
       expect(claims.has('ses_recover')).toBe(true);
@@ -6218,7 +6759,13 @@ describe('task-session-manager hook', () => {
     });
     await first.hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'lost' },
-      { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'fix-1',
+        },
+      },
     );
     childMessages.push({
       info: { role: 'user', id: 'resumed-1', time: { created: base + 900 } },
@@ -6232,13 +6779,25 @@ describe('task-session-manager hook', () => {
     await expect(
       retry.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'ack-intent' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/previous resume was already admitted/);
     await expect(
       retry.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'still-working' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/Recovery is unconfirmed/);
 
@@ -6315,7 +6874,13 @@ describe('task-session-manager hook', () => {
         }),
       },
     });
-    const args = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'fix-1',
+      },
+    };
     await expect(
       finished.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'no-current-proof' },
@@ -6368,7 +6933,13 @@ describe('task-session-manager hook', () => {
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'legacy' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/another resume is unsettled/);
     expect(claims.get('ses_recover')).toEqual({ token, baseline: undefined });
@@ -6382,7 +6953,13 @@ describe('task-session-manager hook', () => {
       const first = createHook({ identityIndex: index, sessionClient });
       await first.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'lost' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       );
       childMessages.push({
         info: { role: 'user', id: 'resumed-1', time: { created: base + 900 } },
@@ -6401,7 +6978,13 @@ describe('task-session-manager hook', () => {
       await expect(
         retry.hook['tool.execute.before'](
           { tool: 'task', sessionID: 'parent-1', callID: 'retry' },
-          { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+          {
+            args: {
+              subagent_type: 'fixer',
+              description: 'recover scheduler task',
+              task_id: 'fix-1',
+            },
+          },
         ),
       ).rejects.toThrow(/another resume is unsettled/);
       expect(claims.has('ses_recover')).toBe(true);
@@ -6415,7 +6998,13 @@ describe('task-session-manager hook', () => {
     const first = createHook({ identityIndex: index, sessionClient });
     await first.hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'lost' },
-      { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'fix-1',
+        },
+      },
     );
     childMessages.push({
       info: { role: 'user', id: 'resumed-1', time: { created: base + 900 } },
@@ -6437,7 +7026,13 @@ describe('task-session-manager hook', () => {
     await expect(
       retry.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'retry' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/another resume is unsettled/);
     expect(claims.has('ses_recover')).toBe(true);
@@ -6449,7 +7044,13 @@ describe('task-session-manager hook', () => {
     const first = createHook({ identityIndex: index, sessionClient });
     await first.hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'v2-lost' },
-      { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'fix-1',
+        },
+      },
     );
     const shim = buildPluginInput({
       session: {
@@ -6488,7 +7089,13 @@ describe('task-session-manager hook', () => {
     await expect(
       retry.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'v2-retry' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/previous resume was already admitted/);
     expect(claims.has('ses_recover')).toBe(false);
@@ -6502,7 +7109,13 @@ describe('task-session-manager hook', () => {
       sessionClient,
       backgroundJobBoard: board,
     });
-    const args = { args: { subagent_type: 'fixer', task_id: 'ses_recover' } };
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'ses_recover',
+      },
+    };
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'resume' },
       args,
@@ -6546,7 +7159,13 @@ describe('task-session-manager hook', () => {
       sessionClient,
       backgroundJobBoard: board,
     });
-    const resume = { args: { subagent_type: 'fixer', task_id: 'ses_recover' } };
+    const resume = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'ses_recover',
+      },
+    };
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'repair' },
       resume,
@@ -6581,7 +7200,13 @@ describe('task-session-manager hook', () => {
       sessionClient,
       backgroundJobBoard: board,
     });
-    const args = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'fix-1',
+      },
+    };
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'known-alias' },
       args,
@@ -6613,7 +7238,13 @@ describe('task-session-manager hook', () => {
       sessionClient,
       backgroundJobBoard: board,
     });
-    const args = { args: { subagent_type: 'fixer', task_id: 'ses_recover' } };
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'ses_recover',
+      },
+    };
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'corrupt' },
@@ -6649,7 +7280,13 @@ describe('task-session-manager hook', () => {
         status: async () => ({ data: { ses_recover: { type: 'busy' } } }),
       },
     });
-    const args = { args: { subagent_type: 'fixer', task_id: 'fix-1' } };
+    const args = {
+      args: {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        task_id: 'fix-1',
+      },
+    };
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'host-busy' },
@@ -6678,7 +7315,13 @@ describe('task-session-manager hook', () => {
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'stale' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/still running|fresh host evidence/);
     expect(board.get('ses_recover')?.generation).toBe(running.generation);
@@ -6696,7 +7339,13 @@ describe('task-session-manager hook', () => {
     });
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'errored' },
-      { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'fix-1',
+        },
+      },
     );
     const generation = board.get('ses_recover')?.generation;
     const errorText = 'task_id: ses_recover\nstate: running';
@@ -6716,7 +7365,13 @@ describe('task-session-manager hook', () => {
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'next' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/another resume is unsettled/);
   });
@@ -6753,7 +7408,13 @@ describe('task-session-manager hook', () => {
     });
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1', callID: 'pending-deletion' },
-      { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'fix-1',
+        },
+      },
     );
     await hook.event({
       event: {
@@ -6788,7 +7449,13 @@ describe('task-session-manager hook', () => {
     await expect(
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'unacknowledged' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/Recovery is unconfirmed/);
     expect(board.get('ses_recover')).toBeUndefined();
@@ -6805,7 +7472,13 @@ describe('task-session-manager hook', () => {
     });
     await hook['tool.execute.before'](
       { tool: 'task', sessionID: 'parent-1' },
-      { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+      {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'fix-1',
+        },
+      },
     );
     await hook['tool.execute.after'](
       { tool: 'task', sessionID: 'parent-1' },
@@ -6832,7 +7505,12 @@ describe('task-session-manager hook', () => {
       hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'rejected' },
         {
-          args: { subagent_type: 'fixer', task_id: 'fix-1', background: true },
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+            background: true,
+          },
         },
       ),
     ).rejects.toThrow('admission rejected');
@@ -6938,7 +7616,13 @@ describe('task-session-manager hook', () => {
         identityIndex: index,
         sessionClient: { ...sessionClient, get },
       });
-      const args = { args: { subagent_type: 'fixer', task_id: 'ses_recover' } };
+      const args = {
+        args: {
+          subagent_type: 'fixer',
+          description: 'recover scheduler task',
+          task_id: 'ses_recover',
+        },
+      };
       await expect(
         hook['tool.execute.before'](
           { tool: 'task', sessionID: 'parent-1', callID: 'resume' },
@@ -6963,7 +7647,13 @@ describe('task-session-manager hook', () => {
     await expect(
       busy.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'busy' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/busy or retrying/);
 
@@ -7007,7 +7697,13 @@ describe('task-session-manager hook', () => {
     await expect(
       interrupted.hook['tool.execute.before'](
         { tool: 'task', sessionID: 'parent-1', callID: 'stopped' },
-        { args: { subagent_type: 'fixer', task_id: 'fix-1' } },
+        {
+          args: {
+            subagent_type: 'fixer',
+            description: 'recover scheduler task',
+            task_id: 'fix-1',
+          },
+        },
       ),
     ).rejects.toThrow(/task_revive/);
     expect(index.hasUnsettledResume('parent-1', 'ses_recover')).toBe(false);

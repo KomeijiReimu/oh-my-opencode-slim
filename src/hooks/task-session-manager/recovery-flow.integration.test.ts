@@ -268,7 +268,12 @@ describe('v2 background recovery across plugin restart', () => {
       });
 
       const accepted = {
-        args: { subagent_type: AGENT, background: true, task_id: alias },
+        args: {
+          subagent_type: AGENT,
+          background: true,
+          description: 'resume retained task',
+          task_id: alias,
+        },
       };
       await hook['tool.execute.before'](
         { tool: 'task', sessionID: PARENT, callID: 'resume' },

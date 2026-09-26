@@ -2,6 +2,7 @@ import type { BackgroundJobLease } from '../../utils/background-job-board';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
 import type { BackgroundTaskConcurrencyTicket } from '../../utils/background-task-concurrency';
+import type { SameProcessResumeEvidenceClaim } from '../../utils/same-process-resume-evidence';
 
 export interface EarlyTaskRegistration {
   taskID: string;
@@ -24,6 +25,10 @@ export interface PendingTaskCall {
   resumedTaskId?: string;
   /** Persistent cross-process intent; never settle on eviction or lost output. */
   resumeClaim?: { parentSessionID: string; taskID: string; token: string };
+  /** Process-local evidence claim. It is intentionally not released by the
+   * generic tracker release path: an after-hook may be late or ambiguous, so
+   * only a deterministic pre-send failure may return it to the broker. */
+  resumeEvidenceClaim?: SameProcessResumeEvidenceClaim;
   relaunchLease?: BackgroundJobLease;
   /** Board generation that owns the relaunch lease. */
   releaseLease?: (lease: BackgroundJobLease) => boolean;

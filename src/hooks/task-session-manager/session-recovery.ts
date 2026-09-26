@@ -3,6 +3,10 @@ import type { BackgroundJobIdentity } from '../../utils/background-job-identity-
 import { classifyTerminalEvidence } from '../../utils/child-transcript';
 import { isRecord } from '../../utils/guards';
 import { INTERNAL_INITIATOR_METADATA_KEY } from '../../utils/internal-initiator';
+import type {
+  SameProcessResumeEvidenceBroker,
+  SameProcessResumeEvidenceToken,
+} from '../../utils/same-process-resume-evidence';
 import {
   parseTaskIdFromTaskOutput,
   parseTaskStatusOutput,
@@ -34,10 +38,16 @@ export type SessionRecoveryResult = RecoveryFields &
       }
     | {
         kind: 'reusable';
+        resumeToken?: SameProcessResumeEvidenceToken;
         evidence: Extract<
           BackgroundJobAdoptionEvidence,
           { kind: 'terminal' }
-        > & { acknowledged: true };
+        > & {
+          acknowledged: true;
+          /** Present only when same-process, statusless-v2 evidence was
+           * authorized for this exact terminal publication. */
+          resumeToken?: SameProcessResumeEvidenceToken;
+        };
       }
     | {
         kind: 'stopped';
@@ -56,6 +66,11 @@ export type SessionRecoveryResult = RecoveryFields &
     | { kind: 'missing'; reason: string }
   );
 
+export type SameProcessResumeEvidenceContext = Readonly<{
+  generation: number;
+  terminalRevision: number;
+}>;
+
 export type SessionRecoveryRequest = {
   requested: { alias: string } | { sessionID: string };
   parentSessionID: string;
@@ -72,6 +87,11 @@ export type SessionRecoveryRequest = {
   getSession?: (sessionID: string, directory: string) => Promise<unknown>;
   /** The SDK session.status response, not an inferred list of idle sessions. */
   probeStatus?: (sessionID: string, directory: string) => Promise<unknown>;
+  /** Process-local evidence gate for statusless v2 terminal reuse. */
+  sameProcessResumeEvidence?: SameProcessResumeEvidenceBroker;
+  /** Board-owned identity for the terminal publication being classified.
+   * The classifier only reads this tuple; it never mutates the board. */
+  sameProcessResumeEvidenceContext?: SameProcessResumeEvidenceContext;
   now?: () => number;
 };
 
@@ -768,10 +788,52 @@ export async function classifySessionRecovery(
           : 'parent terminal notice unproven',
         pendingAcknowledgement: evidence,
       };
+    const statuslessV2 =
+      status === undefined && !validStatusMap && outcome === undefined;
+    let resumeToken: SameProcessResumeEvidenceToken | undefined;
+    if (statuslessV2) {
+      const context = input.sameProcessResumeEvidenceContext;
+      const broker = input.sameProcessResumeEvidence;
+      if (
+        !broker ||
+        !context ||
+        !Number.isSafeInteger(context.generation) ||
+        context.generation < 0 ||
+        !Number.isSafeInteger(context.terminalRevision) ||
+        context.terminalRevision < 0
+      )
+        return uncertain('same-process resume evidence unavailable', details);
+      try {
+        // Terminal publication is recorded by the same-process owner before
+        // classification. Transcript evidence alone never authorizes reuse;
+        // this call only asks the broker to release its exact token.
+        resumeToken = broker.authorize({
+          taskID,
+          parentSessionID: input.parentSessionID,
+          generation: context.generation,
+          terminalRevision: context.terminalRevision,
+          resultSummary: transcript.text,
+          acknowledgedAt: notice.acknowledgedAt,
+        });
+      } catch {
+        resumeToken = undefined;
+      }
+      if (!resumeToken)
+        return uncertain(
+          'same-process resume authorization unavailable',
+          details,
+        );
+    }
+    const reusableEvidence = {
+      ...evidence,
+      acknowledged: true as const,
+      ...(resumeToken ? { resumeToken } : {}),
+    };
     return {
       kind: 'reusable',
       ...details,
-      evidence: { ...evidence, acknowledged: true },
+      ...(resumeToken ? { resumeToken } : {}),
+      evidence: reusableEvidence,
     };
   }
   if (

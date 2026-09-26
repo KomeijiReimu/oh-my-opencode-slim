@@ -119,6 +119,10 @@ import { isInternalInitiatorPart } from './utils/internal-initiator';
 import { probeJSDOM } from './utils/jsdom';
 import { initLogger, log } from './utils/logger';
 import { getClient } from './utils/opencode-client';
+import {
+  createSameProcessResumeEvidence,
+  type SameProcessResumeEvidence,
+} from './utils/same-process-resume-evidence';
 import { SessionMetadataStore } from './utils/session-metadata';
 import {
   createSessionSelectionReader,
@@ -374,6 +378,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let taskReviveTools: ReturnType<typeof createTaskReviveTool>;
   let revivedRunTracker: ReturnType<typeof createRevivedRunTracker>;
   let terminalGate: BackgroundJobTerminalGate | undefined;
+  let resumeEvidence: SameProcessResumeEvidence | undefined;
   let markRevivedRunPending: (taskID: string) => void = () => {};
   let markRevivedRunSettled: (taskID: string) => void = () => {};
   let getRevivedContextFiles = (_taskID: string): ContextFile[] => [];
@@ -566,6 +571,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     const backgroundJobCoordinator = new BackgroundJobCoordinator(
       backgroundJobBoard,
     );
+    resumeEvidence = createSameProcessResumeEvidence();
     const taskControlRecovery = createTaskControlRecovery({
       input: ctx,
       backgroundJobBoard: backgroundJobCoordinator,
@@ -650,6 +656,23 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         current.state === 'running'
       )
         return;
+      if (
+        record.state === 'completed' ||
+        record.state === 'error' ||
+        record.state === 'cancelled'
+      ) {
+        resumeEvidence?.recordTerminal({
+          taskID: record.taskID,
+          parentSessionID: record.parentSessionID,
+          generation: record.generation,
+          terminalRevision: record.terminalRevision,
+          state: record.state,
+          resultSummary: record.resultSummary ?? '',
+          ...(record.completedAt === undefined
+            ? {}
+            : { completedAt: record.completedAt }),
+        });
+      }
       backgroundJobCoordinator.addContext(
         record.taskID,
         getRevivedContextFiles(record.taskID),
@@ -754,6 +777,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     loopCommandHook = createLoopCommandHook();
     taskSessionManagerHook = createTaskSessionManagerHook(ctx, {
       terminalGate,
+      resumeEvidence,
       strategy: runtime.backgroundJobs.strategy,
       maxSessionsPerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
       maxRetainedSnapshots: runtime.backgroundJobs.maxRetainedSnapshots,
@@ -1126,6 +1150,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     toolCount = Object.keys(tools).length;
   } catch (err) {
+    resumeEvidence?.dispose();
     terminalGate?.dispose();
     admissionRuntimeLease?.release();
     // Plugin init failed: log visibly before re-throwing so the user
@@ -1586,8 +1611,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     },
 
     event: async (input) => {
-      if (input.event.type === 'server.instance.disposed')
+      if (input.event.type === 'server.instance.disposed') {
+        resumeEvidence?.dispose();
         terminalGate?.dispose();
+      }
       // Token-stream deltas fire on every reasoning/text chunk. Slim has no
       // work for them; skip the rest of the fan-out. v2 names:
       // session.next.{text,reasoning}.delta.
@@ -1860,6 +1887,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     },
 
     dispose: async () => {
+      resumeEvidence?.dispose();
       terminalGate?.dispose();
       // Cancel pending initial-delay fallback timers so a reloaded
       // generation cannot observe one stale fallback call.

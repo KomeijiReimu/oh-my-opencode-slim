@@ -10,6 +10,7 @@ import {
   createToolLoopGuardHook,
   LOOP_GUARD_WARNING,
 } from '../hooks/tool-loop-guard/hook';
+import { createSameProcessResumeEvidence } from '../utils/same-process-resume-evidence';
 import { createV2InterviewBridge, markerText } from './interview-bridge';
 import { createSessionSubmit } from './session-submit';
 import {
@@ -1258,6 +1259,22 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
     expect(calls).toHaveLength(2);
   });
 
+  test('handlePrompt reports each native admission to the setup-local observer', async () => {
+    const admissions: Array<{ sessionID: string; messageID: string }> = [];
+    const bridge = createSessionPromptBridge(async () => {}, {
+      observeAdmission: (admission) => admissions.push(admission),
+    });
+
+    await bridge.handlePrompt(makePromptEvent());
+    await bridge.handlePrompt(makePromptEvent());
+    await bridge.handlePrompt(makePromptEvent({ messageID: 'msg_2' }));
+
+    expect(admissions).toEqual([
+      { sessionID: 'ses_p', messageID: 'msg_1' },
+      { sessionID: 'ses_p', messageID: 'msg_2' },
+    ]);
+  });
+
   test('handlePrompt maps prompt files into v1 file parts', async () => {
     const calls: Array<Record<string, unknown>> = [];
     const bridge = createSessionPromptBridge(async (input) => {
@@ -1664,6 +1681,118 @@ describe('createSessionPromptBridge (native session.prompt hook)', () => {
       }),
     ).resolves.toBeUndefined();
     expect(calls).toEqual([]);
+  });
+
+  test('parent follow-up admission does not revoke a child terminal', async () => {
+    const broker = createSameProcessResumeEvidence();
+    const bridge = createSessionPromptBridge(async () => {}, {
+      observeAdmission: (admission) => broker.observeAdmission(admission),
+    });
+    const child = {
+      taskID: 'child',
+      parentSessionID: 'parent',
+      generation: 3,
+      terminalRevision: 7,
+      state: 'completed' as const,
+      resultSummary: 'finished',
+      completedAt: 20,
+    };
+
+    await bridge.handlePrompt(
+      makePromptEvent({ sessionID: 'child', messageID: 'child-user-1' }),
+    );
+    broker.recordTerminal(child);
+    await bridge.handlePrompt(
+      makePromptEvent({ sessionID: 'parent', messageID: 'parent-user-2' }),
+    );
+
+    expect(
+      broker.authorize({
+        taskID: child.taskID,
+        parentSessionID: child.parentSessionID,
+        generation: child.generation,
+        terminalRevision: child.terminalRevision,
+        resultSummary: child.resultSummary,
+        acknowledgedAt: 30,
+      }),
+    ).toBeDefined();
+  });
+
+  test('a new child admission invalidates only that child terminal', async () => {
+    const broker = createSameProcessResumeEvidence();
+    const bridge = createSessionPromptBridge(async () => {}, {
+      observeAdmission: (admission) => broker.observeAdmission(admission),
+    });
+    const child = {
+      taskID: 'child',
+      parentSessionID: 'parent',
+      generation: 3,
+      terminalRevision: 7,
+      state: 'completed' as const,
+      resultSummary: 'finished',
+      completedAt: 20,
+    };
+    const otherChild = {
+      ...child,
+      taskID: 'other-child',
+      resultSummary: 'other finished',
+    };
+
+    await bridge.handlePrompt(
+      makePromptEvent({ sessionID: child.taskID, messageID: 'child-user-1' }),
+    );
+    await bridge.handlePrompt(
+      makePromptEvent({
+        sessionID: otherChild.taskID,
+        messageID: 'other-child-user-1',
+      }),
+    );
+    broker.recordTerminal(child);
+    broker.recordTerminal(otherChild);
+
+    const childToken = broker.authorize({
+      taskID: child.taskID,
+      parentSessionID: child.parentSessionID,
+      generation: child.generation,
+      terminalRevision: child.terminalRevision,
+      resultSummary: child.resultSummary,
+      acknowledgedAt: 30,
+    });
+    const otherChildToken = broker.authorize({
+      taskID: otherChild.taskID,
+      parentSessionID: otherChild.parentSessionID,
+      generation: otherChild.generation,
+      terminalRevision: otherChild.terminalRevision,
+      resultSummary: otherChild.resultSummary,
+      acknowledgedAt: 30,
+    });
+    expect(childToken).toBeDefined();
+    expect(otherChildToken).toBeDefined();
+
+    await bridge.handlePrompt(
+      makePromptEvent({ sessionID: child.taskID, messageID: 'child-user-2' }),
+    );
+
+    expect(
+      broker.authorize({
+        taskID: child.taskID,
+        parentSessionID: child.parentSessionID,
+        generation: child.generation,
+        terminalRevision: child.terminalRevision,
+        resultSummary: child.resultSummary,
+        acknowledgedAt: 30,
+      }),
+    ).toBeUndefined();
+    expect(
+      broker.authorize({
+        taskID: otherChild.taskID,
+        parentSessionID: otherChild.parentSessionID,
+        generation: otherChild.generation,
+        terminalRevision: otherChild.terminalRevision,
+        resultSummary: otherChild.resultSummary,
+        acknowledgedAt: 30,
+      }),
+    ).toBe(otherChildToken);
   });
 });
 

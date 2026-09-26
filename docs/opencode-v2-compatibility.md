@@ -755,6 +755,15 @@ seamless continuation. See
 [Background orchestration](background-orchestration.md#unattributed-sessions-and-restart-scope)
 for the operational recovery boundary.
 
+On the pinned v2.0.15 host, same-process `task()` continuation has a narrower
+exception: after the local terminal gate commits the exact child generation and
+terminal revision, the parent retrieves the result and completes its
+acknowledgement turn, the plugin may issue a private one-shot resume token. The
+token is held only by the current setup generation and is never persisted. It
+cannot be reconstructed after restart, setup disposal, a newer child
+admission, a changed result, or an ambiguous native send. Thus this path fixes
+the live same-process workflow without weakening the restart limitation.
+
 The same boundary applies to control tools after a restart. `task_status` can
 report a verified exact ID in read-only mode without adopting it into the
 control board. `task_message` requires a live-status proof, a bounded latest

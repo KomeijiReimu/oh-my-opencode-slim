@@ -2,6 +2,7 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import {
   classifySessionRecovery,
   findStructuredParentTaskDelegation,
+  type SameProcessResumeEvidenceContext,
   type SessionRecoveryResult,
 } from '../hooks/task-session-manager/session-recovery';
 import type {
@@ -17,6 +18,7 @@ import type {
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import { isRecord } from '../utils/guards';
 import { getClient } from '../utils/opencode-client';
+import type { SameProcessResumeEvidenceBroker } from '../utils/same-process-resume-evidence';
 import {
   OperationTimeoutError,
   SESSION_ID_PATTERN,
@@ -101,6 +103,13 @@ export interface TaskControlRecoveryOptions {
   readChildTranscript?: (taskID: string) => Promise<unknown>;
   getSession?: (taskID: string, directory: string) => Promise<unknown>;
   probeStatus?: (taskID: string, directory: string) => Promise<unknown>;
+  /** Optional same-process gate for statusless v2 terminal reuse. */
+  sameProcessResumeEvidence?: SameProcessResumeEvidenceBroker;
+  /** Read-only board/recovery identity for the terminal publication being
+   * classified. */
+  sameProcessResumeEvidenceContextFor?: (
+    taskID: string,
+  ) => SameProcessResumeEvidenceContext | undefined;
   now?: () => number;
   /** Maximum time spent recovering an untracked task. */
   timeoutMs?: number;
@@ -255,6 +264,17 @@ function hasVerifiedStatus(response: unknown, taskID: string): boolean {
   );
 }
 
+function inputResumeEvidence(
+  input: PluginInput,
+): SameProcessResumeEvidenceBroker | undefined {
+  const extended = input as PluginInput & {
+    experimental_v2?: {
+      sameProcessResumeEvidence?: SameProcessResumeEvidenceBroker;
+    };
+  };
+  return extended.experimental_v2?.sameProcessResumeEvidence;
+}
+
 function isReservedIdentity(
   value: unknown,
   parentSessionID: string,
@@ -320,6 +340,26 @@ export function createTaskControlRecovery(
 ): TaskControlRecovery {
   const readers = makeDefaultReaders(options);
   const directory = options.input.directory;
+  const sameProcessResumeEvidence =
+    options.sameProcessResumeEvidence ?? inputResumeEvidence(options.input);
+
+  const resumeEvidenceContextFor = (
+    taskID: string,
+  ): SameProcessResumeEvidenceContext | undefined => {
+    try {
+      const supplied = options.sameProcessResumeEvidenceContextFor?.(taskID);
+      if (supplied) return supplied;
+    } catch {
+      return undefined;
+    }
+    const boardJob = options.backgroundJobBoard.get(taskID);
+    return boardJob
+      ? {
+          generation: boardJob.generation,
+          terminalRevision: boardJob.terminalRevision,
+        }
+      : undefined;
+  };
 
   const recovery: TaskControlRecovery = {
     async resolve(parentSessionID, requested) {
@@ -491,6 +531,10 @@ export function createTaskControlRecovery(
           readChildTranscript: readers.readChildTranscript,
           getSession: readers.getSession,
           probeStatus,
+          sameProcessResumeEvidence,
+          sameProcessResumeEvidenceContext: resumeEvidenceContextFor(
+            identity?.taskID ?? key,
+          ),
           now: options.now,
         });
 
@@ -505,7 +549,10 @@ export function createTaskControlRecovery(
             reason: classification.reason,
           };
         }
-        if (!statusVerified) {
+        const sameProcessResumeAuthorized =
+          classification.kind === 'reusable' &&
+          classification.evidence.resumeToken !== undefined;
+        if (!statusVerified && !sameProcessResumeAuthorized) {
           return {
             kind: 'orphan',
             requested: key,

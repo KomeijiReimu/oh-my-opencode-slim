@@ -27,6 +27,10 @@ import type {
 import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
+import type {
+  SameProcessResumeEvidence,
+  SameProcessResumeEvidenceToken,
+} from '../../utils/same-process-resume-evidence';
 import { isMissingRememberedSessionError } from './board-injection';
 import type { PendingTaskCall } from './pending-call-tracker';
 import { convertSameProviderBackgroundTask } from './same-provider-policy';
@@ -55,6 +59,165 @@ function normalizeObjectiveKey(value: string): string {
 }
 
 type IdentityIndex = ReturnType<typeof createBackgroundJobIdentityIndex>;
+
+const SCHEMA_REJECTION_CLOCK_SKEW_MS = 1_000;
+
+/**
+ * The recovery classifier currently does not need to know about the
+ * process-local broker. Keep the lookup deliberately structural so a newer
+ * classifier can expose an opaque token without making this hook depend on a
+ * particular recovery-result union.
+ */
+function recoveryResumeToken(
+  recovery: unknown,
+): SameProcessResumeEvidenceToken | undefined {
+  if (!isObjectRecord(recovery)) return undefined;
+  const direct =
+    recovery.resumeToken ??
+    recovery.resumeEvidenceToken ??
+    recovery.sameProcessResumeToken;
+  if (isObjectRecord(direct)) {
+    return direct as SameProcessResumeEvidenceToken;
+  }
+  const evidence = recovery.evidence;
+  if (!isObjectRecord(evidence)) return undefined;
+  const nested =
+    evidence.resumeToken ??
+    evidence.resumeEvidenceToken ??
+    evidence.sameProcessResumeToken;
+  return isObjectRecord(nested)
+    ? (nested as SameProcessResumeEvidenceToken)
+    : undefined;
+}
+
+function releaseResumeEvidenceBeforeSend(
+  pending: PendingTaskCall,
+  broker?: SameProcessResumeEvidence,
+): void {
+  const claim = pending.resumeEvidenceClaim;
+  if (!claim) return;
+  pending.resumeEvidenceClaim = undefined;
+  broker?.releaseBeforeSend(claim);
+}
+
+function isTaskToolPart(part: unknown): part is Record<string, unknown> {
+  return (
+    isObjectRecord(part) &&
+    part.type === 'tool' &&
+    (part.tool === 'task' ||
+      part.name === 'task' ||
+      part.tool === 'subagent' ||
+      part.name === 'subagent')
+  );
+}
+
+function isMissingDescriptionSchemaError(error: unknown): boolean {
+  if (typeof error === 'string') {
+    return (
+      /SchemaError/.test(error) &&
+      /description/i.test(error) &&
+      /(missing|required)/i.test(error)
+    );
+  }
+  if (!isObjectRecord(error) || error.name !== 'SchemaError') return false;
+  const message = error.message;
+  return (
+    typeof message === 'string' &&
+    /description/i.test(message) &&
+    /(missing|required)/i.test(message)
+  );
+}
+
+function taskErrorTimestamp(
+  state: Record<string, unknown>,
+): number | undefined {
+  const time = state.time;
+  if (!isObjectRecord(time)) return undefined;
+  const end = time.end;
+  return typeof end === 'number' && Number.isFinite(end) && end >= 0
+    ? end
+    : undefined;
+}
+
+async function settleSchemaRejectedResumeClaim(
+  requested: string,
+  parentSessionID: string,
+  identity: { alias: string; taskID: string },
+  claim: NonNullable<ReturnType<IdentityIndex['inspectResumeClaim']>>,
+  deps: {
+    directory?: string;
+    hostClient?: PluginInput['client'];
+    identityIndex: IdentityIndex;
+  },
+): Promise<boolean> {
+  const claimedAt = claim.baseline?.claimedAt;
+  if (claimedAt === undefined) return false;
+
+  const session = deps.hostClient?.session;
+  if (typeof session?.messages !== 'function') return false;
+
+  let response: unknown;
+  try {
+    response = await session.messages({
+      path: { id: parentSessionID },
+      query: { directory: deps.directory ?? '' },
+    });
+  } catch {
+    return false;
+  }
+  if (
+    !isObjectRecord(response) ||
+    response.error != null ||
+    !Array.isArray(response.data)
+  )
+    return false;
+
+  const taskIDs = new Set([requested, identity.alias, identity.taskID]);
+  const hasAuthoritativeRejection = response.data.some((message) => {
+    if (!isObjectRecord(message) || !isObjectRecord(message.info)) return false;
+    const info = message.info;
+    if (
+      info.role !== 'assistant' ||
+      (info.sessionID !== undefined && info.sessionID !== parentSessionID) ||
+      !Array.isArray(message.parts)
+    )
+      return false;
+    return message.parts.some((part) => {
+      if (!isTaskToolPart(part) || !isObjectRecord(part.state)) return false;
+      const state = part.state;
+      if (state.status !== 'error' || !isObjectRecord(state.input))
+        return false;
+      const taskID = state.input.task_id;
+      if (typeof taskID !== 'string' || !taskIDs.has(taskID)) return false;
+      const error = state.error ?? part.error ?? info.error;
+      if (!isMissingDescriptionSchemaError(error)) return false;
+      const errorAt = taskErrorTimestamp(state);
+      return (
+        errorAt !== undefined &&
+        errorAt + SCHEMA_REJECTION_CLOCK_SKEW_MS >= claimedAt
+      );
+    });
+  });
+  if (!hasAuthoritativeRejection) return false;
+
+  try {
+    deps.identityIndex.settleResume(
+      parentSessionID,
+      identity.taskID,
+      claim.token,
+    );
+    return !deps.identityIndex.inspectResumeClaim(
+      parentSessionID,
+      identity.taskID,
+    );
+  } catch (error) {
+    log(
+      '[task-session-manager] schema rejection claim settlement failed',
+      String(error),
+    );
+    return false;
+  }
+}
 
 function aliasPrefix(agent: string): string {
   const known: Record<string, string> = {
@@ -125,6 +288,11 @@ function recoveryRequest(
     directory?: string;
     hostClient?: PluginInput['client'];
     identityIndex?: IdentityIndex;
+    resumeEvidence?: SameProcessResumeEvidence;
+    resumeEvidenceContext?: {
+      generation: number;
+      terminalRevision: number;
+    };
   },
 ) {
   const session = deps.hostClient?.session;
@@ -156,6 +324,8 @@ function recoveryRequest(
       typeof session?.status === 'function'
         ? () => session.status({ query: { directory } })
         : undefined,
+    sameProcessResumeEvidence: deps.resumeEvidence,
+    sameProcessResumeEvidenceContext: deps.resumeEvidenceContext,
   };
 }
 
@@ -165,11 +335,12 @@ async function readChildUsers(
   taskID: string,
   deps: { directory?: string; hostClient?: PluginInput['client'] },
 ): Promise<ChildUser[] | undefined> {
-  const messages = deps.hostClient?.session?.messages;
+  const session = deps.hostClient?.session;
+  const messages = session?.messages;
   if (typeof messages !== 'function') return undefined;
   let response: unknown;
   try {
-    response = await messages({
+    response = await messages.call(session, {
       path: { id: taskID },
       query: { directory: deps.directory ?? '' },
     });
@@ -502,6 +673,7 @@ export async function handleToolExecuteBefore(
       release?(call: PendingTaskCall): void;
       pendingCallId(sessionID?: string, callID?: string): string;
     };
+    resumeEvidence?: SameProcessResumeEvidence;
     taskContextTracker: { pendingManagedTaskIds: Set<string> };
     backgroundJobSupervisor?: BackgroundJobSupervisor;
     backgroundTaskConcurrency?: BackgroundTaskConcurrency;
@@ -553,6 +725,23 @@ export async function handleToolExecuteBefore(
   }
 
   const agentType = args.subagent_type.trim();
+  const requestedTaskID =
+    typeof args.task_id === 'string' && args.task_id.trim() !== ''
+      ? args.task_id.trim()
+      : undefined;
+  if (
+    requestedTaskID !== undefined &&
+    (typeof args.description !== 'string' || args.description.trim() === '')
+  ) {
+    // The native task schema rejects this call before dispatch. Refuse it
+    // before inspecting or mutating durable identity state, so the host cannot
+    // leave an orphaned resume claim behind.
+    refuseExplicitTaskId(
+      requestedTaskID,
+      `Task ${requestedTaskID}: task() requires a non-empty description when task_id is explicit; no new session was created.`,
+    );
+  }
+
   let background = args.background === true;
   if (background) {
     const conversion = convertSameProviderBackgroundTask({
@@ -601,8 +790,8 @@ export async function handleToolExecuteBefore(
       typeof args.description === 'string' ? args.description : undefined,
     prompt: typeof args.prompt === 'string' ? args.prompt : undefined,
   });
-  if (typeof args.task_id === 'string' && args.task_id.trim() !== '') {
-    const requested = args.task_id.trim();
+  if (requestedTaskID !== undefined) {
+    const requested = requestedTaskID;
     if (deps.identityIndex) {
       let identity: ReturnType<IdentityIndex['lookup']>;
       let claim: ReturnType<IdentityIndex['inspectResumeClaim']>;
@@ -632,17 +821,30 @@ export async function handleToolExecuteBefore(
             `Task ${requested}: persisted identity disagrees with the request; resume blocked.`,
           );
         }
-        await refuseUnsettledResume(
+        const schemaRejectionSettled = await settleSchemaRejectedResumeClaim(
           requested,
           input.sessionID,
-          identity.taskID,
-          agentType,
+          identity,
+          claim,
           {
             identityIndex: deps.identityIndex,
             directory: deps.directory,
             hostClient: deps.hostClient,
           },
         );
+        if (!schemaRejectionSettled) {
+          await refuseUnsettledResume(
+            requested,
+            input.sessionID,
+            identity.taskID,
+            agentType,
+            {
+              identityIndex: deps.identityIndex,
+              directory: deps.directory,
+              hostClient: deps.hostClient,
+            },
+          );
+        }
       }
     }
     let remembered =
@@ -721,7 +923,14 @@ export async function handleToolExecuteBefore(
           { sessionID: remembered.taskID },
           input.sessionID,
           agentType,
-          deps,
+          {
+            ...deps,
+            resumeEvidence: deps.resumeEvidence,
+            resumeEvidenceContext: {
+              generation: remembered.generation,
+              terminalRevision: remembered.terminalRevision,
+            },
+          },
         ),
       );
       if (recovery.taskID !== remembered.taskID) {
@@ -853,9 +1062,22 @@ export async function handleToolExecuteBefore(
           `Task ${requested} cannot be resumed safely: its current generation is already owned by another lifecycle operation. Do not launch a duplicate with the same task_id.`,
         );
       }
+      const resumeToken = recoveryResumeToken(recovery);
+      if (resumeToken && deps.resumeEvidence) {
+        const claim = deps.resumeEvidence.claim(resumeToken);
+        if (!claim) {
+          deps.backgroundJobBoard.releaseLease(relaunchLease);
+          refuseExplicitTaskId(
+            requested,
+            `Task ${requested}: same-process resume evidence is stale or already in use; no new session was created.`,
+          );
+        }
+        pendingCall.resumeEvidenceClaim = claim;
+      }
       const users = await readChildUsers(remembered.taskID, deps);
       const latestUser = users?.at(-1);
       if (!latestUser) {
+        releaseResumeEvidenceBeforeSend(pendingCall, deps.resumeEvidence);
         deps.backgroundJobBoard.releaseLease(relaunchLease);
         refuseExplicitTaskId(
           requested,
@@ -878,6 +1100,7 @@ export async function handleToolExecuteBefore(
             baseline,
           );
         } catch {
+          releaseResumeEvidenceBeforeSend(pendingCall, deps.resumeEvidence);
           deps.backgroundJobBoard.releaseLease(relaunchLease);
           refuseExplicitTaskId(
             requested,
@@ -885,6 +1108,7 @@ export async function handleToolExecuteBefore(
           );
         }
         if (!token) {
+          releaseResumeEvidenceBeforeSend(pendingCall, deps.resumeEvidence);
           deps.backgroundJobBoard.releaseLease(relaunchLease);
           throw await refuseUnsettledResume(
             requested,
@@ -909,6 +1133,7 @@ export async function handleToolExecuteBefore(
       try {
         deps.backgroundJobBoard.markUsed(input.sessionID, remembered.taskID);
       } catch (error) {
+        releaseResumeEvidenceBeforeSend(pendingCall, deps.resumeEvidence);
         deps.backgroundJobBoard.releaseLease(relaunchLease);
         args.task_id = requested;
         if (pendingCall.resumeClaim) {
@@ -995,6 +1220,10 @@ export async function handleToolExecuteBefore(
     );
     if (tracked) deps.pendingCallTracker.release?.(tracked);
     else pendingCall.concurrencyTicket?.releaseIfUnbound();
+    releaseResumeEvidenceBeforeSend(
+      tracked ?? pendingCall,
+      deps.resumeEvidence,
+    );
     if (pendingCall.resumeClaim) {
       try {
         deps.identityIndex?.settleResume(
@@ -1058,6 +1287,7 @@ export async function handleToolExecuteAfter(
       ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
     };
+    resumeEvidence?: SameProcessResumeEvidence;
     taskContextTracker: {
       pendingManagedTaskIds: Set<string>;
       addContext(taskId: string, files: ContextFile[]): void;
@@ -1262,6 +1492,7 @@ export async function handleToolExecuteAfter(
         exactCallConfirmed ||
           (identityTaskID === record.taskID && !pending.identityUnresolved),
         deps.identityIndex,
+        deps.resumeEvidence,
       );
       deps.bindConcurrencyTicket?.(record.taskID, pending);
       deps.clearRehydrateTombstone?.(launch.taskID);
@@ -1298,6 +1529,7 @@ export async function handleToolExecuteAfter(
         exactCallConfirmed ||
           (identityTaskID === record.taskID && !pending.identityUnresolved),
         deps.identityIndex,
+        deps.resumeEvidence,
       );
       deps.bindConcurrencyTicket?.(record.taskID, pending);
       deps.clearRehydrateTombstone?.(status.taskID);
@@ -1415,6 +1647,7 @@ function settleAcceptedResume(
   record: NonNullable<ReturnType<BackgroundJobStore['get']>>,
   exactCallConfirmed: boolean,
   index?: IdentityIndex,
+  resumeEvidence?: SameProcessResumeEvidence,
 ): void {
   const claim = pending.resumeClaim;
   if (
@@ -1434,6 +1667,13 @@ function settleAcceptedResume(
       '[task-session-manager] native resume claim settlement failed',
       String(error),
     );
+  }
+  if (pending.resumeEvidenceClaim && resumeEvidence) {
+    const claim = pending.resumeEvidenceClaim;
+    pending.resumeEvidenceClaim = undefined;
+    if (!resumeEvidence.accept(claim)) {
+      log('[task-session-manager] same-process resume evidence claim rejected');
+    }
   }
 }
 

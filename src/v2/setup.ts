@@ -39,6 +39,7 @@ import {
 } from '../utils/background-job-persistence';
 import { INTERNAL_INITIATOR_METADATA_KEY } from '../utils/internal-initiator';
 import { initLogger, log } from '../utils/logger';
+import { createSameProcessResumeEvidence } from '../utils/same-process-resume-evidence';
 import { adaptTool, applyAgentToDraft, v1PermKeyToV2 } from './adapters';
 import {
   buildPluginInput,
@@ -454,6 +455,15 @@ export interface V2SessionPromptBridge {
   /** Latest agent known for a session from the learned state above (the
    * identity source for transcript user-message enrichment). */
   agentForSession(sessionID: string): string | undefined;
+}
+
+export interface V2SessionPromptBridgeOptions {
+  /** Setup-local native admission observer. It must not be backed by module
+   * state; setup disposal fences the observer's lifetime. */
+  observeAdmission?: (admission: {
+    sessionID: string;
+    messageID: string;
+  }) => void;
 }
 
 /** Trailing (last) message with `role === 'user'`, or undefined. Hot
@@ -939,6 +949,7 @@ export function createPermissionRulesBridge(
  */
 export function createSessionPromptBridge(
   chatMessage: (input: V1ChatMessageInput, output: unknown) => Promise<void>,
+  options: V2SessionPromptBridgeOptions = {},
 ): V2SessionPromptBridge {
   /** Last admitted messageID per session (once-per-admission dedupe). */
   const seenAdmissions = new Map<string, string>();
@@ -971,6 +982,11 @@ export function createSessionPromptBridge(
       if (typeof messageID !== 'string' || !messageID) return;
       if (seenAdmissions.get(sessionID) === messageID) return;
       seenAdmissions.set(sessionID, messageID);
+      try {
+        options.observeAdmission?.({ sessionID, messageID });
+      } catch (err) {
+        log('[v2] same-process admission observer failed', String(err));
+      }
       pruneSessionMap(seenAdmissions);
 
       const state = sessionState.get(sessionID);
@@ -1380,6 +1396,8 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
     // setup still needs the directory for config loading and tool adapters.
     const directory = resolveV2Directory(ctx);
     const disposers: Array<() => Promise<void> | void> = [];
+    const sameProcessResumeEvidence = createSameProcessResumeEvidence();
+    disposers.push(() => sameProcessResumeEvidence.dispose());
     let v1Hooks: Record<string, unknown> | undefined;
 
     // ── Storage domain (optional): background-job persistence ──
@@ -1441,7 +1459,10 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       log('[v2] ctx.generate.text', {
         available: typeof generateText === 'function',
       });
-      const pluginInput = buildPluginInput(ctx, generateChannel);
+      const pluginInput = buildPluginInput(ctx, {
+        ...(generateChannel ?? {}),
+        sameProcessResumeEvidence,
+      });
       log('[v2] calling OhMyOpenCodeLite...');
       v1Hooks = (await OhMyOpenCodeLite(
         pluginInput as never,
@@ -1453,11 +1474,15 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
     } catch (err) {
       log('[v2] FATAL: v1 factory init failed', String(err));
       console.error('[oh-my-opencode-slim][v2] factory init failed:', err);
+      sameProcessResumeEvidence.dispose();
       // Don't hard-fail the whole plugin; register nothing and stay loaded.
       return async () => {};
     }
 
-    if (!v1Hooks) return async () => {};
+    if (!v1Hooks) {
+      sameProcessResumeEvidence.dispose();
+      return async () => {};
+    }
 
     // Fail-loud unwinding: session hooks register
     // unconditionally, so any throw from here through the return below
@@ -1685,7 +1710,10 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       // contexts — a registration failure fails setup).
       let promptBridge: V2SessionPromptBridge | undefined;
       if (chatMessage) {
-        const bridge = createSessionPromptBridge(chatMessage);
+        const bridge = createSessionPromptBridge(chatMessage, {
+          observeAdmission: (admission) =>
+            sameProcessResumeEvidence.observeAdmission(admission),
+        });
         const promptReg = await ctx.session.hook('prompt', bridge.handlePrompt);
         disposers.push(() => promptReg.dispose());
         promptBridge = bridge;

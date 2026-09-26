@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { createInternalAgentTextPart } from '../../utils/internal-initiator';
+import { createSameProcessResumeEvidence } from '../../utils/same-process-resume-evidence';
 import { buildPluginInput } from '../../v2/client-shim';
 import {
   classifySessionRecovery,
@@ -147,10 +148,32 @@ function v2Recovery(
   parentTranscript: unknown,
   overrides: Partial<SessionRecoveryRequest> = {},
 ): SessionRecoveryRequest {
+  const resumeEvidence = createSameProcessResumeEvidence();
+  resumeEvidence.observeAdmission({
+    sessionID: taskID,
+    messageID: 'child-user',
+    createdAt: 110,
+  });
+  resumeEvidence.recordTerminal({
+    taskID,
+    parentSessionID: 'ses_parent',
+    generation: 3,
+    terminalRevision: 1,
+    state: 'completed',
+    resultSummary: 'Finished work.',
+    completedAt: 190,
+  });
+  resumeEvidence.observeAdmission({
+    sessionID: 'ses_parent',
+    messageID: 'parent-user-2',
+    createdAt: 214,
+  });
   return setup({
     probeStatus: undefined,
     getSession: async () => ({ data: v2Host }),
     readParentTranscript: async () => parentTranscript,
+    sameProcessResumeEvidence: resumeEvidence,
+    sameProcessResumeEvidenceContext: { generation: 3, terminalRevision: 1 },
     ...overrides,
   });
 }
@@ -552,6 +575,41 @@ describe('classifySessionRecovery', () => {
     ).toBe('uncertain');
   });
 
+  test('statusless v2.0.15 reuse requires exact same-process terminal evidence', async () => {
+    const parentTranscript = v2ParentResult();
+    expect(
+      await classifySessionRecovery(
+        v2Recovery(parentTranscript, {
+          sameProcessResumeEvidence: undefined,
+        }),
+      ),
+    ).toMatchObject({
+      kind: 'uncertain',
+      reason: 'same-process resume evidence unavailable',
+    });
+
+    expect(
+      await classifySessionRecovery(
+        v2Recovery(parentTranscript, {
+          sameProcessResumeEvidenceContext: {
+            generation: 3,
+            terminalRevision: 2,
+          },
+        }),
+      ),
+    ).toMatchObject({
+      kind: 'uncertain',
+      reason: 'same-process resume authorization unavailable',
+    });
+
+    expect(
+      await classifySessionRecovery(v2Recovery(parentTranscript)),
+    ).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true, resumeToken: {} },
+    });
+  });
+
   test('v2 shim running background part needs persisted task_result and a later parent turn', async () => {
     const parentMessages: Array<Record<string, unknown>> = [
       {
@@ -581,6 +639,26 @@ describe('classifySessionRecovery', () => {
         ],
       },
     ];
+    const resumeEvidence = createSameProcessResumeEvidence();
+    resumeEvidence.observeAdmission({
+      sessionID: taskID,
+      messageID: 'child-user',
+      createdAt: 110,
+    });
+    resumeEvidence.recordTerminal({
+      taskID,
+      parentSessionID: 'ses_parent',
+      generation: 3,
+      terminalRevision: 1,
+      state: 'completed',
+      resultSummary: 'Finished work.',
+      completedAt: 190,
+    });
+    resumeEvidence.observeAdmission({
+      sessionID: 'ses_parent',
+      messageID: 'parent-user-2',
+      createdAt: 214,
+    });
     const shim = buildPluginInput({
       location: { directory: '/project' },
       session: {
@@ -600,12 +678,6 @@ describe('classifySessionRecovery', () => {
                   time: { created: 120, completed: 190 },
                   finish: 'stop',
                   content: [{ type: 'text', text: 'Finished work.' }],
-                },
-                {
-                  id: 'c-idle',
-                  type: 'idle',
-                  time: { created: 200 },
-                  outcome: 'succeeded',
                 },
               ],
         get: async () => v2Host,
@@ -636,6 +708,11 @@ describe('classifySessionRecovery', () => {
           readChildTranscript: () => read(taskID),
           getSession: (id) => api.session.get({ path: { id } }),
           probeStatus: undefined,
+          sameProcessResumeEvidence: resumeEvidence,
+          sameProcessResumeEvidenceContext: {
+            generation: 3,
+            terminalRevision: 1,
+          },
         }),
       );
     // session.synthetic notifications are model-visible but absent from context.

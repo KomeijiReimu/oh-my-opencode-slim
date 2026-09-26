@@ -24,6 +24,7 @@ import {
 import { fetchChildTranscript } from '../../utils/child-transcript';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { getClient } from '../../utils/opencode-client';
+import type { SameProcessResumeEvidence } from '../../utils/same-process-resume-evidence';
 import { isGenuineOperatorMessage } from '../orchestrator-wake/index';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
@@ -189,6 +190,8 @@ export function createTaskSessionManagerHook(
     backgroundTaskConcurrency?: BackgroundTaskConcurrency;
     /** Shared by plugin generations for one admission runtime. */
     pendingCallTracker?: PendingCallTracker;
+    /** One process-local resume-evidence broker for this plugin generation. */
+    resumeEvidence?: SameProcessResumeEvidence;
     getModelForAgent?: (
       agentType: string,
       parentSessionID?: string,
@@ -605,6 +608,21 @@ export function createTaskSessionManagerHook(
       ) {
         return;
       }
+      if (typeof messageIdentity === 'string') {
+        const messageInfo = outputMessage ?? inputMessage;
+        const messageTime = isObjectRecord(messageInfo?.time)
+          ? messageInfo.time.created
+          : undefined;
+        options.resumeEvidence?.observeAdmission({
+          sessionID,
+          messageID: messageIdentity,
+          ...(typeof messageTime === 'number' &&
+          Number.isFinite(messageTime) &&
+          messageTime >= 0
+            ? { createdAt: messageTime }
+            : {}),
+        });
+      }
       idleSessionTokens.onExternalUserMessage(sessionID, messageIdentity);
     },
 
@@ -623,6 +641,7 @@ export function createTaskSessionManagerHook(
         getSessionModel: options.getSessionModel,
         sameProviderPolicy: options.sameProviderPolicy,
         pendingCallTracker,
+        resumeEvidence: options.resumeEvidence,
         taskContextTracker,
         getLifecycleEpoch: () => rehydrateState.nextEpoch,
         hasUntrackedRunningChild: options.hasUntrackedRunningChild,
@@ -652,6 +671,7 @@ export function createTaskSessionManagerHook(
         recordLifecycleSuppression: (taskID) =>
           recordBackgroundJobSuppression(backgroundJobBoard, taskID),
         pendingCallTracker,
+        resumeEvidence: options.resumeEvidence,
         taskContextTracker,
         clearRehydrateTombstone: (taskID) => {
           clearBackgroundJobSuppression(backgroundJobBoard, taskID);

@@ -256,6 +256,17 @@ a replacement; a truly missing child requires an explicit new task without
 `task_id`. A future host upgrade may enable recovery, but restart recovery is
 not seamless or automatic.
 
+There is one deliberately narrower same-process exception. Within one plugin
+setup generation, the terminal gate records a completed/error/cancelled
+publication with its exact board generation and terminal revision. After the
+parent retrieves the result and completes the required acknowledgement turn, a
+private, non-persisted resume token may authorize one same-ID `task()` admission
+on a statusless v2.0.15 host. The token is fenced by the child admission,
+generation, terminal revision, and result text; a new admission, plugin
+disposal, ambiguous send, or host restart invalidates it. This does not make
+v2.0.15 restart recovery automatic and does not authorize `task_message` or
+`task_revive` without their own host evidence.
+
 The control tools share the same recovery boundary. `task_status` may perform a
 read-only report for a verified exact session ID even when no durable alias can
 be adopted; it marks that result as read-only and does not make it eligible for

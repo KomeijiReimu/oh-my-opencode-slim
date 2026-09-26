@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BackgroundJobBoard } from '../utils/background-job-board';
 import { createBackgroundJobIdentityIndex } from '../utils/background-job-identity-index';
+import { createSameProcessResumeEvidence } from '../utils/same-process-resume-evidence';
 import { createTaskControlRecovery } from './task-control-recovery';
 
 const identity = {
@@ -72,6 +73,12 @@ function makeRecovery(options: {
   timeoutMs?: number;
   baselineReadTimeoutMs?: number;
   hasStatus?: boolean;
+  sameProcessResumeEvidence?: ReturnType<
+    typeof createSameProcessResumeEvidence
+  >;
+  sameProcessResumeEvidenceContextFor?: (
+    taskID: string,
+  ) => { generation: number; terminalRevision: number } | undefined;
 }) {
   const session: {
     messages: ({ path }: { path: { id: string } }) => Promise<unknown>;
@@ -104,6 +111,9 @@ function makeRecovery(options: {
     readParentTranscript: options.readParentTranscript,
     readChildTranscript: options.readChildTranscript,
     probeStatus: options.probeStatus,
+    sameProcessResumeEvidence: options.sameProcessResumeEvidence,
+    sameProcessResumeEvidenceContextFor:
+      options.sameProcessResumeEvidenceContextFor,
     now: () => 300,
     timeoutMs: options.timeoutMs,
     baselineReadTimeoutMs: options.baselineReadTimeoutMs,
@@ -447,6 +457,138 @@ describe('task control orphan recovery', () => {
       classification: { kind: 'uncertain' },
     });
     expect(board.list('parent')).toHaveLength(0);
+  });
+
+  test('allows statusless v2 reuse only with broker-authorized terminal evidence', async () => {
+    const parent = {
+      data: [
+        {
+          info: {
+            id: 'call',
+            role: 'assistant',
+            sessionID: 'parent',
+            time: { created: 90 },
+          },
+          parts: [
+            {
+              type: 'tool',
+              name: 'subagent',
+              state: {
+                status: 'completed',
+                input: {
+                  agent: 'fixer',
+                  background: true,
+                  description: 'Implement fix',
+                },
+                output: 'task_id: ses_child\nstate: running',
+                time: { start: 90, end: 100 },
+              },
+            },
+          ],
+        },
+        {
+          info: {
+            id: 'result',
+            role: 'assistant',
+            sessionID: 'parent',
+            time: { created: 214 },
+          },
+          parts: [
+            {
+              type: 'tool',
+              name: 'task_result',
+              state: {
+                status: 'completed',
+                input: { task_id: 'fix-1' },
+                time: { start: 214, end: 215 },
+                output: 'Finished work.',
+              },
+            },
+          ],
+        },
+        {
+          info: {
+            id: 'ack',
+            role: 'assistant',
+            sessionID: 'parent',
+            time: { created: 240, completed: 241 },
+            finish: 'stop',
+          },
+          parts: [{ type: 'text', text: 'Result received.' }],
+        },
+      ],
+    };
+    const child = {
+      data: [
+        {
+          info: { id: 'child-user', role: 'user', time: { created: 110 } },
+          parts: [],
+        },
+        {
+          info: {
+            id: 'child-answer',
+            role: 'assistant',
+            time: { created: 120, completed: 190 },
+            finish: 'stop',
+          },
+          parts: [{ type: 'text', text: 'Finished work.' }],
+        },
+      ],
+    };
+    const noBroker = makeRecovery({
+      status: { data: {} },
+      hasStatus: false,
+      readParentTranscript: async () => parent,
+      readChildTranscript: async () => child,
+    });
+    await expect(
+      noBroker.recovery.resolve('parent', 'fix-1'),
+    ).resolves.toMatchObject({
+      kind: 'orphan',
+      classification: { kind: 'uncertain' },
+    });
+
+    const broker = createSameProcessResumeEvidence();
+    broker.observeAdmission({
+      sessionID: 'ses_child',
+      messageID: 'child-user',
+      createdAt: 110,
+    });
+    broker.recordTerminal({
+      taskID: 'ses_child',
+      parentSessionID: 'parent',
+      generation: 3,
+      terminalRevision: 1,
+      state: 'completed',
+      resultSummary: 'Finished work.',
+      completedAt: 190,
+    });
+    broker.observeAdmission({
+      sessionID: 'parent',
+      messageID: 'parent-user-2',
+      createdAt: 214,
+    });
+    const allowed = makeRecovery({
+      status: { data: {} },
+      hasStatus: false,
+      readParentTranscript: async () => parent,
+      readChildTranscript: async () => child,
+      sameProcessResumeEvidence: broker,
+      sameProcessResumeEvidenceContextFor: () => ({
+        generation: 3,
+        terminalRevision: 1,
+      }),
+    });
+    await expect(
+      allowed.recovery.resolve('parent', 'fix-1'),
+    ).resolves.toMatchObject({
+      kind: 'recovered',
+      classification: {
+        kind: 'reusable',
+        evidence: { acknowledged: true, resumeToken: {} },
+      },
+    });
+    broker.dispose();
   });
 
   test('does not adopt an exact native ID without fresh status evidence', async () => {
