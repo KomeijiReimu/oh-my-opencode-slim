@@ -536,6 +536,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     })();
     webfetch = createWebfetchTool(ctx, {
       binaryDir: undefined,
+      imageRouting: () => runtime.imageRouting,
       webfetchModels,
       explorerModel: pickAgentModelRef(runtime.agent('explorer')?.model),
       librarianModel: pickAgentModelRef(runtime.agent('librarian')?.model),
