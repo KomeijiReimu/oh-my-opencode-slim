@@ -230,6 +230,37 @@ describe('same-process resume evidence', () => {
     ).toBeDefined();
   });
 
+  test('a recorded first run does not block the next completed run', () => {
+    const broker = createSameProcessResumeEvidence();
+    broker.observeAdmission({
+      sessionID: admission.sessionID,
+      messageID: 'child-user-1',
+    });
+    broker.recordTerminal({ ...terminal, completedAt: undefined });
+    broker.observeAdmission({
+      sessionID: admission.sessionID,
+      messageID: 'child-user-2',
+    });
+    broker.recordTerminal({
+      ...terminal,
+      generation: terminal.generation + 1,
+      resultSummary: 'second run',
+      completedAt: undefined,
+    });
+
+    expect(
+      broker.authorize({
+        taskID: terminal.taskID,
+        parentSessionID: terminal.parentSessionID,
+        generation: terminal.generation + 1,
+        terminalRevision: terminal.terminalRevision,
+        resultSummary: 'second run',
+        acknowledgedAt: 30,
+      }),
+    ).toBeDefined();
+    expect(authorize(broker)).toBeUndefined();
+  });
+
   test('a parent follow-up after child terminal does not revoke child evidence', () => {
     const broker = brokerWithTerminal();
     const token = authorize(broker);

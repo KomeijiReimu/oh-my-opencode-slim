@@ -209,9 +209,15 @@ export function createSameProcessResumeEvidence(): SameProcessResumeEvidence {
 
   const admissionsBySession = new Map<string, AdmissionRecord>();
   const terminalsByTask = new Map<string, TerminalRecord>();
-  /** A newer admission replaced the turn that produced a result before that
-   * result was recorded. The next terminal for that session must not attach. */
+  /** No terminal was recorded before this admission changed. The next
+   * terminal still belongs to the previous turn and must not attach. */
   const unmatchedTerminal = new Set<string>();
+  /** A recorded terminal was invalidated by a newer admission. A repeat of
+   * that same result must not attach, but a later run may. */
+  const supersededTerminal = new Map<
+    string,
+    { generation: number; terminalRevision: number; resultDigest: string }
+  >();
   let tokens = new WeakMap<object, TokenState>();
   let claims = new WeakMap<object, ClaimState>();
 
@@ -262,9 +268,16 @@ export function createSameProcessResumeEvidence(): SameProcessResumeEvidence {
       }
 
       if (existing) {
+        const previous = terminalsByTask.get(admission.sessionID);
         invalidateSession(admission.sessionID);
         admissionsBySession.delete(admission.sessionID);
-        unmatchedTerminal.add(admission.sessionID);
+        if (previous) {
+          supersededTerminal.set(admission.sessionID, {
+            generation: previous.generation,
+            terminalRevision: previous.terminalRevision,
+            resultDigest: previous.resultDigest,
+          });
+        } else unmatchedTerminal.add(admission.sessionID);
       }
       while (admissionsBySession.size >= MAX_ADMISSION_RECORDS) {
         const oldest = admissionsBySession.keys().next().value;
@@ -289,6 +302,15 @@ export function createSameProcessResumeEvidence(): SameProcessResumeEvidence {
       if (unmatchedTerminal.delete(terminal.taskID)) return;
 
       const digest = resultDigest(terminal.resultSummary);
+      const superseded = supersededTerminal.get(terminal.taskID);
+      if (
+        superseded &&
+        superseded.generation === terminal.generation &&
+        superseded.terminalRevision === terminal.terminalRevision &&
+        superseded.resultDigest === digest
+      )
+        return;
+      supersededTerminal.delete(terminal.taskID);
       const previous = terminalsByTask.get(terminal.taskID);
       if (
         previous &&
@@ -433,6 +455,7 @@ export function createSameProcessResumeEvidence(): SameProcessResumeEvidence {
       clearTerminals();
       admissionsBySession.clear();
       unmatchedTerminal.clear();
+      supersededTerminal.clear();
       tokens = new WeakMap();
       claims = new WeakMap();
     },
