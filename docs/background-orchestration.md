@@ -79,9 +79,14 @@ it is not yet known to be delegated work. Attribution through the existing task
 launch path promotes it to an ordinary listed task, including recovery wakes.
 This distinction uses explicit provenance, not agent names or description text.
 
-Aliases and reusable-session history are process-local and do not survive process
-restarts as a reusable board. Post-restart recovery is partial and best-effort;
-it does not guarantee restoration of those aliases or the complete history.
+Newly launched aliases are stored in a per-project private local identity index
+when writable; if reservation fails, the board uses the exact task ID instead.
+After restart, reuse requires verification against the host; the index alone is
+not proof of a reusable child. Pre-upgrade aliases cannot be reconstructed, but
+an exact task ID can be checked against structured parent delegation and host
+session evidence. This preserves the identity and context of an existing child,
+not proof that its latest run finished. Recovery remains partial, not a
+restoration of full history.
 
 ---
 
@@ -185,6 +190,8 @@ A cancelled, errored, or stopped retained session may be revived immediately
 once its retained state has been verified safe. Acknowledgement controls parent
 and job-board consumption and reusable-pool display, not same-session revival.
 `task()` never drops an explicit `task_id` to spawn another session.
+After a host restart, `task_revive` also needs current-run host idle proof; a
+preserved session alone cannot authorize a new instruction.
 
 Terminal jobs are reconciled automatically after their result is injected into
 the orchestrator session. That lifecycle state is not proof the output was used;
@@ -214,19 +221,52 @@ idle parent with incomplete todos after continuous idle time; it does not depend
 on the local job board.
 
 After a full OpenCode or plugin restart, persisted running background-task
-history is rehydrated into the local job board and immediately reconciled against
-live host session status. A missing or idle child is a stop candidate: after a
-5s confirmation grace it is surfaced as `stopped, unreconciled`, while a busy
-child remains running; status lookup failures remain uncertain rather than being
-treated as completion. When the host client exposes `session.get`, each newly
-rehydrated task is also probed for existence: a session deleted while the plugin
-was down is tombstoned and torn down instead of resurrecting as a
-forever-running ghost, and a session that already reached a terminal host
-outcome is settled to it (the typed NotFound classification is a v2
-in-process artifact — on v1 hosts the probe harmlessly never tombstones). On
+history is rehydrated into the local job board and reconciled against available
+host evidence. Where live status is available, a missing or idle child is a stop
+candidate: after a 5s confirmation grace it is surfaced as `stopped,
+unreconciled`, while a busy child remains running; status lookup failures remain
+uncertain. When the host client exposes `session.get`, each newly rehydrated task
+is also probed for existence: a session deleted while the plugin was down is
+tombstoned and torn down instead of resurrecting as a forever-running ghost.
+An attributable terminal host outcome can settle an existing child; mere
+existence cannot (the typed NotFound classification is a v2 in-process artifact
+— on v1 hosts the probe harmlessly never tombstones). On
 OpenCode v2 hosts with the optional `ctx.storage` domain, deletion tombstones
 and alias counters additionally persist across host restarts (see the
 [v2 compatibility doc](opencode-v2-compatibility.md#background-job-state-rehydrate-probe-and-persistence)).
+
+Explicit `task_id` reuse after restart is fail-closed: a stored alias or exact
+ID must resolve to the same parent's child and have attributable current-run
+terminal/idle and parent-acknowledgement evidence. If alias reservation fails,
+use the exact task ID: with a readable index but no mapping, it can be checked
+via structured parent delegation. An alias without its mapping cannot be
+recovered; an unreadable index fails closed. OpenCode v2.0.15 does not persist
+`Session.Info.outcome` or `time.idle`, nor a durable idle message. After restart,
+`session.get` status is absent and `wait`/active state is process-local;
+`time.updated` cannot prove the current run completed. Thus orphan
+`task_result` intentionally returns `pending` without current-run host idle
+proof, even for a completed child with its ID/alias and context preserved.
+Result retrieval and automatic same-ID `task` resume require a host exposing
+attributable durable terminal outcome/idle evidence; this is not guaranteed on
+the pinned v2.0.15 host. Even when a later host supplies that proof, the parent
+must call `task_result` for a synthetic (nonpersisted) completion and complete a
+following assistant turn before same-ID resume. `task_revive` cannot bypass
+missing current-run idle proof. An unknown explicit ID is never dropped to spawn
+a replacement; a truly missing child requires an explicit new task without
+`task_id`. A future host upgrade may enable recovery, but restart recovery is
+not seamless or automatic.
+
+The control tools share the same recovery boundary. `task_status` may perform a
+read-only report for a verified exact session ID even when no durable alias can
+be adopted; it marks that result as read-only and does not make it eligible for
+`task_message` or `task_revive`. `task_message` only writes to a verified live
+child, while `task_revive` only writes to a verified retained child and never
+aborts an orphan merely because its session record still exists. Before either
+write, a bounded child-transcript baseline read and a durable operation claim
+are required. Claims use token-fenced phases (`prepared`, `sent_unknown`,
+`accepted`, and `compensating`): deterministic pre-send failures and explicit
+host rejections may clear a claim, but a timeout or generic transport failure
+keeps the claim quarantined until admission is proven or safely compensated.
 
 Specialist outputs are inputs, not final truth. The orchestrator reconciles them
 against each other and the original user goal.
@@ -372,6 +412,8 @@ been verified safe. Acknowledgement controls parent and job-board consumption
 and reusable-pool display, not same-session revival. Stopped sessions stay out
 of the ordinary `task()` reuse pool because that generation has no terminal
 result; after ack they appear under Retained / Recovery.
+After restart, verification also requires attributable current-run idle proof;
+retention alone does not make revival safe.
 
 The current todo list can represent user-visible work, but task IDs and file
 ownership need to be explicit in the orchestrator's working context.
@@ -457,18 +499,19 @@ spell and stops polling until new activity.
 
 **v2 hosts (children-driven degraded mode):** v2 has no todo/children/status
 surfaces, so with `mode: "auto"` the scheduler runs in children-driven mode.
-The wake condition becomes "children without a terminal `outcome`" — v2
-records an outcome (succeeded|failed|interrupted) only on terminal transition —
-plus pending stopped-job recovery. Children are enumerated via
-`session.list({parentID})` (event-tracked fallback from `session.created`
-links when the listing is unavailable), scoped to the session's directory, and
-a child with no fresh update evidence (host `time.updated` or a tracked status
-change within 3× the interval) counts as inactive. The wake prompt asks the
-orchestrator to check on unfinished background child sessions and unreconciled
-jobs, is delivered with `queue` semantics (like v1's queued prompt_async), and
-the children-only fingerprint keeps the two-wake no-progress cap bounding
-cost. v2's native subagent completion nudges still cover the happy path; this
-watchdog covers stuck children and unreconciled jobs.
+The wake condition becomes "children without a terminal `outcome`" where the
+host exposes it (succeeded|failed|interrupted), plus pending stopped-job
+recovery. Pinned v2.0.15 does not persist `outcome` across restarts. Children
+are enumerated via `session.list({parentID})` (event-tracked fallback from
+`session.created` links when the listing is unavailable), scoped to the
+session's directory. A child with no fresh update evidence (host
+`time.updated` or a tracked status change within 3× the interval) counts as
+inactive. Freshness is a watchdog heuristic, not current-run completion proof.
+The wake prompt asks the orchestrator to check on unfinished background child
+sessions and unreconciled jobs. It is delivered with `queue` semantics (like
+v1's queued prompt_async); the children-only fingerprint bounds cost with a
+two-wake no-progress cap. v2's native subagent completion nudges still cover
+the happy path; this watchdog covers stuck children and unreconciled jobs.
 
 For external manual work, the orchestrator first gives the user concrete steps,
 then calls `wait_for_user` as its final tool action. This explicit signal covers

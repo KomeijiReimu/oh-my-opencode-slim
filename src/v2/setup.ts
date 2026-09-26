@@ -1242,8 +1242,9 @@ export function createToolExecuteBridges(
     // is exactly the v1 shape, where a failed tool's model-visible
     // output WAS the error message — so error-recovery consumers
     // (json-error-recovery appends its reminder to output.output) still
-    // run meaningfully. An errored call never presents its result
-    // content as a successful output.
+    // run meaningfully. Forward the native status separately so consumers
+    // do not mistake error text resembling a task admission for success.
+    // An errored call never presents its result content as successful output.
     const errored = e.status === 'error';
     // Map v2 Tool.Result.content (string | Content[]) -> v1 output.output
     // string; the v1 after-hooks (jsonErrorRecovery, taskSessionManagerAfter)
@@ -1286,6 +1287,7 @@ export function createToolExecuteBridges(
         sessionID: e.sessionID,
         callID: e.id,
         args: isDelegation ? subagentArgsToV1(e.input) : e.input,
+        nativeToolStatus: errored ? 'error' : 'completed',
       },
       output,
     );

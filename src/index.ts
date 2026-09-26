@@ -85,6 +85,7 @@ import {
   resolveEventSessionID,
   TaskActivityTracker,
 } from './tools/task-activity';
+import { createTaskControlRecovery } from './tools/task-control-recovery';
 import {
   clearTuiAgentActivities,
   clearTuiSessionAlias,
@@ -108,6 +109,7 @@ import type {
   BackgroundJobRecord,
   ContextFile,
 } from './utils/background-job-board';
+import { createBackgroundJobIdentityIndex } from './utils/background-job-identity-index';
 import {
   type BackgroundJobTerminalGate,
   createBackgroundJobTerminalGate,
@@ -533,11 +535,26 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       librarianModel: pickAgentModelRef(runtime.agent('librarian')?.model),
       smallModelRef: () => runtime.smallModel(),
     });
+    const identityIndex = createBackgroundJobIdentityIndex(ctx.directory);
     backgroundJobBoard = new BackgroundJobBoard({
       maxReusablePerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
       maxContextLines: runtime.backgroundJobs.maxContextLines,
       readContextMinLines: runtime.backgroundJobs.readContextMinLines,
       readContextMaxFiles: runtime.backgroundJobs.readContextMaxFiles,
+      aliasAllocator: (
+        parentSessionID,
+        agent,
+        taskID,
+        prefix,
+        minimumCounter,
+      ) =>
+        identityIndex.reserve(
+          parentSessionID,
+          taskID,
+          agent,
+          prefix,
+          minimumCounter,
+        ).alias,
     });
     admissionRuntimeLease = acquireAdmissionRuntime(
       ctx.directory,
@@ -549,6 +566,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     const backgroundJobCoordinator = new BackgroundJobCoordinator(
       backgroundJobBoard,
     );
+    const taskControlRecovery = createTaskControlRecovery({
+      input: ctx,
+      backgroundJobBoard: backgroundJobCoordinator,
+      identityIndex,
+      hostClient: ctx.client,
+    });
     // Project launch identity (alias↔session) into TUI state so the
     // clickable sidebar can label active subagent sessions. Best-effort:
     // a failed tui-state write must never fail a launch.
@@ -737,6 +760,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       readContextMinLines: runtime.backgroundJobs.readContextMinLines,
       readContextMaxFiles: runtime.backgroundJobs.readContextMaxFiles,
       backgroundJobBoard: backgroundJobCoordinator,
+      identityIndex,
       backgroundJobSupervisor,
       backgroundTaskConcurrency,
       hasUntrackedRunningChild: async (parentSessionID?: string) => {
@@ -1030,6 +1054,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     taskMessageTools = createTaskMessageTool({
       input: ctx,
       backgroundJobBoard: backgroundJobCoordinator,
+      recovery: taskControlRecovery,
     });
     taskReplyTools = createTaskReplyTool({
       input: ctx,
@@ -1039,6 +1064,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       input: ctx,
       backgroundJobBoard: backgroundJobCoordinator,
       terminalGate,
+      identityIndex,
     });
     taskReviveTools = createTaskReviveTool({
       terminalGate,
@@ -1049,11 +1075,15 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         sessionMetadata.isTaskManaged(sessionID),
       backgroundJobSupervisor,
       revivedRunTracker,
+      recovery: taskControlRecovery,
+      identityIndex,
     });
     taskStatusTools = createTaskStatusTool({
       input: ctx,
       backgroundJobBoard: backgroundJobCoordinator,
       activityTracker: taskActivityTracker,
+      recovery: taskControlRecovery,
+      identityIndex,
     });
     waitForUserTools = createWaitForUserTool({
       shouldManageSession: (sessionID) =>

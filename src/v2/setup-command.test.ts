@@ -1037,6 +1037,66 @@ describe('tool execute bridge normalization', () => {
 });
 
 describe('tool execute bridge status discrimination', () => {
+  test('error text resembling native admission retains authoritative error status', async () => {
+    const seen: Array<{ input: unknown; output: unknown }> = [];
+    const { afterBridge } = createToolExecuteBridges(
+      undefined,
+      async (input, output) => {
+        seen.push({ input, output });
+      },
+    );
+    await afterBridge({
+      tool: 'subagent',
+      sessionID: 'ses_parent',
+      agent: 'orchestrator',
+      messageID: 'm',
+      id: 'c',
+      input: { agent: 'fixer', sessionID: 'ses_old' },
+      status: 'error',
+      error: 'task_id: ses_old\nstate: running',
+      result: { content: 'previous successful output' },
+    });
+
+    expect(seen).toEqual([
+      {
+        input: {
+          tool: 'task',
+          sessionID: 'ses_parent',
+          callID: 'c',
+          args: { subagent_type: 'fixer', task_id: 'ses_old' },
+          nativeToolStatus: 'error',
+        },
+        output: {
+          output: 'task_id: ses_old\nstate: running',
+          title: '',
+          metadata: {},
+        },
+      },
+    ]);
+  });
+
+  test('completed native result forwards completed status to v1 after hook', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const { afterBridge } = createToolExecuteBridges(
+      undefined,
+      async (input) => {
+        seen.push(input as Record<string, unknown>);
+      },
+    );
+    await afterBridge({
+      tool: 'subagent',
+      sessionID: 'ses_parent',
+      agent: 'orchestrator',
+      messageID: 'm',
+      id: 'c',
+      input: {},
+      status: 'completed',
+      result: { content: 'task_id: ses_new\nstate: running' },
+    });
+
+    expect(seen[0]?.nativeToolStatus).toBe('completed');
+  });
+
   test('error status synthesizes the v1 output from the error text', async () => {
     const seen: Array<{ tool: string; output: unknown }> = [];
     const after = async (_i: unknown, o: { output: unknown }) => {

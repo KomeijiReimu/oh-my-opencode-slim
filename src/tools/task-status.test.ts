@@ -1,5 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../utils/background-job-board';
+import type { TaskControlRecovery } from './task-control-recovery';
+import { createTaskControlRecovery } from './task-control-recovery';
+import { createTaskMessageTool } from './task-message';
+import { createTaskReviveTool } from './task-revive';
 import { createTaskStatusTool } from './task-status';
 
 let client: Record<string, any>;
@@ -9,16 +13,170 @@ function makeTool(options: {
   board: BackgroundJobBoard;
   now?: () => number;
   statusTimeoutMs?: number;
+  identityIndex?: any;
+  recovery?: TaskControlRecovery;
 }) {
   return createTaskStatusTool({
     input: { directory: '/test' } as any,
     backgroundJobBoard: options.board,
     now: options.now,
     statusTimeoutMs: options.statusTimeoutMs,
+    identityIndex: options.identityIndex,
+    recovery: options.recovery,
   });
 }
 
+const recoveredIdentity = {
+  parentSessionID: 'parent-1',
+  taskID: 'ses_orphan',
+  agent: 'fixer',
+  alias: 'fix-1',
+  directory: '/test',
+};
+
+const recoveredParent = {
+  data: [
+    {
+      info: { id: 'call', role: 'assistant', sessionID: 'parent-1' },
+      parts: [
+        {
+          type: 'tool',
+          name: 'task',
+          state: {
+            input: { subagent_type: 'fixer', background: true },
+            output: 'task_id: ses_orphan\nstate: running',
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe('task_status', () => {
+  test('adopts an exact orphan alias and reports recovered live state', async () => {
+    const board = new BackgroundJobBoard();
+    client = {
+      session: {
+        messages: mock(async ({ path }: { path: { id: string } }) =>
+          path.id === 'parent-1' ? recoveredParent : { data: [] },
+        ),
+        get: mock(async () => ({
+          data: {
+            id: 'ses_orphan',
+            parentID: 'parent-1',
+            directory: '/test',
+          },
+        })),
+        status: mock(async () => ({
+          data: { ses_orphan: { type: 'busy' } },
+        })),
+      },
+    };
+    const { task_status } = makeTool({
+      board,
+      identityIndex: { lookup: () => recoveredIdentity },
+    });
+
+    const output = await task_status.execute({ task_id: 'fix-1' }, {
+      sessionID: 'parent-1',
+    } as any);
+
+    expect(output).toContain('state: busy');
+    expect(output).toContain('recovered: true');
+    expect(board.resolve('parent-1', 'fix-1')).toMatchObject({
+      taskID: 'ses_orphan',
+    });
+  });
+
+  test('reads an exact orphan session ID read-only without an identity index', async () => {
+    const board = new BackgroundJobBoard();
+    client = {
+      session: {
+        messages: mock(async ({ path }: { path: { id: string } }) =>
+          path.id === 'parent-1' ? recoveredParent : { data: [] },
+        ),
+        get: mock(async () => ({
+          data: {
+            id: 'ses_orphan',
+            parentID: 'parent-1',
+            directory: '/test',
+          },
+        })),
+        status: mock(async () => ({
+          data: { ses_orphan: { type: 'busy' } },
+        })),
+      },
+    };
+    const { task_status } = makeTool({ board });
+
+    const output = await task_status.execute({ task_id: 'ses_orphan' }, {
+      sessionID: 'parent-1',
+    } as any);
+
+    expect(output).toContain('Task ses_orphan (ses_orphan)');
+    expect(output).toContain('state: busy');
+    expect(output).toContain('recovered: true');
+    expect(output).toContain('read_only: true');
+    expect(output).toContain('control_operations: blocked');
+    expect(board.resolve('parent-1', 'ses_orphan')).toBeUndefined();
+  });
+
+  test('keeps exact orphan controls blocked after a read-only status lookup', async () => {
+    const board = new BackgroundJobBoard();
+    client = {
+      session: {
+        messages: mock(async ({ path }: { path: { id: string } }) =>
+          path.id === 'parent-1' ? recoveredParent : { data: [] },
+        ),
+        get: mock(async () => ({
+          data: {
+            id: 'ses_orphan',
+            parentID: 'parent-1',
+            directory: '/test',
+          },
+        })),
+        status: mock(async () => ({
+          data: { ses_orphan: { type: 'busy' } },
+        })),
+      },
+    };
+    const input = { directory: '/test' } as any;
+    const recovery = createTaskControlRecovery({
+      input,
+      backgroundJobBoard: board,
+    });
+    const { task_status } = makeTool({ board, recovery });
+    const { task_message } = createTaskMessageTool({
+      input,
+      backgroundJobBoard: board,
+      recovery,
+    });
+    const { task_revive } = createTaskReviveTool({
+      input,
+      backgroundJobBoard: board,
+      shouldManageSession: () => true,
+      revivedRunTracker: {} as any,
+      recovery,
+    });
+
+    await expect(
+      task_status.execute({ task_id: 'ses_orphan' }, {
+        sessionID: 'parent-1',
+      } as any),
+    ).resolves.toContain('read_only: true');
+    expect(board.resolve('parent-1', 'ses_orphan')).toBeUndefined();
+    await expect(
+      task_message.execute({ task_id: 'ses_orphan', message: 'hello' }, {
+        sessionID: 'parent-1',
+      } as any),
+    ).rejects.toThrow('orphan recovery is not safe');
+    await expect(
+      task_revive.execute({ task_id: 'ses_orphan', prompt: 'continue' }, {
+        sessionID: 'parent-1',
+      } as any),
+    ).rejects.toThrow('orphan recovery is not safe');
+  });
+
   test('reads a child status without prompting it', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({

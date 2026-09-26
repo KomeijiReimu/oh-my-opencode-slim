@@ -22,6 +22,8 @@ export interface PendingTaskCall {
   /** Deletion epoch observed when this native task call started. */
   lifecycleEpoch: number;
   resumedTaskId?: string;
+  /** Persistent cross-process intent; never settle on eviction or lost output. */
+  resumeClaim?: { parentSessionID: string; taskID: string; token: string };
   relaunchLease?: BackgroundJobLease;
   /** Board generation that owns the relaunch lease. */
   releaseLease?: (lease: BackgroundJobLease) => boolean;
@@ -46,8 +48,9 @@ export interface PendingCallTracker {
     options?: { recordConsumed?: boolean },
   ): PendingTaskCall | undefined;
   /** Remove and return the pending call whose early registration claimed
-   * `taskID` for this parent — an identity-verified take for hosts that
-   * do not supply tool call IDs. When `ownerBoard` is given and the
+   * `taskID` for this parent, or a uniquely pinned same-ID resume with a
+   * relaunch lease — an identity-verified take for hosts without call IDs.
+   * When `ownerBoard` is given and the
    * early registration was adopted by a different board generation, the
    * pending is left for that generation (same fence as `take`). */
   takeByTaskID(
@@ -318,13 +321,16 @@ export function createPendingCallTracker(
       taskID: string,
       ownerBoard?: BackgroundJobStore,
     ) {
-      for (const [callId, call] of pendingCalls.entries()) {
-        if (
-          call.parentSessionId !== parentSessionId ||
-          call.earlyRegisteredTaskID !== taskID
-        ) {
-          continue;
-        }
+      const matching = [...pendingCalls.entries()].filter(
+        ([, call]) =>
+          call.parentSessionId === parentSessionId &&
+          (call.earlyRegisteredTaskID === taskID ||
+            (call.resumedTaskId === taskID &&
+              call.relaunchLease?.taskID === taskID &&
+              !call.identityUnresolved)),
+      );
+      if (matching.length !== 1) return undefined;
+      for (const [callId, call] of matching) {
         if (
           call.earlyRegistration &&
           ownerBoard &&
