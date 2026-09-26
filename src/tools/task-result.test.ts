@@ -1,9 +1,10 @@
-import { afterEach, expect, mock, test } from 'bun:test';
+import { afterEach, expect, jest, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../utils/background-job-board';
 import {
   type BackgroundJobTerminalGate,
   createBackgroundJobTerminalGate,
 } from '../utils/background-job-terminal-gate';
+import { getRuntimeSessionStatusSnapshot } from '../utils/session-runtime-status';
 import { createTaskResultTool } from './task-result';
 
 mock.module('../utils/opencode-client', () => ({
@@ -412,6 +413,17 @@ test.each([false, true])(
   },
 );
 
+test.each(['exp-1', 'ses_child1'])(
+  'indexed orphan recovers final text with absent idle key by %s',
+  async (taskID) => {
+    const h = harness(false);
+    h.status.mockResolvedValue({ data: {} });
+    expect(await h.execute(taskID)).toBe('final findings');
+    expect(h.status).toHaveBeenCalledTimes(2);
+    expect(h.messages).toHaveBeenCalledTimes(1);
+  },
+);
+
 test('indexed running entry can recover terminal result without board acknowledgement', async () => {
   const h = harness(true, true);
   const before = { ...h.run };
@@ -448,9 +460,38 @@ test('indexed running result fails closed if board relaunches during retrieval',
 test('indexed v1 idle recheck refuses a concurrent new run', async () => {
   const h = harness(false);
   h.status
-    .mockResolvedValueOnce({ data: { ses_child1: { type: 'idle' } } })
+    .mockResolvedValueOnce({ data: {} })
     .mockResolvedValueOnce({ data: { ses_child1: { type: 'busy' } } });
   expect(await h.execute()).not.toContain('final findings');
+});
+
+test.each(['busy', 'retry'])(
+  'indexed v1 absent key recheck blocks a new %s state',
+  async (type) => {
+    const h = harness(false);
+    h.status
+      .mockResolvedValueOnce({ data: {} })
+      .mockResolvedValueOnce({ data: { ses_child1: { type } } });
+    expect(await h.execute()).toContain('state: running (unconfirmed)');
+    expect(h.messages).toHaveBeenCalledTimes(1);
+  },
+);
+
+test('indexed v1 absent key cannot return an earlier turn after new admission', async () => {
+  const h = harness(false);
+  h.status.mockResolvedValue({ data: {} });
+  h.messages.mockResolvedValue({
+    data: [
+      { info: { role: 'user', time: { created: 2 } }, parts: [] },
+      {
+        info: { role: 'assistant', finish: 'stop', time: { completed: 10 } },
+        parts: [{ type: 'text', text: 'old answer' }],
+      },
+      { info: { role: 'user', time: { created: 20 } }, parts: [] },
+    ],
+  } as never);
+  expect(await h.execute()).toContain('state: running (unconfirmed)');
+  expect(h.status).toHaveBeenCalledTimes(1);
 });
 
 test('unindexed orphan exact ID cannot read a foreign session', async () => {
@@ -703,14 +744,99 @@ test.each(['busy', 'retry'])(
   },
 );
 
-test('indexed v1 missing idle and unavailable status fail closed', async () => {
-  const h = harness(false);
-  h.status.mockResolvedValue({ data: {} });
-  expect(await h.execute()).toContain('state: running (unconfirmed)');
-  h.status.mockRejectedValue(new Error('status unavailable'));
-  expect(await h.execute()).toContain('state: running (unconfirmed)');
-  expect(h.messages).not.toHaveBeenCalled();
-});
+test.each([
+  ['error envelope', { error: { name: 'Unavailable' } }],
+  ['invalid map', { data: { type: 'idle' } }],
+  ['malformed child entry', { data: { ses_child1: { type: 'unknown' } } }],
+  ['missing data', {}],
+] as const)(
+  'indexed v1 %s fails closed before and after transcript',
+  async (_case, response) => {
+    for (const stage of ['before', 'after'] as const) {
+      const h = harness(false);
+      if (stage === 'before') h.status.mockResolvedValueOnce(response as never);
+      else
+        h.status
+          .mockResolvedValueOnce({ data: {} })
+          .mockResolvedValueOnce(response as never);
+      expect(await h.execute()).toContain('state: running (unconfirmed)');
+      expect(h.messages).toHaveBeenCalledTimes(stage === 'before' ? 0 : 1);
+    }
+  },
+);
+
+test.each(['before', 'after'] as const)(
+  'indexed v1 status transport error %s transcript fails closed',
+  async (stage) => {
+    const h = harness(false);
+    if (stage === 'after') h.status.mockResolvedValueOnce({ data: {} });
+    h.status.mockRejectedValueOnce(new Error('status unavailable'));
+    expect(await h.execute()).toContain('state: running (unconfirmed)');
+    expect(h.messages).toHaveBeenCalledTimes(stage === 'before' ? 0 : 1);
+  },
+);
+
+test.each(['before', 'after'] as const)(
+  'indexed v1 timed out status %s transcript fails closed',
+  async (stage) => {
+    jest.useFakeTimers();
+    let release: (() => void) | undefined;
+    try {
+      const h = harness(false);
+      if (stage === 'after') h.status.mockResolvedValueOnce({ data: {} });
+      h.status.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve({ data: {} } as never);
+          }),
+      );
+      const result = h.execute();
+      for (
+        let i = 0;
+        i < 20 && h.status.mock.calls.length < (stage === 'before' ? 1 : 2);
+        i++
+      )
+        await Promise.resolve();
+      expect(h.status).toHaveBeenCalledTimes(stage === 'before' ? 1 : 2);
+      jest.advanceTimersByTime(5_000);
+      expect(await result).toContain('state: running (unconfirmed)');
+      expect(h.messages).toHaveBeenCalledTimes(stage === 'before' ? 0 : 1);
+    } finally {
+      release?.();
+      jest.useRealTimers();
+    }
+  },
+);
+
+test.each(['before', 'after'] as const)(
+  'indexed v1 open status read %s transcript fails closed',
+  async (stage) => {
+    const h = harness(false);
+    let release: (() => void) | undefined;
+    if (stage === 'after') h.status.mockResolvedValueOnce({ data: {} });
+    h.status.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ data: {} } as never);
+        }),
+    );
+    try {
+      if (stage === 'before') void getRuntimeSessionStatusSnapshot(h.input);
+      else {
+        const transcript = await h.messages({ path: { id: 'ses_child1' } });
+        h.messages.mockClear();
+        h.messages.mockImplementationOnce(async () => {
+          void getRuntimeSessionStatusSnapshot(h.input);
+          return transcript;
+        });
+      }
+      expect(await h.execute()).toContain('state: running (unconfirmed)');
+      expect(h.messages).toHaveBeenCalledTimes(stage === 'before' ? 0 : 1);
+    } finally {
+      release?.();
+    }
+  },
+);
 
 test('indexed v2 requires succeeded outcome and bounded idle after final assistant', async () => {
   const h = harness(false, true, true);

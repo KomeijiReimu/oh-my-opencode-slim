@@ -43,11 +43,13 @@ plugin rejected with "invalid tui export".
   (agent/aisdk/catalog/command/integration/plugin/reference/skill — no
   tool/session/event/mcp/generate). A dual-export plugin registered via the
   v1 `plugin:` key therefore gets **both** invocations: full v1
-  functionality flows through `server()`, while the parallel pass produces
-  the expected `[v2] … failed` / `bridges: 4` log noise (see
+  functionality flows through `server()`, while the parallel `setup` pass
+  may abort on that reduced context and produce `[v2] … failed` /
+  `bridges: 4` log noise (see
   [Environment caveats](#environment-caveats)). A v2 `plugins:` entry yields
   the setup pass alone — v1 does not convert v2 plugin declarations into v1
-  hooks.
+  hooks. The tested OpenCode 1.18.32 v1 server entrypoint has a real
+  `session.status` map; this reduced v2 pass does not remove it.
 - **v2 loader** (`PluginModule` schema in
   `packages/core/src/plugin/supervisor.ts`) decodes `default` as
   `{ id, setup }` (Effect Schema 4 rejects function defaults) and calls
@@ -295,9 +297,11 @@ interview notifications, retain the same no-resume semantics.
 `experimental_v2.waitForSessionIdle(sessionID)` exists only when the host provides
 `session.wait({sessionID})`. It delegates that method alongside the unchanged
 `generateText` channel; it fabricates neither a status map nor board state.
-`session.status` remains absent. Historical `session.get` outcomes cannot authorize
-revive. The official 2.0.5 prompt intent fields and wait signature are pinned in
-`mirror-conformance.ts`, and tool→shim→host contracts have dedicated tests.
+On the v2 shim, `session.status` remains absent; this says nothing about the v1
+server entrypoint's real status map. Historical `session.get` outcomes cannot
+authorize revive. The official 2.0.5 prompt intent fields and wait signature
+are pinned in `mirror-conformance.ts`, and tool→shim→host contracts have
+dedicated tests.
 The 2.0.5 promise adapter does not forward AbortSignal to these methods, so the
 bounded idle wait does not pretend to cancel the host operation: late settlement
 is observed without authorizing a prompt. It waits for idle within its budget,
@@ -735,23 +739,26 @@ resume claim without redispatch. After a pre-dispatch crash, an unsettled claim
 that cannot be proved not admitted stays blocked.
 
 An indexed alias is an identity hint, **not** permission to continue a child.
-Explicit `task_id` reuse after restart must verify the same parent/child,
-attributable current-run terminal/idle evidence, parent notification, and later
-acknowledgement against the host. An exact ID with no mapping can be considered
-only with a readable index and structured parent delegation; an unreadable
-index fails closed. On pinned v2.0.15, orphan `task_result` intentionally returns
-`pending` without attributable current-run host idle proof, even for a child
-completed before restart with its ID/alias and session context preserved.
-`task_result` retrieval and automatic same-ID `task` resume require a host
-version exposing attributable durable terminal outcome/idle evidence; they
-are not guaranteed on v2.0.15. A future host upgrade may provide that proof.
-Even with such proof, a synthetic (nonpersisted) completion requires the parent
-to call `task_result` with the old alias or exact ID and complete a following
-assistant turn before native same-ID resume. `task_revive` cannot bypass missing
-current-run idle proof. `task()` never silently spawns for an unknown explicit
-ID or automatically resumes a stopped child; a new session must be requested
-explicitly. Neither the synthetic completion nor the index alone guarantees
-seamless continuation. See
+Explicit `task_id` reuse after restart must verify durable identity and claim
+state for the same parent/child. Completed-after-restart continuation additionally
+requires attributable terminal evidence for that child's current run, fresh real
+host status confirming quiescence, `task_result` matched to that child and run,
+and a completed parent acknowledgement turn. An unattributed native synthetic
+completion without plugin provenance alone proves neither notification nor
+acknowledgement. An exact ID with no mapping can be considered only with a
+readable index and structured parent delegation; an unreadable index fails closed.
+
+For a host actually running v2.0.15, orphan `task_result` intentionally returns
+`pending` without attributable current-run host idle proof, even when the child
+completed before restart and its ID, alias, and context survive. That v2-specific
+limitation is not a diagnosis of the tested OpenCode 1.18.32 v1 server path,
+which exposes a real `session.status` map. On a host with sufficient evidence,
+call `task_result` with the old alias or exact ID and let the following parent
+assistant turn finish before native same-ID resume. `task_revive` cannot bypass
+missing current-run idle proof. `task()` never silently spawns for an unknown
+explicit ID or automatically resumes a stopped child; a new session must be
+requested explicitly. Neither a synthetic completion nor the index alone
+guarantees continuation. See
 [Background orchestration](background-orchestration.md#unattributed-sessions-and-restart-scope)
 for the operational recovery boundary.
 

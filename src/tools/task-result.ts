@@ -223,7 +223,10 @@ async function recoverOrphanResult(
   const status = snapshot && runtimeSessionStatus(snapshot, taskID);
   if (status === 'busy' || status === 'retry')
     return pending(taskID, false, status, false);
-  if (hasStatus && status !== 'idle')
+  if (
+    hasStatus &&
+    (!snapshot || snapshot.error || snapshot.malformedSessionIDs.has(taskID))
+  )
     return pending(taskID, true, undefined, false);
 
   const final = finalTurn(
@@ -263,7 +266,13 @@ async function recoverOrphanResult(
   }
   if (hasStatus) {
     const after = await getRuntimeSessionStatusSnapshot(options.input);
-    if (runtimeSessionStatus(after, taskID) !== 'idle')
+    const afterStatus = runtimeSessionStatus(after, taskID);
+    if (
+      after.error ||
+      after.malformedSessionIDs.has(taskID) ||
+      afterStatus === 'busy' ||
+      afterStatus === 'retry'
+    )
       return pending(taskID, true, undefined, false);
   } else {
     // v2 has no live status endpoint. Bracket the transcript with two host

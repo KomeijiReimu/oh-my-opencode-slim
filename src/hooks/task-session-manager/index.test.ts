@@ -19,6 +19,7 @@ import {
   type BackgroundJobTerminalGate,
   createBackgroundJobTerminalGate,
 } from '../../utils/background-job-terminal-gate';
+import * as logger from '../../utils/logger';
 import { createSameProcessResumeEvidence } from '../../utils/same-process-resume-evidence';
 import { buildPluginInput } from '../../v2/client-shim';
 import {
@@ -2311,6 +2312,150 @@ describe('task-session-manager hook', () => {
       ).rejects.toThrow(/fresh host evidence/);
       expect(resume.args.task_id).toBe(original.alias);
       expect(board.get(original.taskID)?.generation).toBe(original.generation);
+    }
+  });
+
+  test('logs the classifier reason when reusable host evidence is unavailable', async () => {
+    const board = new BackgroundJobBoard();
+    setupCompletedJob(board);
+    board.markReconciled('child-1');
+    const job = board.get('child-1');
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      identityIndex: identityIndexForBoard(board),
+    });
+    const logSpy = spyOn(logger, 'log').mockImplementation(() => {});
+    try {
+      await expect(
+        hook['tool.execute.before'](
+          { tool: 'task', sessionID: 'parent-1', callID: 'resume-no-get' },
+          {
+            args: {
+              subagent_type: 'oracle',
+              description: 'retry review',
+              task_id: 'ora-1',
+            },
+          },
+        ),
+      ).rejects.toThrow(
+        /^Task ora-1: fresh host evidence does not confirm a reusable session; resume blocked\.$/,
+      );
+      const refusal = logSpy.mock.calls.find(
+        ([message, details]) =>
+          message === '[task-session-manager] refused explicit task_id' &&
+          details?.task_id === 'ora-1' &&
+          details?.reason === 'session.get unavailable',
+      );
+      expect(refusal?.[1]).toEqual({
+        task_id: 'ora-1',
+        recovery: 'uncertain',
+        reason: 'session.get unavailable',
+        hasPendingAcknowledgement: false,
+        hasBrokerToken: false,
+        boardGeneration: job?.generation,
+        boardTerminalRevision: job?.terminalRevision,
+      });
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test('unproven parent notice or acknowledgement gives a bounded same-ID retry instruction without dispatch', async () => {
+    for (const [reason, requested] of [
+      ['parent terminal notice unproven', 'ora-1'],
+      ['parent acknowledgement unproven', 'child-1'],
+    ] as const) {
+      const board = new BackgroundJobBoard();
+      setupCompletedJob(board);
+      board.markReconciled('child-1');
+      const original = { ...board.get('child-1') };
+      const identityIndex = identityIndexForBoard(board);
+      const claimSpy = spyOn(identityIndex, 'claimResume');
+      const adoptSpy = spyOn(board, 'adoptExistingSession');
+      const pendingCallTracker = createPendingCallTracker();
+      const host = verifiedKnownHost(board, 'child-1');
+      const readMessages = host.messages as (args: {
+        path: { id: string };
+      }) => Promise<{
+        data: { info: { id: string }; parts: unknown[] }[];
+      }>;
+      const { hook } = createHook({
+        backgroundJobBoard: board,
+        identityIndex,
+        pendingCallTracker,
+        sessionClient: {
+          ...host,
+          messages: async (args: { path: { id: string } }) => {
+            const response = await readMessages(args);
+            if (args.path.id !== 'parent-1') return response;
+            return {
+              data: response.data
+                .filter(
+                  (message) =>
+                    reason !== 'parent acknowledgement unproven' ||
+                    message.info.id !== 'ack',
+                )
+                .map((message) =>
+                  reason === 'parent terminal notice unproven' &&
+                  message.info.id === 'notice'
+                    ? {
+                        ...message,
+                        parts: [
+                          {
+                            ...((message.parts[0] ?? {}) as object),
+                            metadata: {},
+                          },
+                        ],
+                      }
+                    : message,
+                ),
+            };
+          },
+        },
+      });
+      const args = {
+        subagent_type: 'oracle',
+        description: 'retry review',
+        prompt: 'additional review',
+        task_id: requested,
+      };
+      const logSpy = spyOn(logger, 'log').mockImplementation(() => {});
+      try {
+        await expect(
+          hook['tool.execute.before'](
+            {
+              tool: 'task',
+              sessionID: 'parent-1',
+              callID: `resume-${requested}`,
+            },
+            { args },
+          ),
+        ).rejects.toThrow(
+          `Task ${requested}: fresh host evidence does not confirm a reusable session; resume blocked. Call task_result with task_id "${requested}" (the same alias or exact ID), allow the parent to finish a turn, then retry once later with the original task_id. Do not auto-resend; no new session was created.`,
+        );
+        expect(
+          logSpy.mock.calls.find(
+            ([message, details]) =>
+              message === '[task-session-manager] refused explicit task_id' &&
+              details?.task_id === requested &&
+              details?.reason === reason,
+          )?.[1],
+        ).toMatchObject({ recovery: 'uncertain', reason });
+        expect(args).toEqual({
+          subagent_type: 'oracle',
+          description: 'retry review',
+          prompt: 'additional review',
+          task_id: requested,
+        });
+        expect(claimSpy).not.toHaveBeenCalled();
+        expect(adoptSpy).not.toHaveBeenCalled();
+        expect(pendingCallTracker.peekByParent('parent-1')).toBeUndefined();
+        expect(board.get('child-1')).toEqual(original);
+      } finally {
+        logSpy.mockRestore();
+        claimSpy.mockRestore();
+        adoptSpy.mockRestore();
+      }
     }
   });
 
@@ -5902,7 +6047,7 @@ describe('task-session-manager hook', () => {
                     id: 'retrieval',
                     role: 'assistant',
                     sessionID: 'parent-1',
-                    time: { created: base + 101 },
+                    time: { created: base + 100 },
                   },
                   parts: [
                     {
@@ -6886,7 +7031,7 @@ describe('task-session-manager hook', () => {
         { tool: 'task', sessionID: 'parent-1', callID: 'no-current-proof' },
         args,
       ),
-    ).rejects.toThrow(/Recovery is unconfirmed/);
+    ).rejects.toThrow(/Call task_result with task_id "fix-1"/);
     expect(args.args.task_id).toBe('fix-1');
     expect(claims.has('ses_recover')).toBe(false);
 
@@ -7457,9 +7602,119 @@ describe('task-session-manager hook', () => {
           },
         },
       ),
-    ).rejects.toThrow(/Recovery is unconfirmed/);
+    ).rejects.toThrow(
+      'Call task_result with task_id "fix-1" (the same alias or exact ID), allow the parent to finish a turn, then retry once later with the original task_id.',
+    );
     expect(board.get('ses_recover')).toBeUndefined();
     expect(index.hasUnsettledResume('parent-1', 'ses_recover')).toBe(false);
+  });
+
+  test('empty board with persisted identity gives a bounded same-ID retry for unproven parent evidence', async () => {
+    for (const [reason, requested] of [
+      ['parent terminal notice unproven', 'fix-1'],
+      ['parent acknowledgement unproven', 'ses_recover'],
+    ] as const) {
+      const { index, sessionClient, base } = recoveryFixture();
+      const identity = index.reserve('parent-1', 'ses_recover', 'fixer', 'fix');
+      const board = new BackgroundJobBoard();
+      const pendingCallTracker = createPendingCallTracker();
+      const claimSpy = spyOn(index, 'claimResume');
+      const adoptSpy = spyOn(board, 'adoptExistingSession');
+      const prompt = mock(async () => ({}));
+      const promptAsync = mock(async () => ({}));
+      const readMessages = sessionClient.messages as (args: {
+        path: { id: string };
+      }) => Promise<{
+        data: { info: { id: string }; parts: unknown[] }[];
+      }>;
+      const { hook } = createHook({
+        identityIndex: index,
+        backgroundJobBoard: board,
+        pendingCallTracker,
+        sessionClient: {
+          ...sessionClient,
+          prompt,
+          promptAsync,
+          messages: async (args: { path: { id: string } }) => {
+            const response = await readMessages(args);
+            if (args.path.id !== 'parent-1') return response;
+            return {
+              data: response.data
+                .filter(
+                  (message) =>
+                    reason !== 'parent acknowledgement unproven' ||
+                    message.info.id !== 'ack',
+                )
+                .map((message) =>
+                  reason === 'parent terminal notice unproven'
+                    ? message.info.id === 'notification'
+                      ? { ...message, parts: [] }
+                      : message.info.id === 'task-output'
+                        ? {
+                            ...message,
+                            parts: [
+                              {
+                                type: 'tool',
+                                tool: 'task',
+                                state: {
+                                  input: {
+                                    subagent_type: 'fixer',
+                                    background: true,
+                                    description: 'Fix it',
+                                  },
+                                  output:
+                                    'task_id: ses_recover\nstate: running',
+                                  time: { end: base + 700 },
+                                },
+                              },
+                            ],
+                          }
+                        : message
+                    : message,
+                ),
+            };
+          },
+        },
+      });
+      const args = {
+        subagent_type: 'fixer',
+        description: 'recover scheduler task',
+        prompt: 'additional review',
+        task_id: requested,
+      };
+      const logSpy = spyOn(logger, 'log').mockImplementation(() => {});
+      try {
+        await expect(
+          hook['tool.execute.before'](
+            { tool: 'task', sessionID: 'parent-1', callID: requested },
+            { args },
+          ),
+        ).rejects.toThrow(
+          `Task ${requested}: fresh host evidence does not confirm a reusable session; resume blocked. Call task_result with task_id "${requested}" (the same alias or exact ID), allow the parent to finish a turn, then retry once later with the original task_id. Do not auto-resend; no new session was created.`,
+        );
+        expect(
+          logSpy.mock.calls.find(
+            ([message, details]) =>
+              message === '[task-session-manager] refused explicit task_id' &&
+              details?.task_id === requested &&
+              details?.reason === reason,
+          )?.[1],
+        ).toMatchObject({ recovery: 'uncertain', reason });
+        expect(args.task_id).toBe(requested);
+        expect(index.lookup('parent-1', requested)).toEqual(identity);
+        expect(board.list('parent-1')).toEqual([]);
+        expect(index.hasUnsettledResume('parent-1', 'ses_recover')).toBe(false);
+        expect(claimSpy).not.toHaveBeenCalled();
+        expect(adoptSpy).not.toHaveBeenCalled();
+        expect(prompt).not.toHaveBeenCalled();
+        expect(promptAsync).not.toHaveBeenCalled();
+        expect(pendingCallTracker.peekByParent('parent-1')).toBeUndefined();
+      } finally {
+        logSpy.mockRestore();
+        claimSpy.mockRestore();
+        adoptSpy.mockRestore();
+      }
+    }
   });
 
   test('no-callID exact resumed task ID settles a pinned persistent claim', async () => {

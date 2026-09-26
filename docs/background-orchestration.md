@@ -88,6 +88,12 @@ session evidence. This preserves the identity and context of an existing child,
 not proof that its latest run finished. Recovery remains partial, not a
 restoration of full history.
 
+A native synthetic completion with no plugin provenance is not, by itself,
+proof that the parent received or acknowledged that child's result. For a
+verified completed child after restart, call `task_result` with its alias or
+exact ID and let the parent assistant turn finish before requesting same-ID
+continuation.
+
 ---
 
 ## Execution Loop
@@ -236,25 +242,29 @@ and alias counters additionally persist across host restarts (see the
 [v2 compatibility doc](opencode-v2-compatibility.md#background-job-state-rehydrate-probe-and-persistence)).
 
 Explicit `task_id` reuse after restart is fail-closed: a stored alias or exact
-ID must resolve to the same parent's child and have attributable current-run
-terminal/idle and parent-acknowledgement evidence. If alias reservation fails,
-use the exact task ID: with a readable index but no mapping, it can be checked
-via structured parent delegation. An alias without its mapping cannot be
-recovered; an unreadable index fails closed. OpenCode v2.0.15 does not persist
-`Session.Info.outcome` or `time.idle`, nor a durable idle message. After restart,
-`session.get` status is absent and `wait`/active state is process-local;
-`time.updated` cannot prove the current run completed. Thus orphan
-`task_result` intentionally returns `pending` without current-run host idle
-proof, even for a completed child with its ID/alias and context preserved.
-Result retrieval and automatic same-ID `task` resume require a host exposing
-attributable durable terminal outcome/idle evidence; this is not guaranteed on
-the pinned v2.0.15 host. Even when a later host supplies that proof, the parent
-must call `task_result` for a synthetic (nonpersisted) completion and complete a
-following assistant turn before same-ID resume. `task_revive` cannot bypass
-missing current-run idle proof. An unknown explicit ID is never dropped to spawn
-a replacement; a truly missing child requires an explicit new task without
-`task_id`. A future host upgrade may enable recovery, but restart recovery is
-not seamless or automatic.
+ID must resolve to the same parent's child through durable identity and claim
+state. Completed-after-restart same-ID continuation also needs an attributable
+terminal result for that child's current run, fresh real host status confirming
+quiescence, a `task_result` matched to that child and run, and a completed parent
+acknowledgement turn. Neither a transcript ending nor an unattributed native
+synthetic completion supplies those proofs. If alias reservation fails, use the
+exact task ID: with a readable index but no mapping, it can be checked via
+structured parent delegation. An alias without its mapping cannot be recovered;
+an unreadable index fails closed.
+
+The tested OpenCode 1.18.32 v1 server entrypoint exposes a real
+`session.status` map. Its embedded v2 plugin pass may abort on a reduced setup
+context; that does not turn the v1 server path into a statusless v2 host. On a
+different host, OpenCode v2.0.15, `Session.Info.outcome`, `time.idle`, and a
+durable idle message are not persisted. After restart, `session.get` lacks run
+status and `wait`/active state was process-local; `time.updated` cannot prove
+the current run completed. On that host an orphan `task_result` remains `pending`
+without attributable current-run host idle proof, even if identity and context
+survive. A host with the necessary evidence can retrieve the matched result;
+same-ID `task` continuation still waits for the parent's acknowledgement turn.
+`task_revive` cannot bypass missing current-run idle proof. An unknown explicit
+ID is never dropped to spawn a replacement; a truly missing child requires an
+explicit new task without `task_id`. Restart recovery is not automatic.
 
 There is one deliberately narrower same-process exception. Within one plugin
 setup generation, the terminal gate records a completed/error/cancelled
@@ -598,6 +608,17 @@ Stopped-job recovery facts are checked again by task ID and run generation
 before a queued recovery wake is delivered. The inline detail queue is bounded;
 when it overflows, the wake carries an explicit overflow signal directing the
 orchestrator to inspect all unreconciled stopped jobs on the board.
+
+`task_status` applies a separate reporting rule. When a successful read returns
+a valid status map with no entry for the session, it reports a certain board
+state of `completed`, `error`, `cancelled`, `reconciled`, or `stopped` when
+that record's own `statusUncertain` is not `true`; it does not append
+`(unconfirmed)` or report `no live status entry`. A missing entry is never
+reported as `idle`, while live `busy`, `retry`, or explicit `idle` takes
+precedence. Running board records, failed or timed-out reads, malformed
+entries, and uncertain records remain unconfirmed. The coordinator continues
+to use the existing 5s confirmation grace before recording a running task as
+`stopped, unreconciled`.
 
 Malformed status entries and failed status requests are surfaced as `status
 uncertain`; they never prove that a job stopped or completed and do not confirm

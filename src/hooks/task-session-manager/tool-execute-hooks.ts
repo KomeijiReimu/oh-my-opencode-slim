@@ -565,6 +565,19 @@ async function refuseUnsettledResume(
   );
 }
 
+function parentConfirmationRetryGuidance(
+  requested: string,
+  recovery: Awaited<ReturnType<typeof classifySessionRecovery>>,
+): string | undefined {
+  if (
+    recovery.kind !== 'uncertain' ||
+    (recovery.reason !== 'parent terminal notice unproven' &&
+      recovery.reason !== 'parent acknowledgement unproven')
+  )
+    return undefined;
+  return ` Call task_result with task_id "${requested}" (the same alias or exact ID), allow the parent to finish a turn, then retry once later with the original task_id. Do not auto-resend; no new session was created.`;
+}
+
 async function recoverUnknownTask(
   requested: string,
   parentSessionID: string,
@@ -591,6 +604,14 @@ async function recoverUnknownTask(
     !recovery.taskID ||
     recovery.evidence.acknowledged !== true
   ) {
+    const retryGuidance = parentConfirmationRetryGuidance(requested, recovery);
+    if (recovery.kind === 'uncertain' && retryGuidance) {
+      refuseExplicitTaskId(
+        requested,
+        `Task ${requested}: fresh host evidence does not confirm a reusable session; resume blocked.${retryGuidance}`,
+        { recovery: recovery.kind, reason: recovery.reason },
+      );
+    }
     const guidance =
       recovery.kind === 'live'
         ? 'The child is busy or retrying; wait for its result.'
@@ -975,10 +996,21 @@ export async function handleToolExecuteBefore(
             `Task ${requested} is still running on the board and cannot be resumed or amended with task(). The host observation is ${recovery.kind}; wait for generation-safe terminal reconciliation before retrying. Do not spawn or cancel a duplicate for an additive request.`,
           );
         }
+        const retryGuidance =
+          parentConfirmationRetryGuidance(requested, recovery) ?? '';
         refuseExplicitTaskId(
           requested,
-          `Task ${requested}: fresh host evidence does not confirm a reusable session; resume blocked.`,
-          { recovery: recovery.kind },
+          `Task ${requested}: fresh host evidence does not confirm a reusable session; resume blocked.${retryGuidance}`,
+          {
+            recovery: recovery.kind,
+            reason: 'reason' in recovery ? recovery.reason : undefined,
+            hasPendingAcknowledgement:
+              recovery.kind === 'uncertain' &&
+              recovery.pendingAcknowledgement !== undefined,
+            hasBrokerToken: recoveryResumeToken(recovery) !== undefined,
+            boardGeneration: remembered?.generation,
+            boardTerminalRevision: remembered?.terminalRevision,
+          },
         );
       }
       if (

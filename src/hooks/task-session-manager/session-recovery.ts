@@ -290,9 +290,68 @@ function matchingTaskPart(
 
 type ParentNotice = { at: number; messageIndex: number };
 
+/** Text, reasoning, and step markers may sit between a notice and the
+ * parent's stop. They are not acknowledgement by themselves. */
+const PARENT_TURN_ASIDE_TYPES = new Set([
+  'text',
+  'reasoning',
+  'step-start',
+  'step-finish',
+]);
+
+/** Exit metadata and truncation are not failures. task()/subagent() are
+ * never ordinary tools; task_result and task_status still are. */
+function parentToolSucceeded(part: MessagePart): boolean {
+  if (part.type !== 'tool' || isTaskToolPart(part) || !isRecord(part.state))
+    return false;
+  return (
+    part.state.status === 'completed' &&
+    part.state.error == null &&
+    part.error == null
+  );
+}
+
+function parentTurnContinues(message: MessageWithParts): boolean {
+  return message.parts.every(
+    (part) =>
+      PARENT_TURN_ASIDE_TYPES.has(part.type) || parentToolSucceeded(part),
+  );
+}
+
+function parentStopAcknowledgedAt(
+  message: MessageWithParts,
+  started: number,
+  now: number,
+): number | undefined {
+  const completed = messageTime(message, 'completed');
+  const info: unknown = message.info;
+  if (
+    typeof message.info.id !== 'string' ||
+    !message.info.id ||
+    !isRecord(info) ||
+    info.finish !== 'stop' ||
+    completed === undefined ||
+    completed < started ||
+    completed > now
+  )
+    return;
+  // Non-empty text is required before any later unknown-part rejection.
+  // Reasoning cannot stand in for that text.
+  if (
+    !message.parts.some(
+      (part) =>
+        part.type === 'text' &&
+        typeof part.text === 'string' &&
+        part.text.trim(),
+    )
+  )
+    return;
+  return completed;
+}
+
 /** A completed task_result part is a persisted retrieval, unlike v2 synthetic
  * notifications. Its entire execution must follow this child's final turn. */
-function matchingTaskResultAt(
+function matchingTaskResults(
   parent: ParentDelegation,
   taskID: string,
   alias: string | undefined,
@@ -300,8 +359,8 @@ function matchingTaskResultAt(
   runStartedAt: number,
   terminalAt: number,
   now: number,
-): ParentNotice | undefined {
-  let latest: ParentNotice | undefined;
+): ParentNotice[] {
+  const notices: ParentNotice[] = [];
   for (const [messageIndex, message] of parent.messages.entries()) {
     // A result retrieval from before the latest delegation belongs to an
     // earlier run when the host reuses the same child session ID.
@@ -337,21 +396,23 @@ function matchingTaskResultAt(
       if (!isRecord(time)) continue;
       const started = time.start;
       const at = time.end;
+      const messageStarted = messageTime(message, 'created');
       if (
         !validTime(started) ||
         !validTime(at) ||
+        messageStarted === undefined ||
+        messageStarted > started ||
         started < terminalAt ||
         started <= runStartedAt ||
         at < started ||
         at <= terminalAt ||
-        at > now ||
-        messageTime(message, 'created') === undefined
+        at > now
       )
         continue;
-      if (!latest || at > latest.at) latest = { at, messageIndex };
+      notices.push({ at, messageIndex });
     }
   }
-  return latest;
+  return notices;
 }
 
 /** Only persisted internal notification parts, native completion, or a
@@ -372,24 +433,24 @@ function parentCompletion(
     status?.taskID === taskID &&
     status.state === 'completed' &&
     status.result?.trim() === result.trim();
-  let notice: ParentNotice | undefined =
+  const notices: ParentNotice[] =
     matches(part.status) &&
     part.resultAt !== undefined &&
     part.resultAt >= terminalAt &&
     part.resultAt <= now
-      ? { at: part.resultAt, messageIndex: part.messageIndex }
-      : undefined;
-  const retrievedAt = matchingTaskResultAt(
-    parent,
-    taskID,
-    alias,
-    result,
-    runStartedAt,
-    terminalAt,
-    now,
+      ? [{ at: part.resultAt, messageIndex: part.messageIndex }]
+      : [];
+  notices.push(
+    ...matchingTaskResults(
+      parent,
+      taskID,
+      alias,
+      result,
+      runStartedAt,
+      terminalAt,
+      now,
+    ),
   );
-  if (retrievedAt && (!notice || retrievedAt.at > notice.at))
-    notice = retrievedAt;
   // Native notifications carry a task ID but no run/generation ID. After a
   // second admission, a late first-run notice with identical text is ambiguous.
   for (const [messageIndex, message] of (allowUnversionedNotice
@@ -410,46 +471,26 @@ function parentCompletion(
           matches(parseTaskStatusOutput(candidate.text)),
       )
     )
-      if (!notice || at > notice.at) notice = { at, messageIndex };
+      notices.push({ at, messageIndex });
   }
-  if (!notice) return;
-  for (const message of messages.slice(notice.messageIndex + 1)) {
-    const started = messageTime(message, 'created');
-    if (started === undefined || started <= notice.at || started > now) break;
-    if (message.info.role !== 'assistant') break;
-    if (
-      message.parts.some(
-        (next) =>
-          next.type === 'tool' &&
-          (next.tool === 'task' ||
-            next.name === 'task' ||
-            next.tool === 'subagent' ||
-            next.name === 'subagent'),
-      )
-    )
+  notices.sort((left, right) => left.messageIndex - right.messageIndex);
+  for (const notice of notices) {
+    for (const message of messages.slice(notice.messageIndex + 1)) {
+      const started = messageTime(message, 'created');
+      if (started === undefined || started <= notice.at || started > now) break;
+      if (message.info.role !== 'assistant') break;
+      // Same alias, same session id, a different child, or no parseable id
+      // all end the turn. Do not continue to a later stop.
+      if (message.parts.some((part) => isTaskToolPart(part))) break;
+      const acknowledgedAt = parentStopAcknowledgedAt(message, started, now);
+      if (acknowledgedAt !== undefined)
+        return { notifiedAt: notice.at, acknowledgedAt };
+      if (parentTurnContinues(message)) continue;
       break;
-    const completed = messageTime(message, 'completed');
-    const info: unknown = message.info;
-    if (
-      typeof message.info.id === 'string' &&
-      message.info.id &&
-      isRecord(info) &&
-      info.finish === 'stop' &&
-      completed !== undefined &&
-      completed >= started &&
-      completed <= now &&
-      message.parts.some(
-        (next) =>
-          next.type === 'text' &&
-          typeof next.text === 'string' &&
-          next.text.trim(),
-      )
-    )
-      return { notifiedAt: notice.at, acknowledgedAt: completed };
-    // A tool-only assistant message can still be part of the same turn.
-    if (message.parts.some((next) => next.type !== 'tool')) break;
+    }
   }
-  return { notifiedAt: notice.at };
+  const lastNotice = notices.at(-1);
+  return lastNotice ? { notifiedAt: lastNotice.at } : undefined;
 }
 
 type ChildBoundary = {
@@ -700,7 +741,7 @@ export async function classifySessionRecovery(
     boundary?.finished &&
     boundary.completedAt !== undefined &&
     transcript?.verdict === 'completed'
-      ? matchingTaskResultAt(
+      ? matchingTaskResults(
           parent,
           taskID,
           identity?.alias,
@@ -708,7 +749,7 @@ export async function classifySessionRecovery(
           boundary.startedAt,
           boundary.completedAt,
           now,
-        )
+        ).at(-1)
       : undefined;
   const currentNativeCompletedAt =
     nativeCompletedAt !== undefined &&

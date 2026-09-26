@@ -1,5 +1,8 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard } from '../utils/background-job-board';
+import {
+  type BackgroundJobAdoptionEvidence,
+  BackgroundJobBoard,
+} from '../utils/background-job-board';
 import type { TaskControlRecovery } from './task-control-recovery';
 import { createTaskControlRecovery } from './task-control-recovery';
 import { createTaskMessageTool } from './task-message';
@@ -24,6 +27,42 @@ function makeTool(options: {
     identityIndex: options.identityIndex,
     recovery: options.recovery,
   });
+}
+
+const adoptedIdentity = {
+  parentSessionID: 'parent-1',
+  taskID: 'host-child',
+  agent: 'explorer',
+  alias: 'exp-8',
+  description: 'host task',
+  background: true,
+} as const;
+
+const acknowledgedCompleted = {
+  kind: 'terminal',
+  state: 'completed',
+  resultSummary: 'host result',
+  completedAt: 250,
+  acknowledged: true,
+} as const;
+
+async function readAdoptedStatus(
+  evidence: BackgroundJobAdoptionEvidence,
+  status: () => unknown,
+  options?: { now?: number; statusTimeoutMs?: number },
+) {
+  const board = new BackgroundJobBoard();
+  const job = board.adoptExistingSession(adoptedIdentity, evidence);
+  client = { session: { status: mock(status) } };
+  const { task_status } = makeTool({
+    board,
+    now: () => options?.now ?? 120_000,
+    statusTimeoutMs: options?.statusTimeoutMs,
+  });
+  const output = await task_status.execute({ task_id: job.taskID }, {
+    sessionID: 'parent-1',
+  } as any);
+  return { output, job };
 }
 
 const recoveredIdentity = {
@@ -361,6 +400,119 @@ describe('task_status', () => {
     );
     expect(output).not.toContain('[guidance]: The task is still running.');
     expect(output).toContain('possibly_stuck: false');
+  });
+
+  test('confirms a terminal board state when a valid status map omits the session', async () => {
+    const cases: Array<{
+      evidence: BackgroundJobAdoptionEvidence;
+      state: string;
+    }> = [
+      { evidence: acknowledgedCompleted, state: 'reconciled' },
+      {
+        evidence: { ...acknowledgedCompleted, acknowledged: false },
+        state: 'completed',
+      },
+      {
+        evidence: {
+          ...acknowledgedCompleted,
+          state: 'error',
+          acknowledged: false,
+        },
+        state: 'error',
+      },
+      {
+        evidence: {
+          ...acknowledgedCompleted,
+          state: 'cancelled',
+          acknowledged: false,
+        },
+        state: 'cancelled',
+      },
+      {
+        evidence: {
+          kind: 'stopped',
+          resultSummary: 'host observed stop without result',
+          completedAt: 250,
+        },
+        state: 'stopped',
+      },
+    ];
+
+    for (const { evidence, state } of cases) {
+      const { output, job } = await readAdoptedStatus(evidence, async () => ({
+        data: {},
+      }));
+      expect(job.state).toBe(state);
+      expect(output).toContain(`state: ${state}\n`);
+      expect(output).not.toContain('status_uncertain');
+      expect(output).not.toContain('no live status entry');
+      expect(output).not.toContain('state: idle');
+      expect(output).toContain('possibly_stuck: false');
+    }
+  });
+
+  test('keeps a reconciled record unconfirmed when the status read throws', async () => {
+    const { output } = await readAdoptedStatus(
+      acknowledgedCompleted,
+      async () => {
+        throw new Error('host status read failed');
+      },
+    );
+    expect(output).toContain('state: reconciled (unconfirmed)');
+    expect(output).toContain('status_uncertain: true');
+    expect(output).toContain('last_status_error: host status read failed');
+    expect(output).toContain('possibly_stuck: false');
+  });
+
+  test('keeps a reconciled record unconfirmed when the live entry is malformed', async () => {
+    const { output } = await readAdoptedStatus(
+      acknowledgedCompleted,
+      async () => ({
+        data: { 'host-child': { type: 'weird-state' } },
+      }),
+    );
+    expect(output).toContain('state: reconciled (unconfirmed)');
+    expect(output).toContain('status_uncertain: true');
+    expect(output).toContain(
+      'last_status_error: malformed live status entry for session',
+    );
+    expect(output).not.toContain('state: idle');
+    expect(output).toContain('possibly_stuck: false');
+  });
+
+  test('keeps a reconciled record unconfirmed when the status read times out', async () => {
+    const { output } = await readAdoptedStatus(
+      acknowledgedCompleted,
+      () =>
+        new Promise((resolve) =>
+          setTimeout(
+            () => resolve({ data: { 'host-child': { type: 'idle' } } }),
+            200,
+          ),
+        ),
+      { statusTimeoutMs: 20 },
+    );
+    expect(output).toContain('state: reconciled (unconfirmed)');
+    expect(output).toContain('status_uncertain: true');
+    expect(output).toContain('last_status_error');
+    expect(output).toContain('timed out');
+    expect(output).not.toContain('state: idle');
+    expect(output).toContain('possibly_stuck: false');
+  });
+
+  test('prefers live busy, retry, and idle over a terminal board record', async () => {
+    for (const live of ['busy', 'retry', 'idle'] as const) {
+      const { output } = await readAdoptedStatus(
+        acknowledgedCompleted,
+        async () => ({
+          data: { 'host-child': { type: live } },
+        }),
+      );
+      expect(output).toContain(`state: ${live}\n`);
+      expect(output).not.toContain('state: reconciled');
+      expect(output).not.toContain('status_uncertain');
+      expect(output).not.toContain('no live status entry');
+    }
   });
 
   test('rejects a task id owned by a different parent', async () => {
