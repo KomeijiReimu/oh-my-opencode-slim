@@ -575,7 +575,7 @@ function parentConfirmationRetryGuidance(
       recovery.reason !== 'parent acknowledgement unproven')
   )
     return undefined;
-  return ` Call task_result with task_id "${requested}" (the same alias or exact ID), allow the parent to finish a turn, then retry once later with the original task_id. Do not auto-resend; no new session was created.`;
+  return ` Call task_result with task_id "${requested}" (the same alias or exact ID), then retry once with the original task_id. Do not wait for a later parent turn. No new session was created.`;
 }
 
 async function recoverUnknownTask(
@@ -924,6 +924,13 @@ export async function handleToolExecuteBefore(
             refuseKnownTaskResume(requested, knownManagedTask, agentType);
           }
           remembered = knownManagedTask;
+        } else if (
+          knownManagedTask.state === 'completed' &&
+          knownManagedTask.terminalUnreconciled
+        ) {
+          // The board flag can still say unreconciled after task_result.
+          // Classify that retrieval before refusing the same-ID call.
+          remembered = knownManagedTask;
         } else {
           refuseKnownTaskResume(requested, knownManagedTask, agentType);
         }
@@ -980,6 +987,23 @@ export async function handleToolExecuteBefore(
           remembered.taskID,
           agentType,
         );
+      }
+      if (
+        remembered?.state === 'completed' &&
+        remembered.terminalUnreconciled
+      ) {
+        if (recovery.kind === 'reusable' && recovery.evidence.acknowledged) {
+          const reconciled = deps.backgroundJobBoard.markReconciled(
+            remembered.taskID,
+            Date.now(),
+            remembered.generation,
+            remembered.terminalRevision,
+          );
+          if (reconciled) remembered = reconciled;
+        }
+        if (remembered.terminalUnreconciled) {
+          refuseKnownTaskResume(requested, remembered, agentType);
+        }
       }
       if (
         !remembered ||

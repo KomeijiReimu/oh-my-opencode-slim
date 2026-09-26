@@ -742,19 +742,50 @@ An indexed alias is an identity hint, **not** permission to continue a child.
 Explicit `task_id` reuse after restart must verify durable identity and claim
 state for the same parent/child. Completed-after-restart continuation additionally
 requires attributable terminal evidence for that child's current run, fresh real
-host status confirming quiescence, `task_result` matched to that child and run,
-and a completed parent acknowledgement turn. An unattributed native synthetic
-completion without plugin provenance alone proves neither notification nor
-acknowledgement. An exact ID with no mapping can be considered only with a
-readable index and structured parent delegation; an unreadable index fails closed.
+host status confirming quiescence, and parent confirmation. A successful
+`task_result` whose text matches that child and run confirms immediately;
+native completion output or a plugin-origin notification followed by a
+qualifying parent `finish: stop` also confirms. An unattributed native
+synthetic completion without plugin provenance alone proves neither
+notification nor acknowledgement. An exact ID with no mapping can be considered
+only with a readable index and structured parent delegation; an unreadable index
+fails closed.
 
 For a host actually running v2.0.15, orphan `task_result` intentionally returns
 `pending` without attributable current-run host idle proof, even when the child
 completed before restart and its ID, alias, and context survive. That v2-specific
 limitation is not a diagnosis of the tested OpenCode 1.18.32 v1 server path,
 which exposes a real `session.status` map. On a host with sufficient evidence,
-call `task_result` with the old alias or exact ID and let the following parent
-assistant turn finish before native same-ID resume. `task_revive` cannot bypass
+call `task_result` with the old alias or exact ID. The matching successful
+retrieval is sufficient parent confirmation for same-ID continuation when the
+host provides the required evidence; native completion and plugin-origin
+notification retain the later parent-stop route. After that retrieval, user
+and system messages, text-only assistant messages, a no-text stop, a refused
+`task()` or `subagent()` whose error or output contains `no new session was
+created` or `resume blocked` (case-insensitive), an unadmitted `running` or
+`pending` task call, a pending or running `read`, `bash`, or `grep` part with
+empty `part.error` and `state.error`, and a host `patch` part leave
+confirmation intact, even in the same parent step. OpenCode 1.18.32 appends
+`patch` to that assistant message when the step changes files. It is not
+confirmation by itself. Later messages created at the retrieval's end time are
+evaluated by content; an earlier, missing, or future creation time blocks
+confirmation. The `task_result` parent message itself must also pass the
+sibling-part check: a failed `bash` or another already completed
+`task()`/`subagent()` blocks that retrieval, while an error-free successful
+ordinary tool does not.
+
+A missing-`description` SchemaError with the OpenCode 1.18.32 text
+`SchemaError`, `description`, `Missing key`, and
+`at ["description"]`, or the equivalent object form
+`{ name: "SchemaError", message: "Missing key at [\"description\"]" }`, is also
+pre-dispatch. A missing `subagent_type` or other `SchemaError` blocks unless
+the error or output also contains `no new session was created`
+(case-insensitively); that explicit refusal did not create a child session.
+
+An actually dispatched task prompt, a failed ordinary tool, an empty tool state,
+an unknown part other than a host `patch`, another ended child task, and `busy`, `retry`, `error`,
+`cancelled`, or `stopped` child state still block. Before parent confirmation,
+an explicit ID is refused without creating a session. `task_revive` cannot bypass
 missing current-run idle proof. `task()` never silently spawns for an unknown
 explicit ID or automatically resumes a stopped child; a new session must be
 requested explicitly. Neither a synthetic completion nor the index alone
@@ -764,12 +795,12 @@ for the operational recovery boundary.
 
 On the pinned v2.0.15 host, same-process `task()` continuation has a narrower
 exception: after the local terminal gate commits the exact child generation and
-terminal revision, the parent retrieves the result and completes its
-acknowledgement turn, the plugin may issue a private one-shot resume token. The
-token is held only by the current setup generation and is never persisted. It
-cannot be reconstructed after restart, setup disposal, a newer child
-admission, a changed result, or an ambiguous native send. Thus this path fixes
-the live same-process workflow without weakening the restart limitation.
+terminal revision and the parent retrieves the matching result, the plugin may
+issue a private one-shot resume token. The token is held only by the current
+setup generation and is never persisted. It cannot be reconstructed after
+restart, setup disposal, a newer child admission, a changed result, or an
+ambiguous native send. This same-process path retains the v2.0.15 restart
+limitation.
 
 The same boundary applies to control tools after a restart. `task_status` can
 report a verified exact ID in read-only mode without adopting it into the
@@ -813,6 +844,10 @@ All other log sites rely on the shape-based redaction at the logger
 choke point.
 
 ## Limitations
+
+The `running`/`pending` classification establishes only that the current
+`task()`/`subagent()` has not admitted a prompt; another parallel child may
+already have crossed its send boundary.
 
 ### Interview
 

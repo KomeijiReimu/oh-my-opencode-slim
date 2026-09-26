@@ -254,7 +254,10 @@ describe('v2 background recovery across plugin restart', () => {
           },
         ],
       });
-      expect((await recover()).kind).toBe('uncertain');
+      expect(await recover()).toMatchObject({
+        kind: 'reusable',
+        evidence: { resultSummary: RESULT, acknowledged: true },
+      });
       host.parent.push({
         id: 'parent-ack',
         type: 'assistant',

@@ -90,9 +90,52 @@ restoration of full history.
 
 A native synthetic completion with no plugin provenance is not, by itself,
 proof that the parent received or acknowledged that child's result. For a
-verified completed child after restart, call `task_result` with its alias or
-exact ID and let the parent assistant turn finish before requesting same-ID
-continuation.
+verified completed child after restart, a successful `task_result` with text
+matching the current child run confirms parent consumption immediately;
+same-ID continuation needs no later `finish: stop`. Native completion results
+and plugin-origin notifications can also establish confirmation when followed
+by a qualifying parent `finish: stop` turn.
+
+After that matching retrieval, later user and system messages, text-only
+assistant messages, a refused `task()` or `subagent()` whose error or output
+contains `no new session was created` or `resume blocked` (matched
+case-insensitively), and a stop with no text leave the confirmation intact.
+A later message created in the same millisecond as the retrieval's end is
+evaluated by its contents; an earlier, missing, or future creation time blocks
+confirmation. The other parts of the parent message containing `task_result`
+are checked too: a failed `bash` or an already completed other
+`task()`/`subagent()` blocks that retrieval, while a successful ordinary tool with no error, or a host `patch` part,
+leaves it intact. OpenCode 1.18.32 appends `patch` to the same assistant
+message when the step changes files. The part is not confirmation by itself.
+
+An in-flight `task()` or `subagent()` call in `running` or `pending` state has
+not admitted a prompt and leaves that confirmation intact. A pending or
+running `read`, `bash`, or `grep` part with empty `part.error` and `state.error`
+also preserves it, including alongside the current `task()` call.
+
+OpenCode 1.18.32 records a missing explicit `description` as a pre-dispatch
+`SchemaError`. The string form contains `SchemaError`, `description`,
+`Missing key`, and `at ["description"]`; the equivalent object form is
+`{ name: "SchemaError", message: "Missing key at [\"description\"]" }`.
+Either form leaves the confirmation intact. A missing `subagent_type` or other
+`SchemaError` blocks confirmation unless its error or output also says `no new
+session was created` (case-insensitively), which identifies a pre-dispatch
+refusal.
+
+The following still block confirmation or reuse: a `task()` or `subagent()`
+that actually dispatched a prompt, whether it completed or failed; a failed
+ordinary tool; an empty tool state; an unknown part other than a host `patch`;
+another ended child task; and a child in `busy`, `retry`, `error`,
+`cancelled`, or `stopped` state.
+Before parent confirmation, an explicit `task_id` is refused without
+creating a session. A dispatched `task()` or `subagent()` blocks another prompt
+for the same child.
+
+### Recovery limitations
+
+The `running`/`pending` exception classifies only the current task call as
+unadmitted; it cannot establish whether another parallel child has already
+crossed its send boundary.
 
 ---
 
@@ -245,8 +288,10 @@ Explicit `task_id` reuse after restart is fail-closed: a stored alias or exact
 ID must resolve to the same parent's child through durable identity and claim
 state. Completed-after-restart same-ID continuation also needs an attributable
 terminal result for that child's current run, fresh real host status confirming
-quiescence, a `task_result` matched to that child and run, and a completed parent
-acknowledgement turn. Neither a transcript ending nor an unattributed native
+quiescence, and parent confirmation: either a matching successful `task_result`
+retrieval, or native completion output or a plugin-origin notification followed
+by a qualifying parent stop. Retrieval confirms immediately; the other paths
+require the later stop. Neither a transcript ending nor an unattributed native
 synthetic completion supplies those proofs. If alias reservation fails, use the
 exact task ID: with a readable index but no mapping, it can be checked via
 structured parent delegation. An alias without its mapping cannot be recovered;
@@ -260,8 +305,9 @@ durable idle message are not persisted. After restart, `session.get` lacks run
 status and `wait`/active state was process-local; `time.updated` cannot prove
 the current run completed. On that host an orphan `task_result` remains `pending`
 without attributable current-run host idle proof, even if identity and context
-survive. A host with the necessary evidence can retrieve the matched result;
-same-ID `task` continuation still waits for the parent's acknowledgement turn.
+survive. A host with the necessary evidence can use matching `task_result`
+retrieval as immediate parent confirmation for same-ID continuation; native
+completion and plugin-origin notification still use the later parent-stop path.
 `task_revive` cannot bypass missing current-run idle proof. An unknown explicit
 ID is never dropped to spawn a replacement; a truly missing child requires an
 explicit new task without `task_id`. Restart recovery is not automatic.
@@ -269,13 +315,12 @@ explicit new task without `task_id`. Restart recovery is not automatic.
 There is one deliberately narrower same-process exception. Within one plugin
 setup generation, the terminal gate records a completed/error/cancelled
 publication with its exact board generation and terminal revision. After the
-parent retrieves the result and completes the required acknowledgement turn, a
-private, non-persisted resume token may authorize one same-ID `task()` admission
-on a statusless v2.0.15 host. The token is fenced by the child admission,
-generation, terminal revision, and result text; a new admission, plugin
-disposal, ambiguous send, or host restart invalidates it. This does not make
-v2.0.15 restart recovery automatic and does not authorize `task_message` or
-`task_revive` without their own host evidence.
+parent retrieves the matched result, a private, non-persisted resume token may
+authorize one same-ID `task()` admission on a statusless v2.0.15 host. The token
+is fenced by the child admission, generation, terminal revision, and result
+text; a new admission, plugin disposal, ambiguous send, or host restart
+invalidates it. This does not make v2.0.15 restart recovery automatic and does
+not authorize `task_message` or `task_revive` without their own host evidence.
 
 The control tools share the same recovery boundary. `task_status` may perform a
 read-only report for a verified exact session ID even when no durable alias can
@@ -603,6 +648,14 @@ the parent has been woken and the stop acknowledged, stale busy cannot flip the
 job back to running; the session remains listed under Retained / Recovery until
 revived or evicted. Only explicit terminal task output proves completion, error,
 or cancellation.
+
+When the current child run's trailing assistant message has `info.error` as an
+`Error` instance or ordinary object whose `name` is exactly
+`MessageAbortedError`, terminal publication submits `stopped` rather than
+`error`; string errors and other error objects remain `error`. A live `busy` or
+`retry` observation still takes precedence and does not submit `stopped`.
+`task_revive` can still return `status_uncertain` while the preceding evidence
+read remains open.
 
 Stopped-job recovery facts are checked again by task ID and run generation
 before a queued recovery wake is delivered. The inline detail queue is bounded;

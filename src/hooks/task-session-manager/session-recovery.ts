@@ -56,8 +56,9 @@ export type SessionRecoveryResult = RecoveryFields &
     | {
         kind: 'uncertain';
         reason: string;
-        /** Child terminal text is known, but a current matching parent notice
-         * and a later completed parent turn have not both been established. */
+        /** Child terminal text is known, but parent confirmation is missing.
+         * A matching task_result can confirm by itself. A synthetic notice
+         * still needs a later completed parent turn. */
         pendingAcknowledgement?: Extract<
           BackgroundJobAdoptionEvidence,
           { kind: 'terminal' }
@@ -136,6 +137,70 @@ function isTaskToolPart(part: MessagePart): boolean {
       part.name === 'task' ||
       part.tool === 'subagent' ||
       part.name === 'subagent')
+  );
+}
+
+/** Host SchemaError text, or the object form used in tests. Only a missing
+ * description is a pre-dispatch refusal; other schema failures are not. */
+function missingDescriptionSchemaError(error: unknown): boolean {
+  const text =
+    typeof error === 'string'
+      ? error
+      : isRecord(error) &&
+          error.name === 'SchemaError' &&
+          typeof error.message === 'string'
+        ? `SchemaError ${error.message}`
+        : undefined;
+  return (
+    text !== undefined &&
+    /SchemaError/.test(text) &&
+    /description/i.test(text) &&
+    /(missing|required)/i.test(text)
+  );
+}
+
+/** A refused resume that did not admit a prompt does not end the
+ * acknowledgement turn. Plugin pre-dispatch errors say "no new session
+ * was created" or "resume blocked". A missing-description SchemaError is
+ * the same class. Any other task()/subagent() call still ends the turn. */
+function refusedTaskCreatedNoSession(part: MessagePart): boolean {
+  if (!isTaskToolPart(part) || !isRecord(part.state)) return false;
+  if (part.state.status !== 'error') return false;
+  const error = part.state.error;
+  const output = part.state.output;
+  const text = `${typeof error === 'string' ? error : ''}\n${
+    typeof output === 'string' ? output : ''
+  }`.toLowerCase();
+  return (
+    text.includes('no new session was created') ||
+    text.includes('resume blocked') ||
+    missingDescriptionSchemaError(error) ||
+    missingDescriptionSchemaError(part.error)
+  );
+}
+
+/** The host writes the call being executed as running or pending before
+ * tool.execute.before. That part has not admitted a prompt yet. */
+function inFlightTaskPart(part: MessagePart): boolean {
+  if (!isTaskToolPart(part) || !isRecord(part.state)) return false;
+  return part.state.status === 'running' || part.state.status === 'pending';
+}
+
+/** A sibling read, bash, or grep can still be pending while task() starts.
+ * It has not failed, so it does not cancel a retrieved result. */
+function inFlightOrdinaryTool(part: MessagePart): boolean {
+  if (part.type !== 'tool' || isTaskToolPart(part) || !isRecord(part.state))
+    return false;
+  if (part.error != null || part.state.error != null) return false;
+  const status = part.state.status;
+  return status === 'pending' || status === 'running';
+}
+
+function taskPartEndsTurn(part: MessagePart): boolean {
+  return (
+    isTaskToolPart(part) &&
+    !refusedTaskCreatedNoSession(part) &&
+    !inFlightTaskPart(part)
   );
 }
 
@@ -288,15 +353,21 @@ function matchingTaskPart(
   return { part: latest.part, messages: transcript.messages };
 }
 
-type ParentNotice = { at: number; messageIndex: number };
+type ParentNotice = {
+  at: number;
+  messageIndex: number;
+  retrieved?: boolean;
+};
 
-/** Text, reasoning, and step markers may sit between a notice and the
- * parent's stop. They are not acknowledgement by themselves. */
+/** Text, reasoning, step markers, and a host file-diff patch may sit in
+ * the parent turn. They are not acknowledgement by themselves. OpenCode
+ * appends `patch` to the same assistant message when that step changes files. */
 const PARENT_TURN_ASIDE_TYPES = new Set([
   'text',
   'reasoning',
   'step-start',
   'step-finish',
+  'patch',
 ]);
 
 /** Exit metadata and truncation are not failures. task()/subagent() are
@@ -314,7 +385,23 @@ function parentToolSucceeded(part: MessagePart): boolean {
 function parentTurnContinues(message: MessageWithParts): boolean {
   return message.parts.every(
     (part) =>
-      PARENT_TURN_ASIDE_TYPES.has(part.type) || parentToolSucceeded(part),
+      PARENT_TURN_ASIDE_TYPES.has(part.type) ||
+      parentToolSucceeded(part) ||
+      refusedTaskCreatedNoSession(part) ||
+      inFlightTaskPart(part) ||
+      inFlightOrdinaryTool(part),
+  );
+}
+
+/** Sibling parts in the task_result message count. A failed tool or an
+ * already dispatched task()/subagent() blocks that retrieval. */
+function retrievedMessageAllowsAck(
+  message: MessageWithParts | undefined,
+): boolean {
+  if (!message) return false;
+  return (
+    parentTurnContinues(message) &&
+    !message.parts.some((item) => taskPartEndsTurn(item))
   );
 }
 
@@ -409,7 +496,7 @@ function matchingTaskResults(
         at > now
       )
         continue;
-      notices.push({ at, messageIndex });
+      notices.push({ at, messageIndex, retrieved: true });
     }
   }
   return notices;
@@ -475,19 +562,48 @@ function parentCompletion(
   }
   notices.sort((left, right) => left.messageIndex - right.messageIndex);
   for (const notice of notices) {
+    let blocked = false;
     for (const message of messages.slice(notice.messageIndex + 1)) {
       const started = messageTime(message, 'created');
-      if (started === undefined || started <= notice.at || started > now) break;
-      if (message.info.role !== 'assistant') break;
-      // Same alias, same session id, a different child, or no parseable id
-      // all end the turn. Do not continue to a later stop.
-      if (message.parts.some((part) => isTaskToolPart(part))) break;
+      // Equal timestamps stay in transcript order. An earlier stamp, a
+      // missing time, or a future time still fails closed.
+      if (started === undefined || started < notice.at || started > now) {
+        blocked = true;
+        break;
+      }
+      if (message.info.role !== 'assistant') {
+        // A retrieved result stays confirmed. A synthetic notice does not
+        // survive a later user or system message.
+        if (notice.retrieved) continue;
+        blocked = true;
+        break;
+      }
+      // A dispatched task()/subagent() ends the turn, including a different
+      // child or a call with no parseable id. A refusal that explicitly
+      // created no session does not.
+      if (message.parts.some((part) => taskPartEndsTurn(part))) {
+        blocked = true;
+        break;
+      }
       const acknowledgedAt = parentStopAcknowledgedAt(message, started, now);
       if (acknowledgedAt !== undefined)
         return { notifiedAt: notice.at, acknowledgedAt };
       if (parentTurnContinues(message)) continue;
+      blocked = true;
       break;
     }
+    // A matching task_result is the acknowledgement. A later stop is not
+    // required. A synthetic notice still is not enough on its own, and a
+    // task() already dispatched after the child finished blocks it.
+    if (
+      !blocked &&
+      notice.retrieved &&
+      retrievedMessageAllowsAck(messages[notice.messageIndex]) &&
+      !messages
+        .slice(part.messageIndex + 1, notice.messageIndex)
+        .some((message) => message.parts.some((item) => taskPartEndsTurn(item)))
+    )
+      return { notifiedAt: notice.at, acknowledgedAt: notice.at };
   }
   const lastNotice = notices.at(-1);
   return lastNotice ? { notifiedAt: lastNotice.at } : undefined;
@@ -883,7 +999,9 @@ export async function classifySessionRecovery(
     (outcome === 'interrupted' || outcome === 'cancelled') &&
     part &&
     part.status.state !== 'completed' &&
-    (transcript?.verdict === 'absent' || transcript?.verdict === 'error')
+    (transcript?.verdict === 'absent' ||
+      transcript?.verdict === 'error' ||
+      transcript?.verdict === 'aborted')
   )
     return {
       kind: 'stopped',
@@ -898,11 +1016,14 @@ export async function classifySessionRecovery(
     quiescentStatus &&
     part &&
     part.status.state !== 'completed' &&
-    (transcript?.verdict === 'absent' || transcript?.verdict === 'error') &&
+    (transcript?.verdict === 'absent' ||
+      transcript?.verdict === 'error' ||
+      transcript?.verdict === 'aborted') &&
     boundary &&
     boundary.startedAt <= statusReadStartedAt &&
     ((boundary.pendingUser && !boundary.errorBeforeLatestUser) ||
-      transcript?.verdict === 'error')
+      transcript?.verdict === 'error' ||
+      transcript?.verdict === 'aborted')
   )
     return {
       kind: 'stopped',

@@ -2431,7 +2431,7 @@ describe('task-session-manager hook', () => {
             { args },
           ),
         ).rejects.toThrow(
-          `Task ${requested}: fresh host evidence does not confirm a reusable session; resume blocked. Call task_result with task_id "${requested}" (the same alias or exact ID), allow the parent to finish a turn, then retry once later with the original task_id. Do not auto-resend; no new session was created.`,
+          `Task ${requested}: fresh host evidence does not confirm a reusable session; resume blocked. Call task_result with task_id "${requested}" (the same alias or exact ID), then retry once with the original task_id. Do not wait for a later parent turn. No new session was created.`,
         );
         expect(
           logSpy.mock.calls.find(
@@ -5720,13 +5720,15 @@ describe('task-session-manager hook', () => {
         task_id: 'ora-1',
       },
     };
-    await expect(
-      hook['tool.execute.before'](
-        { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
-        unreconciled,
-      ),
-    ).rejects.toThrow(/unreconciled; task\(\) cannot resume/);
-    expect(unreconciled.args.task_id).toBe('ora-1');
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
+      unreconciled,
+    );
+    expect(unreconciled.args.task_id).toBe('done-1');
+    expect(board.get('done-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+    });
 
     board.markReconciled('done-1');
 
@@ -5744,19 +5746,6 @@ describe('task-session-manager hook', () => {
       ),
     ).rejects.toThrow(/fresh host evidence/);
     expect(failed.args.task_id).toBe('ora-2');
-
-    const completed = {
-      args: {
-        subagent_type: 'oracle',
-        description: 'review plan retry',
-        task_id: 'ora-1',
-      },
-    };
-    await hook['tool.execute.before'](
-      { tool: 'task', sessionID: 'parent-1', callID: 'call-3' },
-      completed,
-    );
-    expect(completed.args.task_id).toBe('done-1');
 
     const messages = createMessages('parent-1', 'continue');
     await transformMessages(hook, messages);
@@ -7603,7 +7592,7 @@ describe('task-session-manager hook', () => {
         },
       ),
     ).rejects.toThrow(
-      'Call task_result with task_id "fix-1" (the same alias or exact ID), allow the parent to finish a turn, then retry once later with the original task_id.',
+      'Call task_result with task_id "fix-1" (the same alias or exact ID), then retry once with the original task_id. Do not wait for a later parent turn. No new session was created.',
     );
     expect(board.get('ses_recover')).toBeUndefined();
     expect(index.hasUnsettledResume('parent-1', 'ses_recover')).toBe(false);
@@ -7690,7 +7679,7 @@ describe('task-session-manager hook', () => {
             { args },
           ),
         ).rejects.toThrow(
-          `Task ${requested}: fresh host evidence does not confirm a reusable session; resume blocked. Call task_result with task_id "${requested}" (the same alias or exact ID), allow the parent to finish a turn, then retry once later with the original task_id. Do not auto-resend; no new session was created.`,
+          `Task ${requested}: fresh host evidence does not confirm a reusable session; resume blocked. Call task_result with task_id "${requested}" (the same alias or exact ID), then retry once with the original task_id. Do not wait for a later parent turn. No new session was created.`,
         );
         expect(
           logSpy.mock.calls.find(

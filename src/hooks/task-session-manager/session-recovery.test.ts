@@ -868,7 +868,10 @@ describe('classifySessionRecovery', () => {
         },
       ],
     });
-    expect((await recover()).kind).toBe('uncertain');
+    expect(await recover()).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
     parentMessages.push({
       id: 'p-ack',
       role: 'assistant',
@@ -902,12 +905,19 @@ describe('classifySessionRecovery', () => {
       v2ParentResult({ resultStartedAt: 189 }),
       v2ParentResult({ resultStartedAt: Number.NaN }),
       v2ParentResult({ resultStartedAt: 220 }),
-      v2ParentResult({ acknowledge: false }),
     ]) {
       expect((await classifySessionRecovery(v2Recovery(transcript))).kind).toBe(
         'uncertain',
       );
     }
+    expect(
+      await classifySessionRecovery(
+        v2Recovery(v2ParentResult({ acknowledge: false })),
+      ),
+    ).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
     const failed = v2ParentResult();
     const tool = failed.data[1].parts[0] as {
       state: { error?: string; time: { start?: number; end?: number } };
@@ -1137,7 +1147,20 @@ describe('classifySessionRecovery', () => {
         parts: [{ type: 'tool', name: 'read', state: {} }],
       },
     ];
-    for (const message of between) {
+    const userMessage = between[0];
+    const userTranscript = v2ParentResult();
+    userTranscript.data.splice(
+      2,
+      0,
+      userMessage as (typeof userTranscript.data)[number],
+    );
+    expect(
+      await classifySessionRecovery(v2Recovery(userTranscript)),
+    ).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+    for (const message of between.slice(1)) {
       const transcript = v2ParentResult();
       transcript.data.splice(2, 0, message as (typeof transcript.data)[number]);
       expect(
@@ -1149,13 +1172,13 @@ describe('classifySessionRecovery', () => {
     }
   });
 
-  test('a parent reply without a completed timestamp cannot acknowledge a retrieval', async () => {
+  test('a retrieved result stays acknowledged without a completed parent reply', async () => {
     const transcript = v2ParentResult();
     transcript.data[2].info.time = { created: 240 };
     expect(await classifySessionRecovery(v2Recovery(transcript))).toMatchObject(
       {
-        kind: 'uncertain',
-        pendingAcknowledgement: { acknowledged: false },
+        kind: 'reusable',
+        evidence: { acknowledged: true },
       },
     );
   });
@@ -1713,7 +1736,45 @@ describe('classifySessionRecovery', () => {
     });
   });
 
-  test('an earlier finish stop cannot acknowledge a later task_result', async () => {
+  test('the in-flight task() does not erase a retrieved result', async () => {
+    for (const status of ['running', 'pending'] as const) {
+      const result = await recoveryForTail([
+        parentMessage('resume', 'assistant', 220, [
+          {
+            type: 'tool',
+            tool: 'task',
+            state: {
+              status,
+              input: { task_id: taskID, background: true },
+            },
+          },
+        ]),
+      ]);
+      expect({
+        status,
+        kind: result.kind,
+        acknowledged: acknowledgedFlag(result),
+      }).toEqual({
+        status,
+        kind: 'reusable',
+        acknowledged: true,
+      });
+    }
+    await expectTailUncertain('already-dispatched', [
+      parentMessage('sent', 'assistant', 220, [
+        {
+          type: 'tool',
+          tool: 'task',
+          state: {
+            status: 'completed',
+            input: { task_id: taskID, background: true },
+          },
+        },
+      ]),
+    ]);
+  });
+
+  test('a matching task_result acknowledges without a later parent stop', async () => {
     const transcript = v2ParentResult({ acknowledge: false });
     transcript.data.splice(
       1,
@@ -1726,25 +1787,34 @@ describe('classifySessionRecovery', () => {
       reason: 'reason' in result ? result.reason : undefined,
       acknowledged: acknowledgedFlag(result),
     }).toEqual({
-      kind: 'uncertain',
-      reason: 'parent acknowledgement unproven',
-      acknowledged: false,
+      kind: 'reusable',
+      reason: undefined,
+      acknowledged: true,
     });
   });
 
-  test('a later stop after a user or system message is not acknowledgement', async () => {
-    await expectTailUncertain('user', [
-      parentMessage('external', 'user', 220, [
-        { type: 'text', text: 'New instruction' },
-      ]),
-      parentStop(),
-    ]);
-    await expectTailUncertain('system', [
-      parentMessage('note', 'system', 220, [
-        { type: 'text', text: 'System note' },
-      ]),
-      parentStop(),
-    ]);
+  test('a retrieved result stays confirmed after a user or system message', async () => {
+    for (const [label, message] of [
+      [
+        'user',
+        parentMessage('external', 'user', 220, [
+          { type: 'text', text: 'New instruction' },
+        ]),
+      ],
+      [
+        'system',
+        parentMessage('note', 'system', 220, [
+          { type: 'text', text: 'System note' },
+        ]),
+      ],
+    ] as const) {
+      const result = await recoveryForTail([message, parentStop()]);
+      expect({
+        label,
+        kind: result.kind,
+        acknowledged: acknowledgedFlag(result),
+      }).toEqual({ label, kind: 'reusable', acknowledged: true });
+    }
   });
 
   test('task() or subagent() before a stop stays unacknowledged', async () => {
@@ -1765,10 +1835,206 @@ describe('classifySessionRecovery', () => {
       ]);
   });
 
-  test('unfinished or failed ordinary tools stay unacknowledged', async () => {
-    const states: Array<Record<string, unknown>> = [
+  test('a missing-description SchemaError does not erase a retrieved result', async () => {
+    const errors = [
+      'SchemaError: description is required',
+      { name: 'SchemaError', message: 'Missing key at ["description"]' },
+    ];
+    for (const [index, error] of errors.entries()) {
+      const result = await recoveryForTail([
+        parentMessage('schema', 'assistant', 220, [
+          {
+            type: 'tool',
+            tool: 'task',
+            state: {
+              status: 'error',
+              input: { task_id: taskID, background: true },
+              error,
+            },
+          },
+        ]),
+      ]);
+      expect({
+        index,
+        kind: result.kind,
+        acknowledged: acknowledgedFlag(result),
+      }).toEqual({ index, kind: 'reusable', acknowledged: true });
+    }
+    await expectTailUncertain('other-schema', [
+      parentMessage('schema', 'assistant', 220, [
+        {
+          type: 'tool',
+          tool: 'task',
+          state: {
+            status: 'error',
+            input: { task_id: taskID, background: true },
+            error: {
+              name: 'SchemaError',
+              message: 'Invalid type at ["prompt"]',
+            },
+          },
+        },
+      ]),
+      parentStop(),
+    ]);
+  });
+
+  test('a capital-N no-session refusal can be followed by a stop', async () => {
+    const refusal = {
+      type: 'tool',
+      tool: 'task',
+      state: {
+        status: 'error',
+        input: { task_id: taskID, background: true },
+        error:
+          'fix-108: completed, unreconciled; task() cannot resume until acknowledgement. Use task_revive now, or wait for ack then task(). No new session was created.',
+      },
+    };
+    const result = await recoveryForTail([
+      parentMessage('retry', 'assistant', 220, [refusal]),
+      parentStop(),
+    ]);
+    expect(result).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+  });
+
+  test('a refused task() that created no session can be followed by a stop', async () => {
+    const refusal = {
+      type: 'tool',
+      tool: 'task',
+      state: {
+        status: 'error',
+        input: { task_id: taskID, background: true },
+        error:
+          'fresh host evidence does not confirm a reusable session; resume blocked. no new session was created.',
+      },
+    };
+    const result = await recoveryForTail([
+      parentMessage('retry', 'assistant', 220, [
+        { type: 'text', text: 'Retrying the same session.' },
+        refusal,
+      ]),
+      parentMessage('retry-again', 'assistant', 240, [refusal]),
+      parentStop(),
+    ]);
+    expect(result).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+    await expectTailUncertain('error-without-proof', [
+      parentMessage('retry', 'assistant', 220, [
+        {
+          type: 'tool',
+          tool: 'task',
+          state: {
+            status: 'error',
+            input: { task_id: taskID },
+            error: 'network timeout',
+          },
+        },
+      ]),
+      parentStop(),
+    ]);
+    const afterUser = await recoveryForTail([
+      parentMessage('retry', 'assistant', 220, [refusal]),
+      parentMessage('external', 'user', 250, [
+        { type: 'text', text: 'New instruction' },
+      ]),
+      parentStop(260, 270),
+    ]);
+    expect(afterUser).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+  });
+
+  test('unfinished ordinary tools do not erase a retrieved result', async () => {
+    for (const [index, state] of [
       { status: 'pending' },
       { status: 'running' },
+    ].entries()) {
+      const result = await recoveryForTail([
+        parentMessage('tool', 'assistant', 220, [
+          { type: 'tool', tool: 'bash', name: 'bash', state },
+          {
+            type: 'tool',
+            tool: 'task',
+            state: {
+              status: 'running',
+              input: { task_id: taskID, background: true },
+            },
+          },
+        ]),
+      ]);
+      expect({
+        index,
+        kind: result.kind,
+        acknowledged: acknowledgedFlag(result),
+      }).toEqual({ index, kind: 'reusable', acknowledged: true });
+    }
+  });
+
+  test('a same-millisecond user message keeps a retrieved result', async () => {
+    const same = await recoveryForTail([
+      parentMessage('external', 'user', 215, [
+        { type: 'text', text: 'New instruction' },
+      ]),
+    ]);
+    expect(same).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+    await expectTailUncertain('earlier-user', [
+      parentMessage('external', 'user', 214, [
+        { type: 'text', text: 'Earlier stamp' },
+      ]),
+    ]);
+    await expectTailUncertain('same-ms-failed-bash', [
+      parentMessage('tool', 'assistant', 215, [
+        {
+          type: 'tool',
+          tool: 'bash',
+          name: 'bash',
+          state: { status: 'error', error: 'command failed' },
+        },
+      ]),
+    ]);
+  });
+
+  test('siblings beside task_result block when they failed or dispatched', async () => {
+    const failed = v2ParentResult({ acknowledge: false });
+    failed.data[1].parts.push({
+      type: 'tool',
+      tool: 'bash',
+      name: 'bash',
+      state: { status: 'completed', error: 'command failed' },
+    });
+    expect(await classifySessionRecovery(v2Recovery(failed))).toMatchObject({
+      kind: 'uncertain',
+      pendingAcknowledgement: { acknowledged: false },
+    });
+
+    const other = v2ParentResult({ acknowledge: false });
+    other.data[1].parts.push(
+      childDelegation({ tool: 'subagent', taskId: 'ses_other' }),
+    );
+    expect(await classifySessionRecovery(v2Recovery(other))).toMatchObject({
+      kind: 'uncertain',
+      pendingAcknowledgement: { acknowledged: false },
+    });
+
+    const ok = v2ParentResult({ acknowledge: false });
+    ok.data[1].parts.push(completedBash());
+    expect(await classifySessionRecovery(v2Recovery(ok))).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+  });
+
+  test('failed ordinary tools stay unacknowledged', async () => {
+    const states: Array<Record<string, unknown>> = [
       {},
       { status: 'completed', error: 'command failed' },
     ];
@@ -1797,12 +2063,78 @@ describe('classifySessionRecovery', () => {
     ]);
   });
 
+  test('a resume-blocked refusal does not erase a later task_result', async () => {
+    const transcript = v2ParentResult({ acknowledge: false });
+    transcript.data.splice(
+      1,
+      0,
+      parentMessage('refused', 'assistant', 180, [
+        {
+          type: 'tool',
+          tool: 'task',
+          state: {
+            status: 'error',
+            input: { task_id: taskID, background: true },
+            error:
+              'Task ses_child: fresh host evidence does not confirm a reusable session; resume blocked. Do not create a new session.',
+          },
+        },
+      ]) as (typeof transcript.data)[number],
+    );
+    expect(await classifySessionRecovery(v2Recovery(transcript))).toMatchObject(
+      {
+        kind: 'reusable',
+        evidence: { acknowledged: true },
+      },
+    );
+    const after = await recoveryForTail([
+      parentMessage('refused-later', 'assistant', 220, [
+        {
+          type: 'tool',
+          tool: 'task',
+          state: {
+            status: 'error',
+            input: { task_id: taskID, background: true },
+            error: 'identity index unreadable; resume blocked.',
+          },
+        },
+      ]),
+    ]);
+    expect(after).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+  });
+
+  test('a host patch part does not erase a retrieved result', async () => {
+    const beside = v2ParentResult({ acknowledge: false });
+    beside.data[1].parts.push({
+      type: 'patch',
+      hash: 'abc',
+      files: [{ file: 'src/a.ts' }],
+    });
+    expect(await classifySessionRecovery(v2Recovery(beside))).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+    const later = await recoveryForTail([
+      parentMessage('patched', 'assistant', 220, [
+        completedBash(),
+        { type: 'patch', hash: 'abc', files: [{ file: 'src/a.ts' }] },
+        { type: 'step-finish' },
+      ]),
+    ]);
+    expect(later).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+  });
+
   test('an unknown part type before a stop stays unacknowledged', async () => {
     for (const type of [
       'subtask',
       'retry',
       'compaction',
-      'patch',
       'snapshot',
       'file',
       'agent',
@@ -1814,30 +2146,45 @@ describe('classifySessionRecovery', () => {
       ]);
   });
 
-  test('a stop without non-empty text is not acknowledgement', async () => {
-    await expectTailUncertain('reasoning-only', [
-      parentStop(240, 241, [
-        { type: 'reasoning', text: 'Result received.' },
-        { type: 'step-start' },
-        { type: 'step-finish' },
-      ]),
-    ]);
-    await expectTailUncertain('blank-text', [
-      parentStop(240, 241, [
-        { type: 'reasoning', text: 'Result received.' },
-        { type: 'text', text: ' \n\t' },
-        { type: 'step-finish' },
-      ]),
-    ]);
+  test('a textless stop does not erase a retrieved result', async () => {
+    for (const [label, stop] of [
+      [
+        'reasoning-only',
+        parentStop(240, 241, [
+          { type: 'reasoning', text: 'Result received.' },
+          { type: 'step-start' },
+          { type: 'step-finish' },
+        ]),
+      ],
+      [
+        'blank-text',
+        parentStop(240, 241, [
+          { type: 'reasoning', text: 'Result received.' },
+          { type: 'text', text: ' \n\t' },
+          { type: 'step-finish' },
+        ]),
+      ],
+    ] as const) {
+      const result = await recoveryForTail([stop]);
+      expect({
+        label,
+        kind: result.kind,
+        acknowledged: acknowledgedFlag(result),
+      }).toEqual({ label, kind: 'reusable', acknowledged: true });
+    }
   });
 
   test('a stop after a message outside the notice window stays unacknowledged', async () => {
-    await expectTailUncertain('created-equals-notice', [
+    const same = await recoveryForTail([
       parentMessage('same', 'assistant', 215, [
-        { type: 'text', text: 'Too early.' },
+        { type: 'text', text: 'Same millisecond.' },
       ]),
       parentStop(),
     ]);
+    expect(same).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
     await expectTailUncertain('created-before-notice', [
       parentMessage('early', 'assistant', 200, [
         { type: 'text', text: 'Too early.' },
