@@ -427,6 +427,32 @@ describe('task_revive tool', () => {
     });
   });
 
+  test('a thrown HTTP 500 keeps the revive claim', async () => {
+    await withRealIdentityIndex(async (identityIndex) => {
+      const fixture = createTool(
+        realStoppedOrphanOptions(identityIndex, {
+          promptAsync: () =>
+            Promise.reject(
+              Object.assign(new Error('HTTP 500'), {
+                status: 500,
+                error: { message: 'socket closed' },
+              }),
+            ),
+        }),
+      );
+
+      await expect(
+        fixture.taskRevive.execute(
+          { task_id: 'ses_1', prompt: 'retry me' },
+          context,
+        ),
+      ).rejects.toThrow('HTTP 500');
+      expect(
+        identityIndex.inspectOperationClaim('parent-1', 'ses_1', 'revive'),
+      ).toMatchObject({ phase: 'sent_unknown' });
+    });
+  });
+
   test('settles a late thrown status-bearing rejection after the caller deadline', async () => {
     await withRealIdentityIndex(async (identityIndex) => {
       const deadline = controlledAdmissionDeadline();

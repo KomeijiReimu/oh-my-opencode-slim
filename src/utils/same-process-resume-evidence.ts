@@ -209,6 +209,9 @@ export function createSameProcessResumeEvidence(): SameProcessResumeEvidence {
 
   const admissionsBySession = new Map<string, AdmissionRecord>();
   const terminalsByTask = new Map<string, TerminalRecord>();
+  /** A newer admission replaced the turn that produced a result before that
+   * result was recorded. The next terminal for that session must not attach. */
+  const unmatchedTerminal = new Set<string>();
   let tokens = new WeakMap<object, TokenState>();
   let claims = new WeakMap<object, ClaimState>();
 
@@ -261,6 +264,7 @@ export function createSameProcessResumeEvidence(): SameProcessResumeEvidence {
       if (existing) {
         invalidateSession(admission.sessionID);
         admissionsBySession.delete(admission.sessionID);
+        unmatchedTerminal.add(admission.sessionID);
       }
       while (admissionsBySession.size >= MAX_ADMISSION_RECORDS) {
         const oldest = admissionsBySession.keys().next().value;
@@ -282,6 +286,7 @@ export function createSameProcessResumeEvidence(): SameProcessResumeEvidence {
 
       const admission = admissionsBySession.get(terminal.taskID);
       if (!admission) return;
+      if (unmatchedTerminal.delete(terminal.taskID)) return;
 
       const digest = resultDigest(terminal.resultSummary);
       const previous = terminalsByTask.get(terminal.taskID);
@@ -427,6 +432,7 @@ export function createSameProcessResumeEvidence(): SameProcessResumeEvidence {
       disposed = true;
       clearTerminals();
       admissionsBySession.clear();
+      unmatchedTerminal.clear();
       tokens = new WeakMap();
       claims = new WeakMap();
     },

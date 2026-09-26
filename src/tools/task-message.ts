@@ -402,13 +402,13 @@ function rejectionStatus(error: Record<string, unknown>): number | undefined {
   return undefined;
 }
 
-/** A 4xx response refused the message. A 5xx or transport failure may
- * already have admitted it, so the durable claim stays. */
+/** Only an explicit 4xx, including `cause.status`, refused the message.
+ * A 5xx, a status-less throw, or a transport error may already have
+ * admitted it, so the durable claim stays. */
 function isAuthoritativeApiRejection(error: unknown): boolean {
   if (!isRecord(error)) return false;
   const status = rejectionStatus(error);
-  if (status !== undefined) return status >= 400 && status < 500;
-  return error.error !== undefined && error.error !== null;
+  return status !== undefined && status >= 400 && status < 500;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

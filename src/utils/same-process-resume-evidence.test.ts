@@ -198,6 +198,38 @@ describe('same-process resume evidence', () => {
     expect(authorize(broker)).toBeUndefined();
   });
 
+  test('a later child admission does not inherit the previous result', () => {
+    const broker = createSameProcessResumeEvidence();
+    broker.observeAdmission({
+      sessionID: admission.sessionID,
+      messageID: 'child-user-1',
+    });
+    broker.observeAdmission({
+      sessionID: admission.sessionID,
+      messageID: 'child-user-2',
+    });
+    broker.recordTerminal({ ...terminal, completedAt: undefined });
+
+    expect(authorize(broker)).toBeUndefined();
+
+    broker.recordTerminal({
+      ...terminal,
+      terminalRevision: terminal.terminalRevision + 1,
+      resultSummary: 'second run',
+      completedAt: undefined,
+    });
+    expect(
+      broker.authorize({
+        taskID: terminal.taskID,
+        parentSessionID: terminal.parentSessionID,
+        generation: terminal.generation,
+        terminalRevision: terminal.terminalRevision + 1,
+        resultSummary: 'second run',
+        acknowledgedAt: 30,
+      }),
+    ).toBeDefined();
+  });
+
   test('a parent follow-up after child terminal does not revoke child evidence', () => {
     const broker = brokerWithTerminal();
     const token = authorize(broker);

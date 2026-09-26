@@ -510,7 +510,7 @@ export function createTaskReviveTool(
             },
             (error: unknown) => {
               owner.settled = true;
-              if (getApiError(error) !== undefined)
+              if (isExplicitClientRejection(error))
                 settleOperation('authoritative_rejection');
               return { ok: false as const, error };
             },
@@ -774,6 +774,27 @@ function isReviveableRetainedJob(
   return job.state === 'reconciled' && job.terminalState !== undefined;
 }
 
+function explicitClientStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const record = error as Record<string, unknown>;
+  for (const key of ['status', 'statusCode'] as const) {
+    if (typeof record[key] === 'number') return record[key];
+  }
+  if (!record.cause || typeof record.cause !== 'object') return undefined;
+  const cause = record.cause as Record<string, unknown>;
+  for (const key of ['status', 'statusCode'] as const) {
+    if (typeof cause[key] === 'number') return cause[key];
+  }
+  return undefined;
+}
+
+/** A thrown prompt error clears the claim only for an explicit 4xx.
+ * A 5xx or a status-less transport error may already have been admitted. */
+function isExplicitClientRejection(error: unknown): boolean {
+  const status = explicitClientStatus(error);
+  return status !== undefined && status >= 400 && status < 500;
+}
+
 function getApiError(response: unknown): unknown {
   if (response === false || response === null) return response;
   return classifyApiRejection(response);
@@ -807,7 +828,7 @@ function hasHttpFailureStatus(value: unknown): boolean {
     typeof value === 'string'
       ? statusFromMessage(value)
       : statusFromRecord(value);
-  return status !== undefined && status >= 300 && status <= 599;
+  return status !== undefined && status >= 400 && status < 500;
 }
 
 function statusFromRecord(value: unknown): number | undefined {

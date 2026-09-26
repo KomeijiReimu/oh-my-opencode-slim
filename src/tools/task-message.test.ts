@@ -516,6 +516,29 @@ describe('task_message', () => {
     expect(recovery.isClaimed()).toBe(false);
   });
 
+  test('a status-less thrown error keeps the durable claim', async () => {
+    const board = new BackgroundJobBoard();
+    registerRunningChild(board);
+    const prompt = mock(async () => {
+      throw Object.assign(new Error('socket closed'), {
+        error: { message: 'socket closed' },
+      });
+    });
+    const settlements: string[] = [];
+    const recovery = makeDurableRecovery(board, {
+      onSettle: (resolution) => settlements.push(resolution),
+    });
+    const task_message = createDurableTool(board, prompt, recovery);
+
+    await expect(
+      task_message.execute({ task_id: 'ses_child1', message: 'Retry.' }, {
+        sessionID: 'parent-1',
+      } as any),
+    ).rejects.toThrow('socket closed');
+    expect(settlements).toEqual([]);
+    expect(recovery.isClaimed()).toBe(true);
+  });
+
   test.each([false, undefined])(
     'marks sent before prompt and refuses to prompt when that transition is %s',
     async (sent) => {
