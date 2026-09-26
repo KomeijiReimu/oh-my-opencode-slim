@@ -395,11 +395,20 @@ function messageResponseError(response: unknown): unknown {
   return response.error === null ? undefined : response.error;
 }
 
+function rejectionStatus(error: Record<string, unknown>): number | undefined {
+  if (typeof error.status === 'number') return error.status;
+  if (isRecord(error.cause) && typeof error.cause.status === 'number')
+    return error.cause.status;
+  return undefined;
+}
+
+/** A 4xx response refused the message. A 5xx or transport failure may
+ * already have admitted it, so the durable claim stays. */
 function isAuthoritativeApiRejection(error: unknown): boolean {
   if (!isRecord(error)) return false;
-  if (error.error !== undefined && error.error !== null) return true;
-  if (typeof error.status === 'number') return true;
-  return isRecord(error.cause) && typeof error.cause.status === 'number';
+  const status = rejectionStatus(error);
+  if (status !== undefined) return status >= 400 && status < 500;
+  return error.error !== undefined && error.error !== null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

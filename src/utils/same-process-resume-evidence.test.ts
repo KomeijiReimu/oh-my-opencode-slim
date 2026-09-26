@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { createSameProcessResumeEvidence } from './same-process-resume-evidence';
+import {
+  createSameProcessResumeEvidence,
+  hostResumeEvidence,
+} from './same-process-resume-evidence';
 
 const admission = {
   sessionID: 'child',
@@ -39,6 +42,17 @@ function authorize(
 }
 
 describe('same-process resume evidence', () => {
+  test('reuses the broker supplied by the host setup', () => {
+    const supplied = createSameProcessResumeEvidence();
+
+    expect(hostResumeEvidence({ experimental_v2: {} })).toBeUndefined();
+    expect(
+      hostResumeEvidence({
+        experimental_v2: { sameProcessResumeEvidence: supplied },
+      }),
+    ).toBe(supplied);
+  });
+
   test('rejects authorization before terminal evidence exists', () => {
     const broker = createSameProcessResumeEvidence();
     broker.observeAdmission(admission);

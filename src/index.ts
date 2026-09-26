@@ -121,6 +121,7 @@ import { initLogger, log } from './utils/logger';
 import { getClient } from './utils/opencode-client';
 import {
   createSameProcessResumeEvidence,
+  hostResumeEvidence,
   type SameProcessResumeEvidence,
 } from './utils/same-process-resume-evidence';
 import { SessionMetadataStore } from './utils/session-metadata';
@@ -571,7 +572,14 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     const backgroundJobCoordinator = new BackgroundJobCoordinator(
       backgroundJobBoard,
     );
-    resumeEvidence = createSameProcessResumeEvidence();
+    resumeEvidence =
+      hostResumeEvidence(
+        ctx as {
+          experimental_v2?: {
+            sameProcessResumeEvidence?: SameProcessResumeEvidence;
+          };
+        },
+      ) ?? createSameProcessResumeEvidence();
     const taskControlRecovery = createTaskControlRecovery({
       input: ctx,
       backgroundJobBoard: backgroundJobCoordinator,

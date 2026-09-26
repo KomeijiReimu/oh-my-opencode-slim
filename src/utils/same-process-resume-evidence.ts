@@ -66,6 +66,16 @@ export interface SameProcessResumeEvidenceBroker {
 /** Alias for callers that prefer the shorter object type name. */
 export type SameProcessResumeEvidence = SameProcessResumeEvidenceBroker;
 
+/** The v2 setup broker, when the host passed one in. Callers must not
+ * create a second broker for the same plugin setup. */
+export function hostResumeEvidence(input: {
+  experimental_v2?: {
+    sameProcessResumeEvidence?: SameProcessResumeEvidence;
+  };
+}): SameProcessResumeEvidence | undefined {
+  return input.experimental_v2?.sameProcessResumeEvidence;
+}
+
 interface AdmissionRecord {
   sessionID: string;
   messageID: string;

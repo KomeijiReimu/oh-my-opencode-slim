@@ -2106,6 +2106,20 @@ describe('classifySessionRecovery', () => {
     });
   });
 
+  test('a failed tool in a stopped parent message stays unacknowledged', async () => {
+    await expectTailUncertain('failed-and-stop', [
+      parentStop(220, 230, [
+        { type: 'text', text: 'Result received.' },
+        {
+          type: 'tool',
+          tool: 'bash',
+          name: 'bash',
+          state: { status: 'completed', error: 'command failed' },
+        },
+      ]),
+    ]);
+  });
+
   test('a host patch part does not erase a retrieved result', async () => {
     const beside = v2ParentResult({ acknowledge: false });
     beside.data[1].parts.push({

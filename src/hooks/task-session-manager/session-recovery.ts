@@ -585,12 +585,15 @@ function parentCompletion(
         blocked = true;
         break;
       }
+      // A failed tool in the same message blocks even when that message
+      // also ends with finish: stop. The stop is not checked first.
+      if (!parentTurnContinues(message)) {
+        blocked = true;
+        break;
+      }
       const acknowledgedAt = parentStopAcknowledgedAt(message, started, now);
       if (acknowledgedAt !== undefined)
         return { notifiedAt: notice.at, acknowledgedAt };
-      if (parentTurnContinues(message)) continue;
-      blocked = true;
-      break;
     }
     // A matching task_result is the acknowledgement. A later stop is not
     // required. A synthetic notice still is not enough on its own, and a

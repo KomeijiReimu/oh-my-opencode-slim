@@ -471,6 +471,51 @@ describe('task_message', () => {
     expect(recovery.isClaimed()).toBe(false);
   });
 
+  test('an HTTP 500 after the prompt keeps the durable claim', async () => {
+    const board = new BackgroundJobBoard();
+    registerRunningChild(board);
+    const prompt = mock(async () => {
+      throw Object.assign(new Error('HTTP 500'), {
+        status: 500,
+        error: { message: 'upstream failed' },
+      });
+    });
+    const settlements: string[] = [];
+    const recovery = makeDurableRecovery(board, {
+      onSettle: (resolution) => settlements.push(resolution),
+    });
+    const task_message = createDurableTool(board, prompt, recovery);
+
+    await expect(
+      task_message.execute({ task_id: 'ses_child1', message: 'Retry.' }, {
+        sessionID: 'parent-1',
+      } as any),
+    ).rejects.toThrow('HTTP 500');
+    expect(settlements).toEqual([]);
+    expect(recovery.isClaimed()).toBe(true);
+  });
+
+  test('a thrown HTTP 409 clears the durable claim', async () => {
+    const board = new BackgroundJobBoard();
+    registerRunningChild(board);
+    const prompt = mock(async () => {
+      throw Object.assign(new Error('HTTP 409'), { status: 409 });
+    });
+    const settlements: string[] = [];
+    const recovery = makeDurableRecovery(board, {
+      onSettle: (resolution) => settlements.push(resolution),
+    });
+    const task_message = createDurableTool(board, prompt, recovery);
+
+    await expect(
+      task_message.execute({ task_id: 'ses_child1', message: 'Rejected.' }, {
+        sessionID: 'parent-1',
+      } as any),
+    ).rejects.toThrow('HTTP 409');
+    expect(settlements).toEqual(['authoritative_rejection']);
+    expect(recovery.isClaimed()).toBe(false);
+  });
+
   test.each([false, undefined])(
     'marks sent before prompt and refuses to prompt when that transition is %s',
     async (sent) => {
