@@ -188,6 +188,8 @@ export function createTaskSessionManagerHook(
     hostOutcomeClock?: 'shared-unix-ms';
     backgroundJobSupervisor?: BackgroundJobSupervisor;
     backgroundTaskConcurrency?: BackgroundTaskConcurrency;
+    /** When false, board reminder injection is fully disabled (#1314 thread). */
+    boardInjection?: boolean;
     /** Shared by plugin generations for one admission runtime. */
     pendingCallTracker?: PendingCallTracker;
     /** One process-local resume-evidence broker for this plugin generation. */
@@ -385,8 +387,11 @@ export function createTaskSessionManagerHook(
     string,
     Map<string, BackgroundJobExecution>
   >();
-  /** Managed sessions with a deferred inline 401/410 awaiting fallback outcome. */
-  const deferredInlineErrors = new Set<string>();
+  /** Sessions with a deferred failover error awaiting the fallback
+   *  outcome (managed inline 401/410, or a background child's
+   *  failover-worthy error with an armed fallback chain), mapped to the
+   *  summary the idle backstop publishes when no recovery happens. */
+  const deferredInlineErrors = new Map<string, string>();
 
   // Forward refs for circular deps — set after corresponding managers exist.
   // These are captured by closure in createIdleReconciler and only called
@@ -410,6 +415,14 @@ export function createTaskSessionManagerHook(
     hasInputWait: (s) => hasInputWait(s),
     getIdleSessionToken: (s) => getIdleSessionToken(s),
     isCurrentIdleSessionToken: (s, t) => isCurrentIdleSessionToken(s, t),
+    // Read-and-clear for the deferred-error backstop: consuming at fire
+    // time keeps a newer deferral authoritative and leaves no stale
+    // entries to poison a later reuse of the session.
+    consumeDeferredError: (sessionID) => {
+      const message = deferredInlineErrors.get(sessionID);
+      if (message !== undefined) deferredInlineErrors.delete(sessionID);
+      return message;
+    },
   });
   const runtimeStatusReconciler = createRuntimeStatusReconciler({
     input: _ctx,
@@ -505,6 +518,7 @@ export function createTaskSessionManagerHook(
     terminalGate,
     maxRetainedSnapshots: options.maxRetainedSnapshots,
     strategy: options.strategy ?? 'latest',
+    boardInjection: options.boardInjection !== false,
     lifecycleLedger: rehydrateState,
     processedInjectedCompletions: rehydrateState.processedInjectedCompletions,
     processedInjectedCompletionOrder:
@@ -782,7 +796,12 @@ export function createTaskSessionManagerHook(
         const sessionID =
           input.event.properties?.info?.id ?? input.event.properties?.sessionID;
         if (sessionID) {
-          deferredInlineErrors.delete(sessionID);
+          // deferredInlineErrors is intentionally NOT cleared here: the
+          // event router's session.deleted branch owns the deferral —
+          // it publishes the deferred error for genuine deletions and
+          // keeps it (with a re-armed backstop) through fallback
+          // teardown. An unconditional clear would swallow the error
+          // and strand a mid-fallback record in `running` forever.
           if (!options.isFallbackInProgress?.(sessionID)) {
             const hardTimedOut =
               backgroundJobBoard.field(sessionID, 'deadlineExceededAt') !==

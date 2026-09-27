@@ -4,25 +4,35 @@ import {
   acquireAdmissionRuntime,
 } from './admission-runtime';
 import {
-  applyModelInheritanceToConfig,
   createAgents,
-  ensureCouncilCompactionException,
-  getAgentConfigs,
+  getAgentConfigsFromDefinitions,
   isSubagent,
   resolvePrimaryModelValue,
 } from './agents';
 import { buildOrchestratorPrompt } from './agents/orchestrator';
+import {
+  buildResolvedAgentRegistry,
+  type RegistryHostSnapshot,
+  type ResolvedAgentRegistry,
+} from './agents/registry';
+import type { RegistryFactoryBridge } from './agents/registry-bridge';
 import { CompanionManager } from './companion/manager';
 import { ensureCompanionVersion } from './companion/updater';
 import { deepMerge, loadPluginConfig } from './config';
-import { parseList } from './config/agent-mcps';
 import {
-  AGENT_ALIASES,
   DEFAULT_MAX_SESSION_METADATA_ENTRIES,
   TOAST_DURATION_MS,
 } from './config/constants';
+import {
+  findPluginConfigPaths,
+  loadPluginConfigFromPath,
+  mergePluginConfigs,
+} from './config/loader';
+import {
+  PresetResolutionError,
+  resolvePresetDefinition,
+} from './config/presets';
 import { RuntimeConfig } from './config/runtime';
-import { applyOrchestratorModelConfig } from './config/strip-orchestrator-model';
 import { getBuildInfo } from './generated/build-info';
 import { HEALTH_CHECK, minimumExpectedToolCount } from './health-check';
 import {
@@ -32,7 +42,6 @@ import {
   createCacheMonitorHook,
   createChatHeadersHook,
   createDeepworkCommandHook,
-  createFilterAvailableSkillsHook,
   createJsonErrorRecoveryHook,
   createLoopCommandHook,
   createOrchestratorWakeScheduler,
@@ -42,6 +51,7 @@ import {
   createTaskSessionManagerHook,
   createToolLoopGuardHook,
   ForegroundFallbackManager,
+  type ForegroundFallbackModel,
   formatChildInputWaitDelta,
   formatStoppedJobDelta,
   SessionLifecycle,
@@ -65,6 +75,8 @@ import {
   type MessageWithParts,
 } from './hooks/types';
 import { createInterviewManager } from './interview';
+import { discoverPreflightSkills } from './marketplace/preflight';
+import { MarketplaceStore } from './marketplace/store';
 import { createBuiltinMcps } from './mcp';
 import {
   ast_grep_replace,
@@ -167,6 +179,34 @@ async function appLog(
 const lastImageSkippedToastByDir = new Map<string, number>();
 const IMAGE_SKIPPED_DEBOUNCE_MS = 60_000;
 
+function loadMarketplaceSelectionSnapshot(
+  directory: string,
+  presetName: string | undefined,
+): readonly string[] {
+  if (!presetName) return Object.freeze([]);
+  const paths = findPluginConfigPaths(directory);
+  const userConfig = paths.userConfigPath
+    ? (loadPluginConfigFromPath(paths.userConfigPath, { silent: true }) ?? {})
+    : {};
+  const projectConfig = paths.projectConfigPath
+    ? loadPluginConfigFromPath(paths.projectConfigPath, { silent: true })
+    : null;
+  const factoryConfig = projectConfig
+    ? mergePluginConfigs(userConfig, projectConfig)
+    : userConfig;
+  const presets = factoryConfig.presets ?? {};
+  if (!presets[presetName]) return Object.freeze([]);
+  try {
+    return Object.freeze([
+      ...(resolvePresetDefinition(presetName, presets).marketplace?.agents ??
+        []),
+    ]);
+  } catch (error) {
+    if (error instanceof PresetResolutionError) return Object.freeze([]);
+    throw error;
+  }
+}
+
 // Module-level runtime preset tracking. Survives plugin re-inits triggered
 // by client.config.update() → Instance.dispose(). When the plugin function
 // re-runs, it checks this variable and applies the runtime preset instead
@@ -191,7 +231,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let config: ReturnType<typeof loadPluginConfig>;
   let runtime: RuntimeConfig;
   let agentDefs: ReturnType<typeof createAgents>;
-  let agents: ReturnType<typeof getAgentConfigs>;
+  let agents: ReturnType<typeof getAgentConfigsFromDefinitions>;
+  let resolvedAgentRegistry: ResolvedAgentRegistry | undefined;
+  let registryRetired = false;
   let mcps: ReturnType<typeof createBuiltinMcps>;
   // Host flavor ('v2' on OpenCode v2 hosts via the client shim, undefined on
   // v1). Survives the try block so prompt-assembly hooks can use it.
@@ -352,12 +394,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
   let chatHeadersHook: ReturnType<typeof createChatHeadersHook>;
   let foregroundFallback: ForegroundFallbackManager;
+  let foregroundFallbackChains: Record<string, ForegroundFallbackModel[]> = {};
+  let selectedMarketplacePackageIds: readonly string[] = [];
   let deepworkCommandHook: ReturnType<typeof createDeepworkCommandHook>;
   let reflectCommandHook: ReturnType<typeof createReflectCommandHook>;
   let loopCommandHook: ReturnType<typeof createLoopCommandHook>;
   let taskSessionManagerHook: ReturnType<typeof createTaskSessionManagerHook>;
   let phaseReminder: ReturnType<typeof createPhaseReminderHook>;
-  let filterAvailableSkills: ReturnType<typeof createFilterAvailableSkillsHook>;
   let applyPatch: ReturnType<typeof createApplyPatchHook>;
   let searchPathGuard: ReturnType<typeof createSearchPathGuardHook>;
   let absolutePathRescue: ReturnType<typeof createAbsolutePathRescueHook>;
@@ -461,11 +504,17 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       return resolvePrimaryModelValue((entry as Record<string, unknown>).model);
     };
 
-    const directModel = readModel(finalHostAgentConfig?.[agentType]);
+    // v2 finalizes the host snapshot directly through the registry bridge, so
+    // it does not run the v1 config() projection assignment below. Prefer the
+    // generation-local finalized projection in both runtimes; the config-hook
+    // projection remains a fallback only before registry finalization.
+    const finalAgentConfig =
+      resolvedAgentRegistry?.finalAgentConfig ?? finalHostAgentConfig;
+    const directModel = readModel(finalAgentConfig?.[agentType]);
     if (directModel) return directModel;
 
     const resolvedName = resolveRuntimeAgentName(runtime, agentType);
-    return readModel(finalHostAgentConfig?.[resolvedName]);
+    return readModel(finalAgentConfig?.[resolvedName]);
   };
 
   try {
@@ -494,6 +543,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     }
 
     runtime = RuntimeConfig.get(ctx.directory);
+    const activePresetName = runtime.getRuntimePreset() ?? config.preset;
+    selectedMarketplacePackageIds = loadMarketplaceSelectionSnapshot(
+      ctx.directory,
+      activePresetName,
+    );
     rewriteDisplayNameMentions = createDisplayNameMentionRewriter(runtime);
     // Host flavor marker ('v2' on OpenCode v2 hosts, set by the v2 client
     // shim; absent on v1). Threads the native delegation vocabulary into
@@ -504,10 +558,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       projectDirectory: ctx.directory,
       hostFlavor,
     });
-    agents = getAgentConfigs(runtime, {
-      projectDirectory: ctx.directory,
-      hostFlavor,
-    });
+    agents = getAgentConfigsFromDefinitions(runtime, agentDefs);
 
     mcps = createBuiltinMcps(runtime.disabledMcps);
     acpRunTools =
@@ -752,9 +803,24 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       backgroundJobBoard: backgroundJobCoordinator,
       revivedRunTracker,
     });
+    // The current v2 host interface has no per-turn/atomic conditional switch,
+    // so an in-flight switch can commit on the host after a newer user turn has
+    // taken over. Disable the manager's automatic intervention entirely on v2
+    // (unregistering only the retry hook is not enough: session.error,
+    // message.updated and session.status retry all reach the replay path).
+    const fallbackEnabled =
+      runtime.fallback.enabled !== false && hostFlavor !== 'v2';
+    if (runtime.fallback.enabled !== false && hostFlavor === 'v2') {
+      // Deterministic notice: no timestamps or per-call ids. Do not log when
+      // the user explicitly disabled fallback.
+      log(
+        '[foreground-fallback] automatic fallback disabled on v2 hosts (no atomic per-turn model switch)',
+      );
+    }
+    foregroundFallbackChains = runtime.runtimeChains;
     foregroundFallback = new ForegroundFallbackManager(
-      runtime.runtimeChains,
-      runtime.fallback.enabled !== false,
+      foregroundFallbackChains,
+      fallbackEnabled,
       ctx,
       runtime.fallback.maxRetries,
       sessionLifecycle,
@@ -792,6 +858,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       maxRetainedSnapshots: runtime.backgroundJobs.maxRetainedSnapshots,
       readContextMinLines: runtime.backgroundJobs.readContextMinLines,
       readContextMaxFiles: runtime.backgroundJobs.readContextMaxFiles,
+      boardInjection: runtime.backgroundJobs.boardInjection,
       backgroundJobBoard: backgroundJobCoordinator,
       identityIndex,
       backgroundJobSupervisor,
@@ -1052,8 +1119,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       shouldInject: shouldInjectOrchestratorReminder,
     });
 
-    filterAvailableSkills = createFilterAvailableSkillsHook(ctx, runtime);
-
     applyPatch = createApplyPatchHook(ctx);
 
     searchPathGuard = createSearchPathGuardHook(ctx);
@@ -1267,7 +1332,75 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     return undefined;
   }
 
+  const registryBridge: RegistryFactoryBridge = {
+    finalize(hostSnapshot, nativePermissionsByAgent) {
+      if (registryRetired) throw new Error('Agent registry is retired');
+      if (!resolvedAgentRegistry) {
+        RuntimeConfig.get(ctx.directory).captureHostConfig(hostSnapshot);
+        resolvedAgentRegistry = buildResolvedAgentRegistry(runtime, {
+          hostSnapshot,
+          definitions: agentDefs,
+          projectDirectory: ctx.directory,
+          hostFlavor,
+          pluginMcps: mcps,
+          nativePermissionsByAgent,
+          marketplace: {
+            selectedPackageIds: selectedMarketplacePackageIds,
+            store: new MarketplaceStore({
+              pluginVersion: getBuildInfo().version,
+            }),
+            pluginVersion: getBuildInfo().version,
+            availableSkillNames: selectedMarketplacePackageIds.length
+              ? discoverPreflightSkills(runtime, ctx.directory)
+              : [],
+          },
+          onHostModelSelected: (agentName) => {
+            runtime.everModelSwitched(agentName);
+          },
+        });
+        for (const [name, candidates] of Object.entries(
+          resolvedAgentRegistry.modelCandidates,
+        )) {
+          if (candidates.length > 1) {
+            foregroundFallbackChains[name] = candidates.map(
+              ({ id, variant }) => ({
+                id,
+                ...(variant ? { variant } : {}),
+              }),
+            );
+          }
+        }
+        for (const [agentName, models] of Object.entries(runtime.modelArrays)) {
+          if (
+            models.length > 0 &&
+            runtime.combinedModelInheritanceSource(agentName) === undefined &&
+            runtime.hasModelSwitched(agentName)
+          ) {
+            foregroundFallback.disableChain(agentName);
+          }
+        }
+      }
+      return resolvedAgentRegistry;
+    },
+    requireRegistry() {
+      if (registryRetired) throw new Error('Agent registry is retired');
+      if (!resolvedAgentRegistry)
+        throw new Error('Agent registry has not been finalized');
+      return resolvedAgentRegistry;
+    },
+    prepareCommands(opencodeConfig) {
+      interviewManager.registerCommand(opencodeConfig);
+      deepworkCommandHook.registerCommand(opencodeConfig);
+      reflectCommandHook.registerCommand(opencodeConfig);
+      loopCommandHook.registerCommand(opencodeConfig);
+    },
+    retire() {
+      registryRetired = true;
+    },
+  };
+
   return {
+    registryBridge,
     name: 'oh-my-opencode-slim',
     'v2.session.retry':
       foregroundFallback.handleV2Retry.bind(foregroundFallback),
@@ -1279,11 +1412,14 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     mcp: mcps,
 
     config: async (opencodeConfig: Record<string, unknown>) => {
-      // Capture the host opencode config BEFORE any mutation so runtime
-      // consumers can distinguish host-provided values from plugin-applied
-      // ones (host override > runtime override > plugin file).
-      RuntimeConfig.get(ctx.directory).captureHostConfig(opencodeConfig);
-
+      const preMutationHostSnapshot = resolvedAgentRegistry
+        ? undefined
+        : (structuredClone(opencodeConfig) as RegistryHostSnapshot);
+      if (preMutationHostSnapshot) {
+        RuntimeConfig.get(ctx.directory).captureHostConfig(
+          preMutationHostSnapshot,
+        );
+      }
       // Force default_agent to the orchestrator's visible entry when unset,
       // and also when the user pointed it at an omos subagent name (opencode
       // rejects subagent names as default_agent with "default agent must be a
@@ -1310,313 +1446,49 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         }
       }
 
-      // Merge Agent configs - per-agent shallow merge to preserve
-      // user-supplied fields (e.g. tools, permission) from opencode.json
-      if (!opencodeConfig.agent) {
-        opencodeConfig.agent = { ...agents };
-      } else {
-        for (const [name, pluginAgent] of Object.entries(agents)) {
-          const existing = (opencodeConfig.agent as Record<string, unknown>)[
-            name
-          ] as Record<string, unknown> | undefined;
-          // User explicitly picked a model via /model → disable fallback.
-          // Only marks the agent if the model differs from the chain primary.
-          // Once marked, stays disabled even if user switches back to chain[0].
-          // Combined inherit+chain agents are exempt: a /model pick is their
-          // follow target, and the configured chain stays armed as the
-          // failure fallback for whatever model they land on.
-          if (
-            existing &&
-            typeof existing.model === 'string' &&
-            runtime.combinedModelInheritanceSource(name) === undefined
-          ) {
-            const primary = runtime.modelArrays[name]?.[0]?.id;
-            if (primary && existing.model !== primary) {
-              runtime.everModelSwitched(name);
-            }
-            if (runtime.hasModelSwitched(name)) {
-              foregroundFallback.disableChain(name);
-            }
-          }
-          if (existing) {
-            // Shallow merge: plugin defaults first, user overrides win
-            (opencodeConfig.agent as Record<string, unknown>)[name] = {
-              ...pluginAgent,
-              ...existing,
-            };
-          } else {
-            (opencodeConfig.agent as Record<string, unknown>)[name] = {
-              ...pluginAgent,
-            };
-          }
+      // Finalize one generation-local registry from this real, pre-mutation
+      // host snapshot. All later projections are clones of that frozen result.
+      if (!resolvedAgentRegistry) {
+        if (!preMutationHostSnapshot) {
+          throw new Error(
+            'Missing pre-mutation host snapshot for registry finalization',
+          );
         }
+        registryBridge.finalize(preMutationHostSnapshot, {});
       }
-      const configAgent = opencodeConfig.agent as Record<string, unknown>;
+      const registry = registryBridge.requireRegistry();
 
-      // Model resolution for foreground agents: use _modelArray entries
-      // to pick the first model for startup-time selection.
-      //
-      // Runtime failover on API errors (e.g. rate limits
-      // mid-conversation) is handled separately by
-      // ForegroundFallbackManager via the event hook.
-      //
-      // Model inheritance (applyModelInheritanceToConfig below) runs AFTER
-      // this pass and the runtime preset pass: for combined
-      // inherit+chain agents it clears/overrides the chain head pinned
-      // here, so the SDK layer keeps following the live session or
-      // orchestrator model.
-      if (Object.keys(runtime.modelArrays).length > 0) {
-        for (const [agentName, models] of Object.entries(runtime.modelArrays)) {
-          if (models.length === 0) continue;
-
-          // Use the first model in the model array. Not all providers
-          // require entries in opencodeConfig.provider - some are loaded
-          // automatically by opencode (e.g. github-copilot, openrouter).
-          // We cannot distinguish these from truly unconfigured providers
-          // at config-hook time, so we cannot gate on the provider config
-          // keys. Runtime failover is handled separately by
-          // ForegroundFallbackManager.
-          const chosen = models[0];
-          const entry = configAgent[agentName] as
-            | Record<string, unknown>
-            | undefined;
-          if (entry) {
-            // Only apply model array resolution if no user-selected model
-            // exists. A user-selected model (via /model command) takes
-            // precedence over the config's fallback chain to preserve
-            // runtime selections and avoid breaking provider cache.
-            if (entry.model === undefined) {
-              entry.model = chosen.id;
-              if (chosen.variant) {
-                entry.variant = chosen.variant;
-              }
-            }
-          } else {
-            // Agent exists in slim but not in opencodeConfig.agent -
-            // create entry
-            (configAgent as Record<string, unknown>)[agentName] = {
-              model: chosen.id,
-              ...(chosen.variant ? { variant: chosen.variant } : {}),
-            };
-          }
-          log('[plugin] resolved model from array', {
-            agent: agentName,
-            model: chosen.id,
-            variant: chosen.variant,
-          });
-        }
-      }
-
-      // Runtime preset override: instance disposal recreates the plugin
-      // factory and its factory-local state, while module-level runtime
-      // preset data may persist. Apply that persisted selection after normal
-      // model resolution for the current generation.
-      const runtimePresetName = runtime.getRuntimePreset();
-      if (runtimePresetName && config.presets?.[runtimePresetName]) {
-        const runtimePreset = config.presets[runtimePresetName];
-        for (const [agentName, override] of Object.entries(runtimePreset)) {
-          // Resolve legacy alias keys (e.g. "explore" → "explorer")
-          // so presets using aliases work in this path.
-          const resolvedName = AGENT_ALIASES[agentName] ?? agentName;
-          const entry = configAgent[resolvedName] as
-            | Record<string, unknown>
-            | undefined;
-          if (!entry) continue;
-
-          if (typeof override.model === 'string') {
-            entry.model = override.model;
-          } else if (
-            Array.isArray(override.model) &&
-            override.model.length > 0
-          ) {
-            const first = override.model[0];
-            entry.model = typeof first === 'string' ? first : first.id;
-            // Extract inline variant from array-form model entry
-            if (typeof first !== 'string' && first.variant) {
-              entry.variant = first.variant;
-            }
-          }
-          // Explicitly set or clear scalar fields so switching from
-          // Preset A (which sets a field) to Preset B (which doesn't)
-          // doesn't leave stale values behind.
-          if (typeof override.variant === 'string') {
-            entry.variant = override.variant;
-          } else if ('variant' in override) {
-            delete entry.variant;
-          }
-          if (typeof override.temperature === 'number') {
-            entry.temperature = override.temperature;
-          } else if ('temperature' in override) {
-            delete entry.temperature;
-          }
-          if (
-            override.options &&
-            typeof override.options === 'object' &&
-            !Array.isArray(override.options)
-          ) {
-            entry.options = override.options;
-          } else if ('options' in override) {
-            delete entry.options;
-          }
-          log('[plugin] runtime preset override', {
-            preset: runtimePresetName,
-            agent: agentName,
-            model: entry.model as string,
-          });
-        }
-      }
-
-      // Model inheritance applies after the array-primary and runtime
-      // preset passes: it is the authoritative policy for agents with
-      // `inheritModelFrom`, clearing or replacing whatever model those
-      // passes pinned (`session` clears it so the SDK follows the live
-      // session model; `orchestrator` pins the resolved orchestrator
-      // model). Scalar-model agents keep their explicit model and are
-      // skipped inside.
-      applyModelInheritanceToConfig(configAgent, runtime);
-
-      // Capture the resolved model state before optionally removing the
-      // orchestrator model from the SDK config, so the TUI keeps showing the
-      // configured model rather than a fallback or "default".
-      const tuiAgentModels: Record<string, string> = {};
-      const tuiAgentVariants: Record<string, string> = {};
-      for (const agentDef of agentDefs) {
-        if (
-          agentDef.name === 'council' ||
-          agentDef.name === 'councillor' ||
-          agentDef.name.startsWith('councillor-')
-        )
-          continue;
-
-        const entry = configAgent[agentDef.name] as
-          | Record<string, unknown>
-          | undefined;
-        // Session-following combined agents have no launch model of their
-        // own: entry.model is cleared, the chain head is only a fallback
-        // tail, and agentDef.config.model is deleted by inheritance. Skip
-        // the chain-head probe so they display 'default' like pure
-        // inherit agents instead of a model they do not run.
-        const followsSessionModel =
-          runtime.combinedModelInheritanceSource(agentDef.name) === 'session';
-        const resolvedModel =
-          typeof entry?.model === 'string'
-            ? entry.model
-            : followsSessionModel
-              ? undefined
-              : runtime.runtimeChains[agentDef.name]?.[0]
-                ? runtime.runtimeChains[agentDef.name][0]
-                : typeof agentDef.config.model === 'string'
-                  ? agentDef.config.model
-                  : undefined;
-        const resolvedVariant =
-          typeof entry?.variant === 'string'
-            ? entry.variant
-            : typeof agentDef.config.variant === 'string'
-              ? agentDef.config.variant
-              : undefined;
-
-        tuiAgentModels[agentDef.name] = resolvedModel ?? 'default';
-        if (resolvedVariant) {
-          tuiAgentVariants[agentDef.name] = resolvedVariant;
-        }
-      }
+      // Refresh consumers that retain the startup SDK record, while keeping
+      // the registry's authoritative snapshot immutable.
+      const projectedAgents = registry.getSdkAgentProjection();
+      for (const key of Object.keys(agents)) delete agents[key];
+      Object.assign(agents, projectedAgents);
+      const currentAgentConfig =
+        opencodeConfig.agent && typeof opencodeConfig.agent === 'object'
+          ? (opencodeConfig.agent as Record<string, unknown>)
+          : {};
+      opencodeConfig.agent = {
+        ...currentAgentConfig,
+        ...structuredClone(registry.managedAgentConfig),
+      };
+      finalHostAgentConfig = opencodeConfig.agent as Record<string, unknown>;
+      const currentMcpConfig =
+        opencodeConfig.mcp && typeof opencodeConfig.mcp === 'object'
+          ? (opencodeConfig.mcp as Record<string, unknown>)
+          : {};
+      opencodeConfig.mcp = {
+        ...currentMcpConfig,
+        ...structuredClone(registry.managedMcpConfig),
+      };
       recordTuiAgentModels(
         {
-          agentModels: tuiAgentModels,
-          agentVariants: tuiAgentVariants,
+          agentModels: registry.tuiAgentModels,
+          agentVariants: registry.tuiAgentVariants,
         },
         ctx.directory,
       );
 
-      applyOrchestratorModelConfig({
-        agents: configAgent,
-        enabled: runtime.stripOrchestratorModel,
-        presets: runtime.plugin?.presets,
-        configPreset: runtime.preset,
-        runtimePreset: runtimePresetName,
-      });
-
-      // Host `agent.council.prompt` wins the shallow merge above and can
-      // drop the compaction exception applied in createAgents. Re-apply to
-      // the canonical key and the visible display-name alias.
-      const councilPlugin = agents.council as
-        | { displayName?: string }
-        | undefined;
-      const councilKeys = new Set<string>(['council']);
-      if (typeof councilPlugin?.displayName === 'string') {
-        councilKeys.add(normalizeAgentName(councilPlugin.displayName));
-      }
-      for (const key of councilKeys) {
-        const entry = configAgent[key] as Record<string, unknown> | undefined;
-        if (typeof entry?.prompt === 'string') {
-          entry.prompt = ensureCouncilCompactionException(entry.prompt);
-        }
-      }
-
-      // This is the source of truth for admission. It is intentionally
-      // captured only after every host/plugin merge and the final
-      // array-primary, preset, model-inheritance, and orchestrator-model
-      // passes.
-      finalHostAgentConfig = configAgent;
-
-      // Merge MCP configs
-      const configMcp = opencodeConfig.mcp as
-        | Record<string, unknown>
-        | undefined;
-      if (!configMcp) {
-        opencodeConfig.mcp = { ...mcps };
-      } else {
-        Object.assign(configMcp, mcps);
-      }
-
-      // Get all MCP names from the merged config (built-in + custom)
-      const mergedMcpConfig = opencodeConfig.mcp as
-        | Record<string, unknown>
-        | undefined;
-      const allMcpNames = Object.keys(mergedMcpConfig ?? mcps);
-
-      // For each agent, create permission rules based on their mcps list
-      for (const [agentName, agentConfig] of Object.entries(agents)) {
-        const agentMcps = (agentConfig as { mcps?: string[] })?.mcps;
-        if (!agentMcps) continue;
-
-        // Get or create agent permission config
-        if (!configAgent[agentName]) {
-          configAgent[agentName] = { ...agentConfig };
-        }
-        const agentConfigEntry = configAgent[agentName] as Record<
-          string,
-          unknown
-        >;
-        const agentPermission = (agentConfigEntry.permission ?? {}) as Record<
-          string,
-          unknown
-        >;
-
-        // Parse mcps list with wildcard and exclusion support
-        const allowedMcps = parseList(agentMcps, allMcpNames);
-
-        // Create permission rules for each MCP
-        // MCP tools are named as <server>_<tool>, so we use <server>_*
-        for (const mcpName of allMcpNames) {
-          const sanitizedMcpName = mcpName.replace(/[^a-zA-Z0-9_-]/g, '_');
-          const permissionKey = `${sanitizedMcpName}_*`;
-          const action = allowedMcps.includes(mcpName) ? 'allow' : 'deny';
-
-          // Only set if not already defined by user
-          if (!(permissionKey in agentPermission)) {
-            agentPermission[permissionKey] = action;
-          }
-        }
-
-        // Update agent config with permissions
-        agentConfigEntry.permission = agentPermission;
-      }
-
-      interviewManager.registerCommand(opencodeConfig);
-      deepworkCommandHook.registerCommand(opencodeConfig);
-      reflectCommandHook.registerCommand(opencodeConfig);
-      loopCommandHook.registerCommand(opencodeConfig);
+      registryBridge.prepareCommands(opencodeConfig);
     },
 
     event: async (input) => {
@@ -1897,6 +1769,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     dispose: async () => {
       resumeEvidence?.dispose();
+      registryBridge.retire();
       terminalGate?.dispose();
       // Cancel pending initial-delay fallback timers so a reloaded
       // generation cannot observe one stale fallback call.
@@ -2167,16 +2040,27 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         const orchestratorDef = agentDefs.find(
           (a) => a.name === 'orchestrator',
         );
+        const finalizedOrchestratorName =
+          resolvedAgentRegistry?.identities.orchestrator ?? 'orchestrator';
+        const finalizedOrchestrator =
+          (resolvedAgentRegistry?.finalAgentConfig[finalizedOrchestratorName] as
+            | Record<string, unknown>
+            | undefined) ??
+          (resolvedAgentRegistry?.finalAgentConfig.orchestrator as
+            | Record<string, unknown>
+            | undefined);
         const orchestratorPrompt =
-          typeof orchestratorDef?.config?.prompt === 'string'
-            ? orchestratorDef.config.prompt
-            : buildOrchestratorPrompt(
-                runtime.disabledAgents,
-                undefined,
-                true,
-                true,
-                hostFlavor,
-              );
+          typeof finalizedOrchestrator?.prompt === 'string'
+            ? finalizedOrchestrator.prompt
+            : typeof orchestratorDef?.config?.prompt === 'string'
+              ? orchestratorDef.config.prompt
+              : buildOrchestratorPrompt(
+                  runtime.disabledAgents,
+                  undefined,
+                  true,
+                  true,
+                  hostFlavor,
+                );
         // Dedup by the EFFECTIVE prompt, not by default-prompt markers:
         // a custom replacement without `<Role>` previously slipped past
         // the marker check and was appended twice (P + host + P).
@@ -2277,10 +2161,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         typedOutput as never,
       );
       await phaseReminder['experimental.chat.messages.transform'](
-        input as never,
-        typedOutput as never,
-      );
-      await filterAvailableSkills['experimental.chat.messages.transform'](
         input as never,
         typedOutput as never,
       );

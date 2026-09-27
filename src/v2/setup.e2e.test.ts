@@ -22,8 +22,9 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { readdirSync as readDirSync, readFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import * as path from 'node:path';
+import { MarketplaceStore } from '../marketplace/store';
 import { flushLoggerForTesting } from '../utils/logger';
 import { createV2Setup } from './setup';
 import type { V2Context } from './types';
@@ -50,6 +51,13 @@ interface MockCalls {
     | undefined;
   contextHookCb:
     | ((event: Record<string, unknown>) => Promise<void>)
+    | undefined;
+  promptHookCb:
+    | ((event: {
+        sessionID: string;
+        messageID: string;
+        prompt: { text: string };
+      }) => Promise<void>)
     | undefined;
   disposed: string[];
 }
@@ -125,6 +133,7 @@ function makeMockV2Context(projectDir: string): {
     toolBeforeCb: undefined,
     toolAfterCb: undefined,
     contextHookCb: undefined,
+    promptHookCb: undefined,
     disposed: [],
   };
   const events = createEventQueue();
@@ -204,10 +213,15 @@ function makeMockV2Context(projectDir: string): {
     // Runtime session methods deliberately ABSENT: the shim must degrade
     // honestly without them (no fake success shapes).
     session: {
-      hook: async (name: 'context', cb: (event: never) => Promise<void>) => {
+      hook: async (
+        name: 'context' | 'prompt',
+        cb: (event: never) => Promise<void>,
+      ) => {
         calls.hooks.push(`session:${name}`);
         if (name === 'context') {
           calls.contextHookCb = cb as unknown as MockCalls['contextHookCb'];
+        } else if (name === 'prompt') {
+          calls.promptHookCb = cb as unknown as MockCalls['promptHookCb'];
         }
         return reg(`session.hook:${name}`);
       },
@@ -286,8 +300,9 @@ describe('createV2Setup e2e', () => {
     projectDir = path.join(fixtureRoot, 'project');
     configDir = path.join(fixtureRoot, 'config');
     logDir = path.join(fixtureRoot, 'logs');
+    await mkdir(path.join(projectDir, '.opencode'), { recursive: true });
     await Bun.write(
-      path.join(configDir, 'oh-my-opencode-slim.json'),
+      path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
       // Minimal fixture: empty plugin config with the companion disabled so
       // factory init stays hermetic (no user config, no side processes).
       JSON.stringify({ companion: { enabled: false } }),
@@ -333,6 +348,11 @@ describe('createV2Setup e2e', () => {
     expect(calls.hooks).toContain('tool:execute.before');
     expect(calls.hooks).toContain('tool:execute.after');
     expect(calls.contextHookCb).toBeFunction();
+    expect(calls.promptHookCb).toBeFunction();
+    await calls.promptHookCb?.({
+      sessionID: 'ses_baseline_unknown',
+      messageID: 'msg_baseline',
+    });
 
     await cleanup();
     expect(calls.disposed.length).toBeGreaterThan(0);
@@ -341,6 +361,1022 @@ describe('createV2Setup e2e', () => {
   test('reduced ctx (no agent.transform) skips gracefully', async () => {
     const cleanup = await createV2Setup()({} as never);
     await cleanup(); // passes when neither call throws
+  }, 20_000);
+
+  test('retired generations reject late agent transform callbacks', async () => {
+    const { ctx } = makeMockV2Context(projectDir);
+    let deferred: ((draft: unknown) => void) | undefined;
+    const agent = ctx.agent as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+    };
+    agent.transform = async (callback) => {
+      deferred = callback;
+      return { dispose: () => {} };
+    };
+    const cleanup = await createV2Setup()(ctx);
+    await cleanup();
+    expect(() => deferred?.({ list: () => [] })).toThrow('retired');
+  }, 20_000);
+
+  test('agent transform replay reuses the first finalized model and native policy', async () => {
+    const { ctx } = makeMockV2Context(projectDir);
+    const projectedModels: Array<Record<string, unknown> | undefined> = [];
+    const projectedRequests: Array<Record<string, unknown> | undefined> = [];
+    const projectedPermissions: Array<Record<string, unknown>[] | undefined> =
+      [];
+    const nativePermissions: Array<Record<string, unknown>[]> = [];
+    const updatedAgents: string[] = [];
+    const agent = ctx.agent as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+    };
+    agent.transform = async (callback) => {
+      for (const providerID of ['host-first', 'host-replay']) {
+        const permissions = [
+          {
+            action: 'read',
+            resource: '*',
+            effect: providerID === 'host-first' ? 'allow' : 'deny',
+          },
+        ];
+        nativePermissions.push(permissions);
+        const native = {
+          id: 'orchestrator',
+          mode: 'primary',
+          model: { providerID, id: 'model' },
+          request: {
+            settings: { temperature: 0.25, topP: 0.8 },
+            headers: { 'x-native': 'preserve' },
+            body: { hostSetting: true },
+          },
+          permissions,
+          untouchedByPlugin: 'foreign',
+        };
+        const foreign = {
+          id: 'foreign-agent',
+          mode: 'primary',
+          permissions: [],
+        };
+        callback({
+          list: () => [{ id: 'orchestrator' }, foreign],
+          get: (id: string) => (id === 'orchestrator' ? native : foreign),
+          default: () => {},
+          update: (
+            id: string,
+            project: (draft: Record<string, unknown>) => void,
+          ) => {
+            const draft: Record<string, unknown> = { ...native };
+            project(draft);
+            updatedAgents.push(id);
+            if (id === 'orchestrator') {
+              projectedModels.push(
+                draft.model as Record<string, unknown> | undefined,
+              );
+              projectedRequests.push(
+                draft.request as Record<string, unknown> | undefined,
+              );
+              projectedPermissions.push(
+                draft.permissions as Record<string, unknown>[] | undefined,
+              );
+            }
+          },
+          remove: () => {},
+        });
+      }
+      return { dispose: () => {} };
+    };
+
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      expect(projectedModels.length).toBeGreaterThan(1);
+      expect(
+        projectedModels.every((model) => model?.providerID === 'host-first'),
+      ).toBe(true);
+      expect(nativePermissions[1]?.[0]?.effect).toBe('deny');
+      expect(
+        projectedPermissions.every(
+          (permissions) => permissions?.at(-1)?.effect === 'allow',
+        ),
+      ).toBe(true);
+      expect(projectedRequests).toHaveLength(projectedModels.length);
+      for (const request of projectedRequests) {
+        expect(request).toMatchObject({
+          settings: { temperature: 0.25, topP: 0.8 },
+          headers: { 'x-native': 'preserve' },
+          body: { hostSetting: true },
+        });
+      }
+      expect(updatedAgents).not.toContain('foreign-agent');
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
+  test('late malformed agent transform fails readiness without escaping callback', async () => {
+    const { ctx, calls } = makeMockV2Context(projectDir);
+    let deferred: ((draft: unknown) => void) | undefined;
+    const agent = ctx.agent as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+      list: () => Promise<unknown[]>;
+    };
+    agent.transform = async (callback) => {
+      deferred = callback;
+      return {
+        dispose: () => calls.disposed.push('malformed-agent-transform'),
+      };
+    };
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      const prompt = calls.promptHookCb?.({
+        sessionID: 'ses_malformed_agent',
+        messageID: 'msg_malformed_agent',
+        prompt: { text: 'prompt waits for agent readiness' },
+      });
+      expect(deferred).toBeFunction();
+      expect(() =>
+        deferred?.({
+          list: () => [{ id: 'explorer' }],
+          get: () => ({ id: 'explorer', mode: 'subagent' }),
+        }),
+      ).not.toThrow();
+      const promptError = await prompt?.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(promptError).toMatchObject({
+        message: 'Agent permission snapshot finalization failed',
+        cause: expect.objectContaining({
+          message: "Native agent 'explorer' did not expose a permissions array",
+        }),
+      });
+    } finally {
+      await cleanup();
+    }
+    expect(calls.disposed).toContain('malformed-agent-transform');
+  }, 20_000);
+
+  test('v2 draft registration applies display-name model and ordered policy overrides', async () => {
+    await mkdir(path.join(projectDir, '.opencode'), { recursive: true });
+    await Bun.write(
+      path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        companion: { enabled: false },
+        agents: {
+          explorer: { displayName: 'Scout', mcps: ['context7'] },
+        },
+      }),
+    );
+    const { ctx } = makeMockV2Context(projectDir);
+    const registered = new Map<string, Record<string, unknown>>();
+    const visibleRules = [
+      { action: 'skill', resource: '*', effect: 'allow' },
+      { action: 'skill', resource: 'review-tools', effect: 'deny' },
+      { action: 'context7_*', resource: '*', effect: 'deny' },
+    ];
+    const canonicalRules = [
+      { action: 'context7_*', resource: '*', effect: 'allow' },
+    ];
+    const nativeAgents: Record<string, Record<string, unknown>> = {
+      explorer: {
+        id: 'explorer',
+        mode: 'subagent',
+        model: { providerID: 'canonical', id: 'canonical-model' },
+        permissions: canonicalRules,
+      },
+      Scout: {
+        id: 'Scout',
+        mode: 'subagent',
+        model: { providerID: 'visible', id: 'visible-model' },
+        permissions: visibleRules,
+      },
+    };
+    const agent = ctx.agent as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+    };
+    agent.transform = async (callback) => {
+      callback({
+        list: () => Object.keys(nativeAgents).map((id) => ({ id })),
+        get: (id: string) => nativeAgents[id],
+        default: () => {},
+        update: (
+          id: string,
+          project: (draft: Record<string, unknown>) => void,
+        ) => {
+          const draft = { ...nativeAgents[id] };
+          project(draft);
+          registered.set(id, draft);
+        },
+        remove: () => {},
+      });
+      return { dispose: () => {} };
+    };
+
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      const visible = registered.get('Scout');
+      const canonical = registered.get('explorer');
+      expect(visible?.model).toEqual({
+        providerID: 'visible',
+        id: 'visible-model',
+      });
+      expect(visible?.permissions).toEqual(
+        expect.arrayContaining(visibleRules),
+      );
+      expect(canonical?.model).toEqual({
+        providerID: 'canonical',
+        id: 'canonical-model',
+      });
+      expect(canonical?.permissions).not.toEqual(
+        expect.arrayContaining(visibleRules),
+      );
+      const visibleMcpRules = (
+        (visible?.permissions ?? []) as Array<Record<string, unknown>>
+      ).filter((rule) => rule.action === 'context7_*');
+      const canonicalMcpRules = (
+        (canonical?.permissions ?? []) as Array<Record<string, unknown>>
+      ).filter((rule) => rule.action === 'context7_*');
+      expect(visibleMcpRules.at(-1)?.effect).toBe('deny');
+      expect(canonicalMcpRules.at(-1)?.effect).toBe('allow');
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
+  test('v2 clears inherited session models and variants from visible agent drafts', async () => {
+    await mkdir(path.join(projectDir, '.opencode'), { recursive: true });
+    await Bun.write(
+      path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        companion: { enabled: false },
+        agents: {
+          explorer: { displayName: 'Scout', inheritModelFrom: 'session' },
+        },
+      }),
+    );
+    const { ctx } = makeMockV2Context(projectDir);
+    const registered = new Map<string, Record<string, unknown>>();
+    const nativeAgents: Record<string, Record<string, unknown>> = {
+      explorer: {
+        id: 'explorer',
+        mode: 'subagent',
+        model: {
+          providerID: 'host',
+          id: 'canonical',
+          variant: 'canonical-v',
+        },
+        permissions: [],
+      },
+      Scout: {
+        id: 'Scout',
+        mode: 'subagent',
+        model: { providerID: 'host', id: 'visible', variant: 'visible-v' },
+        permissions: [],
+      },
+    };
+    const agent = ctx.agent as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+    };
+    agent.transform = async (callback) => {
+      callback({
+        list: () => Object.keys(nativeAgents).map((id) => ({ id })),
+        get: (id: string) => nativeAgents[id],
+        default: () => {},
+        update: (
+          id: string,
+          project: (draft: Record<string, unknown>) => void,
+        ) => {
+          const draft = { ...nativeAgents[id] };
+          project(draft);
+          registered.set(id, draft);
+        },
+        remove: () => {},
+      });
+      return { dispose: () => {} };
+    };
+
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      for (const name of ['explorer', 'Scout']) {
+        expect(registered.get(name)).not.toHaveProperty('model');
+        expect(registered.get(name)).not.toHaveProperty('variant');
+      }
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
+  test('v2 defaults to the visible orchestrator and keeps canonical hidden', async () => {
+    await mkdir(path.join(projectDir, '.opencode'), { recursive: true });
+    await Bun.write(
+      path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        companion: { enabled: false },
+        agents: { orchestrator: { displayName: 'Lead' } },
+      }),
+    );
+    const { ctx } = makeMockV2Context(projectDir);
+    const registered = new Map<string, Record<string, unknown>>();
+    let defaultAgent: string | undefined;
+    const nativeAgents: Record<string, Record<string, unknown>> = {
+      orchestrator: {
+        id: 'orchestrator',
+        mode: 'primary',
+        permissions: [],
+      },
+      Lead: {
+        id: 'Lead',
+        mode: 'primary',
+        permissions: [],
+      },
+    };
+    const agent = ctx.agent as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+    };
+    agent.transform = async (callback) => {
+      callback({
+        list: () => Object.keys(nativeAgents).map((id) => ({ id })),
+        get: (id: string) => nativeAgents[id],
+        default: (id: string) => {
+          defaultAgent = id;
+        },
+        update: (
+          id: string,
+          project: (draft: Record<string, unknown>) => void,
+        ) => {
+          const draft = { ...nativeAgents[id] };
+          project(draft);
+          registered.set(id, draft);
+        },
+        remove: () => {},
+      });
+      return { dispose: () => {} };
+    };
+
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      expect(defaultAgent).toBe('Lead');
+      expect(registered.get('orchestrator')?.hidden).toBe(true);
+      expect(registered.get('Lead')?.hidden).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
+  test('host-only MCP namespaces are denied in both agent and child policies', async () => {
+    const { ctx, events, calls } = makeMockV2Context(projectDir);
+    const setupCtx = ctx as unknown as {
+      mcp: {
+        transform: (callback: (draft: unknown) => void) => Promise<{
+          dispose: () => void;
+        }>;
+      };
+      agent: {
+        transform: (callback: (draft: unknown) => void) => Promise<{
+          dispose: () => void;
+        }>;
+      };
+      session: {
+        update: (input: {
+          sessionID: string;
+          permissions: Array<Record<string, unknown>>;
+        }) => Promise<void>;
+      };
+    };
+    let registeredRules: Array<Record<string, unknown>> = [];
+    const childUpdates: Array<{
+      sessionID: string;
+      permissions: Array<Record<string, unknown>>;
+    }> = [];
+    setupCtx.mcp.transform = async (callback) => {
+      callback({
+        list: () => [['host-only', { type: 'local' }]],
+        get: (name: string) =>
+          name === 'host-only' ? { type: 'local' } : undefined,
+        set: (name: string, config: Record<string, unknown>) => {
+          calls.mcpSets.push({ name, config });
+        },
+        update: () => {},
+        remove: () => {},
+      });
+      return { dispose: () => {} };
+    };
+    setupCtx.agent.transform = async (callback) => {
+      callback({
+        list: () => [],
+        get: () => undefined,
+        default: () => {},
+        update: (
+          name: string,
+          project: (agent: Record<string, unknown>) => void,
+        ) => {
+          const agent: Record<string, unknown> = {};
+          project(agent);
+          if (name === 'explorer') {
+            registeredRules = agent.permissions as Array<
+              Record<string, unknown>
+            >;
+          }
+        },
+        remove: () => {},
+      });
+      return { dispose: () => {} };
+    };
+    setupCtx.session.update = async (input) => {
+      childUpdates.push(input);
+    };
+
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      events.push({
+        type: 'session.created',
+        data: {
+          sessionID: 'ses_host_mcp_child',
+          parentID: 'ses_parent',
+          agent: 'explorer',
+        },
+      });
+      const deadline = Date.now() + 2_000;
+      while (childUpdates.length === 0 && Date.now() < deadline) {
+        await Bun.sleep(10);
+      }
+
+      expect(registeredRules).toContainEqual(
+        expect.objectContaining({ action: 'host-only_*', effect: 'deny' }),
+      );
+      expect(childUpdates).toHaveLength(1);
+      expect(childUpdates[0]?.permissions).toEqual(registeredRules);
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
+  test('marketplace agent projection and child session receive the same narrowed native policy', async () => {
+    const store = new MarketplaceStore({
+      pluginVersion: '2.2.25',
+    });
+    store.install({
+      manifest: {
+        schemaVersion: 2,
+        id: 'team/v2-marketplace',
+        version: '1.0.0',
+        displayName: 'V2 marketplace agent',
+        description: 'Marketplace child policy fixture',
+        agentName: 'v2-marketplace-agent',
+        prompt: 'Use only the package-authorized capabilities.',
+        skills: [],
+        mcps: ['package-mcp'],
+        tools: ['read'],
+        author: { name: 'Test' },
+        tags: [],
+        license: 'MIT',
+        compatibility: { plugin: '>=2.0.0' },
+        model: {
+          source: 'explicit',
+          candidates: ['provider/package', 'provider/fallback'],
+        },
+        routing: {
+          description: 'Marketplace test lane',
+          when: 'Testing marketplace routing.',
+          keywords: ['marketplace'],
+        },
+      } as never,
+    });
+    await Bun.write(
+      path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        companion: { enabled: false },
+        preset: 'marketplace-test',
+        presets: {
+          'marketplace-test': {
+            marketplace: { agents: ['team/v2-marketplace'] },
+          },
+        },
+      }),
+    );
+
+    const { ctx, calls, events } = makeMockV2Context(projectDir);
+    const setupCtx = ctx as unknown as {
+      mcp: {
+        transform: (callback: (draft: unknown) => void) => Promise<{
+          dispose: () => void;
+        }>;
+      };
+      agent: {
+        transform: (callback: (draft: unknown) => void) => Promise<{
+          dispose: () => void;
+        }>;
+      };
+      session: {
+        update: (input: {
+          sessionID: string;
+          permissions: Array<Record<string, unknown>>;
+        }) => Promise<void>;
+      };
+    };
+    const childUpdates: Array<{
+      sessionID: string;
+      permissions: Array<Record<string, unknown>>;
+    }> = [];
+    let packageAgent: Record<string, unknown> | undefined;
+    setupCtx.mcp.transform = async (callback) => {
+      callback({
+        list: () => [
+          ['package-mcp', { type: 'local' }],
+          ['host-only-mcp', { type: 'local' }],
+        ],
+        get: (name: string) =>
+          name === 'package-mcp' || name === 'host-only-mcp'
+            ? { type: 'local' }
+            : undefined,
+        set: (name: string, config: Record<string, unknown>) => {
+          calls.mcpSets.push({ name, config });
+        },
+        update: () => {},
+        remove: () => {},
+      });
+      return { dispose: () => {} };
+    };
+    setupCtx.agent.transform = async (callback) => {
+      callback({
+        list: () => [],
+        get: () => undefined,
+        default: () => {},
+        update: (
+          name: string,
+          project: (agent: Record<string, unknown>) => void,
+        ) => {
+          const agent: Record<string, unknown> = {};
+          project(agent);
+          if (name === 'v2-marketplace-agent') packageAgent = agent;
+        },
+        remove: () => {},
+      });
+      return { dispose: () => {} };
+    };
+    setupCtx.session.update = async (input) => {
+      childUpdates.push(input);
+    };
+
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      expect(packageAgent).toBeDefined();
+      expect(packageAgent?.model).toMatchObject({
+        providerID: 'provider',
+        id: 'package',
+      });
+      const packageRules = packageAgent?.permissions as Array<
+        Record<string, unknown>
+      >;
+      expect(packageRules).toContainEqual(
+        expect.objectContaining({ action: 'read', effect: 'allow' }),
+      );
+      expect(packageRules).toContainEqual(
+        expect.objectContaining({
+          action: 'skill',
+          resource: '*',
+          effect: 'deny',
+        }),
+      );
+      expect(packageRules).toContainEqual(
+        expect.objectContaining({ action: 'package-mcp_*', effect: 'allow' }),
+      );
+      expect(packageRules).toContainEqual(
+        expect.objectContaining({ action: '*', resource: '*', effect: 'deny' }),
+      );
+      expect(
+        packageRules.some(
+          (rule) => rule.action === 'bash' && rule.effect === 'allow',
+        ),
+      ).toBe(false);
+      expect(
+        packageRules.some(
+          (rule) =>
+            rule.action === 'host-only-mcp_*' && rule.effect === 'allow',
+        ),
+      ).toBe(false);
+
+      events.push({
+        type: 'session.created',
+        data: {
+          sessionID: 'ses_marketplace_child',
+          parentID: 'ses_marketplace_parent',
+          agent: 'v2-marketplace-agent',
+        },
+      });
+      const deadline = Date.now() + 2_000;
+      while (childUpdates.length === 0 && Date.now() < deadline) {
+        await Bun.sleep(10);
+      }
+      expect(childUpdates).toHaveLength(1);
+      expect(childUpdates[0]?.permissions).toEqual(packageRules);
+      expect(childUpdates[0]?.permissions).toContainEqual(
+        expect.objectContaining({ action: '*', resource: '*', effect: 'deny' }),
+      );
+      // With marketplace policy active and no session.get, an unobserved
+      // session may be a marketplace root and must fail closed.
+      await expect(
+        calls.promptHookCb?.({
+          sessionID: 'ses_marketplace_unknown',
+          messageID: 'msg_unknown',
+        }),
+      ).rejects.toThrow(/identity is unknown; prompt blocked/i);
+
+      // Once a session event establishes that this is a child, missing agent
+      // identity is a marketplace policy barrier and must still block prompt.
+      events.push({
+        type: 'session.created',
+        data: {
+          sessionID: 'ses_marketplace_unclassified_child',
+          parentID: 'ses_marketplace_parent',
+        },
+      });
+      const childEventDeadline = Date.now() + 2_000;
+      while (events.pulled() < 2 && Date.now() < childEventDeadline) {
+        await Bun.sleep(10);
+      }
+      await Bun.sleep(10);
+      await expect(
+        calls.promptHookCb?.({
+          sessionID: 'ses_marketplace_unclassified_child',
+          messageID: 'msg_unclassified_child',
+        }),
+      ).rejects.toThrow(/identity is unknown; prompt blocked/i);
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
+  test('marketplace activation fails and unwinds when child session.update is unavailable', async () => {
+    const store = new MarketplaceStore({ pluginVersion: '2.2.25' });
+    store.install({
+      manifest: {
+        schemaVersion: 2,
+        id: 'team/no-child-update',
+        version: '1.0.0',
+        displayName: 'No child update',
+        description: 'Requires child policy enforcement',
+        agentName: 'no-child-update-agent',
+        prompt: 'Use only admitted capabilities.',
+        skills: [],
+        mcps: [],
+        tools: ['read'],
+        author: { name: 'Test' },
+        tags: [],
+        license: 'MIT',
+        compatibility: { plugin: '>=2.0.0' },
+        model: { source: 'explicit', candidates: ['provider/package'] },
+        routing: {
+          description: 'Marketplace test lane',
+          when: 'Testing host capability failure.',
+          keywords: ['marketplace'],
+        },
+      } as never,
+    });
+    await Bun.write(
+      path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        companion: { enabled: false },
+        preset: 'marketplace-test',
+        presets: {
+          'marketplace-test': {
+            marketplace: { agents: ['team/no-child-update'] },
+          },
+        },
+      }),
+    );
+    const { ctx, calls } = makeMockV2Context(projectDir);
+    const setupCtx = ctx as unknown as {
+      mcp: {
+        transform: (callback: (draft: unknown) => void) => Promise<{
+          dispose: () => void;
+        }>;
+      };
+      agent: {
+        transform: (callback: (draft: unknown) => void) => Promise<{
+          dispose: () => void;
+        }>;
+      };
+    };
+    setupCtx.mcp.transform = async (callback) => {
+      callback({
+        list: () => [],
+        get: () => undefined,
+        set: () => {},
+        update: () => {},
+        remove: () => {},
+      });
+      return {
+        dispose: () => calls.disposed.push('marketplace-mcp-transform'),
+      };
+    };
+    setupCtx.agent.transform = async (callback) => {
+      callback({
+        list: () => [],
+        get: () => undefined,
+        default: () => {},
+        update: () => {},
+        remove: () => {},
+      });
+      return {
+        dispose: () => calls.disposed.push('marketplace-agent-transform'),
+      };
+    };
+
+    await expect(createV2Setup()(ctx)).rejects.toThrow(
+      'Marketplace agents require ctx.session.update',
+    );
+    expect(calls.disposed).toContain('marketplace-agent-transform');
+    expect(calls.disposed).toContain('marketplace-mcp-transform');
+  }, 20_000);
+
+  test('batch-deferred MCP and agent transforms finalize before managed prompts', async () => {
+    const { ctx, calls, events } = makeMockV2Context(projectDir);
+    const mcp = ctx.mcp as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+    };
+    const agent = ctx.agent as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+      list: () => Promise<unknown[]>;
+    };
+    let deferredMcpTransform: ((draft: unknown) => void) | undefined;
+    let deferredAgentTransform: ((draft: unknown) => void) | undefined;
+    const childUpdates: Array<Record<string, unknown>> = [];
+    mcp.transform = async (callback) => {
+      deferredMcpTransform = callback;
+      return { dispose: () => calls.disposed.push('mcp.transform') };
+    };
+    agent.transform = async (callback) => {
+      deferredAgentTransform = callback;
+      return { dispose: () => calls.disposed.push('agent.transform') };
+    };
+    agent.list = async () => {
+      throw new Error('setup must not materialize the agent registry');
+    };
+    (
+      ctx.session as unknown as {
+        update: (input: Record<string, unknown>) => Promise<void>;
+      }
+    ).update = async (input) => {
+      childUpdates.push(input);
+    };
+
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      expect(deferredMcpTransform).toBeFunction();
+      expect(deferredAgentTransform).toBeFunction();
+      expect(calls.hooks).toContain('session:prompt');
+      const earlyPrompt = calls.promptHookCb?.({
+        sessionID: 'ses_deferred_mcp_child',
+        messageID: 'msg_early',
+        prompt: { text: 'early child prompt' },
+      });
+      events.push({
+        type: 'session.created',
+        data: {
+          sessionID: 'ses_deferred_mcp_child',
+          parentID: 'ses_parent',
+          agent: 'explorer',
+        },
+      });
+      // Let the event pump cache the child while its initial plugin roster is
+      // still empty; finalization must reclassify it rather than lose it.
+      await Bun.sleep(25);
+
+      const agentDraft = {
+        list: () => [],
+        get: () => undefined,
+        default: () => {},
+        update: (
+          name: string,
+          project: (draft: Record<string, unknown>) => void,
+        ) => {
+          const draft: Record<string, unknown> = {};
+          project(draft);
+          if (name === 'explorer') {
+            calls.agentUpdates.push({ id: name });
+            (calls as unknown as { explorerRules?: unknown }).explorerRules =
+              draft.permissions;
+          }
+        },
+        remove: () => {},
+      };
+      expect(() => deferredAgentTransform?.(agentDraft)).not.toThrow();
+      expect(() =>
+        deferredMcpTransform?.({
+          list: () => [['host-only', { type: 'local' }]],
+          get: () => ({ type: 'local' }),
+          set: (name: string, config: Record<string, unknown>) => {
+            calls.mcpSets.push({ name, config });
+          },
+          update: () => {},
+          remove: () => {},
+        }),
+      ).not.toThrow();
+      expect(
+        (calls as unknown as { explorerRules?: Array<Record<string, unknown>> })
+          .explorerRules,
+      ).toContainEqual(
+        expect.objectContaining({ action: 'host-only_*', effect: 'deny' }),
+      );
+      await expect(earlyPrompt).resolves.toBeUndefined();
+      await calls.promptHookCb?.({
+        sessionID: 'ses_deferred_mcp_child',
+        messageID: 'msg_deferred_child',
+        prompt: { text: 'managed child prompt after flush' },
+      });
+      await calls.promptHookCb?.({
+        sessionID: 'ses_deferred_mcp',
+        messageID: 'msg_deferred_mcp',
+        prompt: { text: 'ordinary prompt after flush' },
+      });
+      const deadline = Date.now() + 2_000;
+      while (childUpdates.length === 0 && Date.now() < deadline) {
+        await Bun.sleep(10);
+      }
+      expect(childUpdates).toHaveLength(1);
+      expect(childUpdates[0]?.permissions).toContainEqual(
+        expect.objectContaining({ action: 'host-only_*', effect: 'deny' }),
+      );
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
+  test.each(['agent-first', 'mcp-first'] as const)(
+    'deferred %s callback keeps an unclassified child behind the live marketplace barrier',
+    async (callbackOrder) => {
+      const store = new MarketplaceStore({ pluginVersion: '2.2.25' });
+      store.install({
+        manifest: {
+          schemaVersion: 2,
+          id: 'team/deferred-barrier',
+          version: '1.0.0',
+          displayName: 'Deferred barrier agent',
+          description: 'Deferred marketplace permission fixture',
+          agentName: 'deferred-barrier-agent',
+          prompt: 'Use only package-authorized capabilities.',
+          skills: [],
+          mcps: [],
+          tools: ['read'],
+          author: { name: 'Test' },
+          tags: [],
+          license: 'MIT',
+          compatibility: { plugin: '>=2.0.0' },
+          model: { source: 'explicit', candidates: ['provider/package'] },
+          routing: {
+            description: 'Deferred marketplace lane',
+            when: 'Testing deferred marketplace readiness.',
+            keywords: ['marketplace'],
+          },
+        } as never,
+      });
+      await Bun.write(
+        path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
+        JSON.stringify({
+          companion: { enabled: false },
+          preset: 'deferred-marketplace-test',
+          presets: {
+            'deferred-marketplace-test': {
+              marketplace: { agents: ['team/deferred-barrier'] },
+            },
+          },
+        }),
+      );
+
+      const { ctx, calls, events } = makeMockV2Context(projectDir);
+      const setupCtx = ctx as unknown as {
+        mcp: {
+          transform: (callback: (draft: unknown) => void) => Promise<{
+            dispose: () => void;
+          }>;
+        };
+        agent: {
+          transform: (callback: (draft: unknown) => void) => Promise<{
+            dispose: () => void;
+          }>;
+        };
+        session: {
+          update: (input: Record<string, unknown>) => Promise<void>;
+        };
+      };
+      let deferredMcpTransform: ((draft: unknown) => void) | undefined;
+      let deferredAgentTransform: ((draft: unknown) => void) | undefined;
+      setupCtx.session.update = async () => {};
+      setupCtx.mcp.transform = async (callback) => {
+        deferredMcpTransform = callback;
+        return { dispose: () => calls.disposed.push('deferred-mcp') };
+      };
+      setupCtx.agent.transform = async (callback) => {
+        deferredAgentTransform = callback;
+        return { dispose: () => calls.disposed.push('deferred-agent') };
+      };
+
+      const cleanup = await createV2Setup()(ctx);
+      try {
+        events.push({
+          type: 'session.created',
+          data: {
+            sessionID: 'ses_deferred_marketplace_unclassified',
+            parentID: 'ses_parent',
+            agent: 'unclassified-host-agent',
+          },
+        });
+        await Bun.sleep(25);
+
+        const agentDraft = {
+          list: () => [],
+          get: () => undefined,
+          default: () => {},
+          update: (
+            _name: string,
+            project: (agent: Record<string, unknown>) => void,
+          ) => project({}),
+          remove: () => {},
+        };
+        const mcpDraft = {
+          list: () => [],
+          get: () => undefined,
+          set: () => {},
+          update: () => {},
+          remove: () => {},
+        };
+        if (!deferredAgentTransform || !deferredMcpTransform) {
+          throw new Error('deferred transforms were not captured');
+        }
+        if (callbackOrder === 'agent-first') {
+          deferredAgentTransform(agentDraft);
+          deferredMcpTransform(mcpDraft);
+        } else {
+          deferredMcpTransform(mcpDraft);
+          deferredAgentTransform(agentDraft);
+        }
+
+        await expect(
+          calls.promptHookCb?.({
+            sessionID: 'ses_deferred_marketplace_unclassified',
+            messageID: 'msg_deferred_marketplace_unclassified',
+            prompt: { text: 'This child has no enforceable agent policy.' },
+          }),
+        ).rejects.toThrow('child session identity is unknown');
+      } finally {
+        await cleanup();
+      }
+    },
+  );
+
+  test('missing MCP draft callback keeps managed prompts behind readiness', async () => {
+    const { ctx, calls } = makeMockV2Context(projectDir);
+    const mcp = ctx.mcp as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+    };
+    mcp.transform = async () => ({
+      dispose: () => calls.disposed.push('mcp.transform'),
+    });
+
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      await expect(
+        calls.promptHookCb?.({
+          sessionID: 'ses_missing_mcp_draft',
+          messageID: 'msg_missing_mcp_draft',
+          prompt: { text: 'Do not admit without finalized MCP scope.' },
+        }),
+      ).rejects.toThrow('Agent permission snapshot readiness timed out');
+    } finally {
+      await cleanup();
+    }
+    expect(calls.disposed).toContain('mcp.transform');
+  }, 20_000);
+
+  test('missing MCP transform fails startup and unwinds earlier resources', async () => {
+    const { ctx } = makeMockV2Context(projectDir);
+    const mcp = ctx.mcp as unknown as { transform?: unknown };
+    mcp.transform = undefined;
+
+    await expect(createV2Setup()(ctx)).rejects.toThrow(
+      'this host cannot expose configured MCP namespaces; update to a supported v2 host',
+    );
+    await flushLoggerForTesting();
+    const logText = readPluginLog();
+    expect(logText).toContain('[v2][interview] bridge disposed');
+    expect(logText).toContain('[v2] v1 dispose hook invoked (abort path)');
   }, 20_000);
 
   test('subagent launch flows into the job board through the tool bridges', async () => {
@@ -436,6 +1472,90 @@ describe('createV2Setup e2e', () => {
       // (subagent_type derived from the v2 `agent` field).
       expect(status.content).toContain('agent: fixer');
       expect(status.content).toContain('ses_kid_1');
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
+  test('admission uses the finalized v2 child model instead of its parent', async () => {
+    await Bun.write(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        companion: { enabled: false },
+        backgroundJobs: { sameProviderPolicy: { openai: 'foreground' } },
+      }),
+    );
+    const { ctx, calls, events } = makeMockV2Context(projectDir);
+    const agent = ctx.agent as unknown as {
+      transform: (callback: (draft: unknown) => void) => Promise<{
+        dispose: () => void;
+      }>;
+    };
+    const hostAgents = {
+      orchestrator: {
+        id: 'orchestrator',
+        mode: 'primary',
+        model: { providerID: 'openai', id: 'parent-model' },
+        permissions: [],
+      },
+      fixer: {
+        id: 'fixer',
+        mode: 'subagent',
+        model: { providerID: 'anthropic', id: 'child-model' },
+        permissions: [],
+      },
+    };
+    agent.transform = async (callback) => {
+      callback({
+        list: () => Object.values(hostAgents),
+        get: (id: string) => hostAgents[id as keyof typeof hostAgents],
+        default: () => {},
+        update: (
+          _id: string,
+          project: (draft: Record<string, unknown>) => void,
+        ) => {
+          project({});
+        },
+        remove: () => {},
+      });
+      return { dispose: () => {} };
+    };
+
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      events.push({
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'msg_parent_model',
+            sessionID: 'ses_admission_parent',
+            providerID: 'openai',
+            modelID: 'parent-model',
+          },
+        },
+      });
+      await Bun.sleep(20);
+
+      const beforeHook = calls.toolBeforeCb;
+      if (!beforeHook) throw new Error('tool:execute.before not captured');
+      const childLaunch = {
+        tool: 'subagent',
+        sessionID: 'ses_admission_parent',
+        agent: 'orchestrator',
+        messageID: 'msg_admission',
+        id: 'call_admission',
+        input: {
+          agent: 'fixer',
+          description: 'verify finalized child model',
+          prompt: 'Do the work',
+          background: true,
+        },
+      };
+      await beforeHook(childLaunch);
+
+      // The policy applies to the parent's provider. If admission incorrectly
+      // falls back to the parent model, this is converted to foreground.
+      expect(childLaunch.input.background).toBe(true);
     } finally {
       await cleanup();
     }

@@ -208,7 +208,7 @@ function describeTransition(label: string, prev: string, next: string) {
 
 // ── Hook + turn runner ────────────────────────────────────────────────
 
-function createHook(board: BackgroundJobBoard) {
+function createHook(board: BackgroundJobBoard, boardInjection?: boolean) {
   return createTaskSessionManagerHook(
     {
       client: { session: { status: mock(async () => ({ data: {} })) } },
@@ -219,6 +219,7 @@ function createHook(board: BackgroundJobBoard) {
       maxSessionsPerAgent: 4,
       maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
       strategy: 'checkpoint-compatible',
+      boardInjection,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
     },
@@ -509,4 +510,36 @@ describe('checkpoint-compatible board cache safety', () => {
       );
     }
   }, 20_000);
+});
+
+describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
+  test('off: checkpoint strategy injects no board text at all', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    const hook = createHook(board, false);
+    const turn = await runTurn(hook, [
+      userMsg('msg_u_sw_off', 'Coordinate the refactor work', BASE_TIME),
+    ]);
+    expect(turn.transformBytes).not.toContain('Background Job Board');
+  });
+
+  test('on (default): checkpoint strategy keeps injecting the board', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    const hook = createHook(board);
+    const turn = await runTurn(hook, [
+      userMsg('msg_u_sw_on', 'Coordinate the refactor work', BASE_TIME),
+    ]);
+    expect(turn.transformBytes).toContain('Background Job Board');
+  });
 });

@@ -24,13 +24,17 @@ function user(id: string) {
   };
 }
 
-function stateFor(board: BackgroundJobBoard): InjectionState {
+function stateFor(
+  board: BackgroundJobBoard,
+  boardInjection?: boolean,
+): InjectionState {
   return {
     backgroundJobBoard: board,
     terminalGate: {} as never,
     lifecycleLedger: {} as never,
     maxRetainedSnapshots: 20,
     strategy: 'latest',
+    boardInjection,
     processedInjectedCompletions: new Set(),
     processedInjectedCompletionOrder: [],
     terminalJobsInjectedByParent: new Map(),
@@ -47,7 +51,7 @@ function stateFor(board: BackgroundJobBoard): InjectionState {
   } as unknown as InjectionState;
 }
 
-function setup() {
+function setup(boardInjection?: boolean) {
   const board = new BackgroundJobBoard();
   board.registerLaunch({
     taskID: 'child-1',
@@ -55,7 +59,7 @@ function setup() {
     agent: 'explorer',
     description: 'map hooks',
   });
-  return { board, state: stateFor(board) };
+  return { board, state: stateFor(board, boardInjection) };
 }
 
 async function inject(
@@ -282,5 +286,25 @@ describe('latest board unchanged marker', () => {
     expect(output.at(-1)?.parts[0]?.text).toContain('### Background Job Board');
     expect(isMarker(output.at(-1)?.parts[0]?.text)).toBe(false);
     expect(isMarker(boardParts(output)[1]?.text)).toBe(true);
+  });
+});
+
+describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
+  test('off: no board part is injected even with active jobs', async () => {
+    const { state } = setup(false);
+    const output = await inject(state, [user('switch-off')]);
+    expect(boardParts(output)).toHaveLength(0);
+  });
+
+  test('default (undefined) and explicit true keep injecting the board', async () => {
+    for (const flag of [undefined, true] as const) {
+      const { state } = setup(flag);
+      const output = await inject(state, [user('switch-on')]);
+      expect(
+        boardParts(output).some((p) =>
+          p.text?.includes('Background Job Board'),
+        ),
+      ).toBe(true);
+    }
   });
 });

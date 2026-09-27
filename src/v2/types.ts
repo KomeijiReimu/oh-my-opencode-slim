@@ -203,6 +203,18 @@ export interface V2Context {
     transform(cb: (draft: V2CommandDraft) => void): Promise<V2Registration>;
     list(): Promise<unknown>;
   };
+  skill?: {
+    transform(
+      cb: (draft: {
+        add(skill: unknown): void;
+        update(
+          id: string,
+          update: (skill: Record<string, unknown>) => void,
+        ): void;
+        remove(id: string): void;
+      }) => void,
+    ): Promise<V2Registration>;
+  };
   session: {
     hook(
       name: 'context',

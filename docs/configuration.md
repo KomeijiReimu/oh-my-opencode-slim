@@ -136,9 +136,15 @@ written to the user config file; reload OpenCode for it to take effect. See
 | `agents.<customAgent>.prompt` | string | - | Full execution prompt for a custom agent |
 | `agents.<customAgent>.orchestratorPrompt` | string | - | Exact `@agent` block injected into the orchestrator prompt; must start with `@<agent-name>` |
 | `agents.<agent>.permission` | object \| string | - | Tool-level permission rules enforced by the SDK. See [Agent Permissions](#agent-permissions) |
+| `agents.<agent>.mcps` | string[] | - | Plugin MCP allow-list (`"*"`, `"!item"`, explicit list); this is plugin configuration, not a host agent `mcps` field |
 | `agents.<agent>.displayName` | string | - | Custom user-facing alias for the agent in the active config |
 | `agents.<agent>.color` | string | - | Agent display color as `#RRGGBB` or a theme color: `primary`, `secondary`, `accent`, `success`, `warning`, `error`, or `info` |
 | `agents.<agent>.description` | string | generated | Description shown to OpenCode and the orchestrator; defaults to `Custom subagent '<name>'` for custom agents |
+
+The plugin's `agents.<agent>.mcps` setting controls which configured plugin MCP
+servers its policy allows. It is not a host-native `agent.mcps` property and
+does not replace host permission rules: an explicit host permission denial for
+an MCP tool remains authoritative.
 | `acpAgents.<name>.command` | string | - | Command for an external ACP-compatible agent; creates a wrapper subagent named `<name>` See [ACP-connected agents](#acp-connected-agents). |
 | `acpAgents.<name>.args` | string[] | `[]` | Arguments for the ACP agent command See [ACP-connected agents](#acp-connected-agents). |
 | `acpAgents.<name>.env` | object | `{}` | Extra environment variables for the ACP subprocess See [ACP-connected agents](#acp-connected-agents). |
@@ -179,9 +185,10 @@ written to the user config file; reload OpenCode for it to take effect. See
 | `backgroundJobs.concurrency.modelConcurrency` | object | `{}` | Per-model caps keyed by `provider/model` ID. Each value must be `0`–`1000`, where `0` means unlimited for that model. The most specific configured cap wins: model > provider > default See [Background Job Management](#background-job-management). |
 | `backgroundJobs.sameProviderPolicy` | object | `{}` | Opt-in per-provider policy keyed by provider ID; the only value is `"foreground"`. When the parent session's current model and the child agent's resolved model both resolve to a configured provider, an explicit `task(..., background: true)` call is converted to the existing foreground execution path. Unconfigured, different, or undeterminable providers keep background behavior. See [Background Job Management](#background-job-management). |
 | `backgroundJobs.waitForUserGuard` | boolean | `true` | When true, intercepts `wait_for_user` calls while background tasks are still running and the orchestrator wake scheduler is enabled, returning guidance to end the turn instead of blocking on manual input. See [Background Job Management](#background-job-management). |
+| `backgroundJobs.boardInjection` | boolean | `true` | When false, the Background Job Board reminder is never injected into prompts. Background task tracking, wake, and task_status all keep working; the orchestrator simply no longer passively sees the board. See [Background Job Management](#background-job-management). |
 | `disabled_mcps` | string[] | `[]` | MCP server IDs to disable globally |
-| `fallback.enabled` | boolean | `true` | Enable Slim's foreground model-chain failover. It does not configure OpenCode provider/AI-SDK retries. |
-| `fallback.maxRetries` | number | `3` | Consecutive retryable 429 responses allowed for the same foreground model before Slim aborts or selects the next configured fallback model. It does not cap OpenCode provider retries or background subagent retries. |
+| `fallback.enabled` | boolean | `true` | Enable Slim's foreground model-chain failover. It does not configure OpenCode provider/AI-SDK retries. On **v2 hosts** Slim's automatic foreground fallback is disabled regardless (temporary compatibility limitation: the v2 `switchModel` has no per-turn/atomic conditional form, so an in-flight switch could commit after a newer user turn has taken over). Host-native retries still run, but the configured chain is not executed automatically. Re-enable only once a host atomic conditional-switch capability is confirmed — not merely because a `switchModel` method exists. |
+| `fallback.maxRetries` | number | `3` | Number of current-model retries allowed before Slim switches to the next configured fallback model. The budget is chain-global (shared across every model in the fallback chain) and counts both host-initiated retries (`session.status: retry`) and Slim-initiated same-model retries on terminal errors (`session.error` / `message.updated`). It is not reset by a model switch and clears only on a successful assistant response, session deletion, or a confirmed new user turn; `0` switches immediately for ordinary retryable errors. Confirmed permanent quota/usage/billing errors (explicit spending limits, expired coding plans, exhausted fixed-window limits, explicit quota exhaustion) skip the budget **and** `fallback.initialRetryDelayMs` and advance the chain immediately; ordinary 429/rate-limit errors keep using the budget and the delay. It does not cap OpenCode provider retries or background subagent retries. |
 | `fallback.initialRetryDelayMs` | number | `0` | Delay in milliseconds before triggering the first fallback on a failover-worthy error. Gives intercepting plugins time to recover the current model before the fallback chain advances. 0 disables. |
 | `fallback.retryDelayMs` | number | `500` | Delay in milliseconds between consecutive fallback attempts after the initial trigger. 0 disables. |
 | `council.presets` | object | - | **Required if using council.** Named councillor presets See [Council configuration note](#council-configuration-note). |
@@ -472,8 +479,18 @@ running session.
 
 `fallback.maxRetries` is unrelated to the wall-clock supervisor and to
 OpenCode's provider retry policy. A value of `0` disables Slim's foreground
-429 failover budget; it does not prevent OpenCode from retrying a provider
-request in a child session.
+retry budget; it does not prevent OpenCode from retrying a provider request in
+a child session.
+
+On v2 hosts, Slim's automatic foreground fallback is disabled entirely
+(temporary compatibility limitation): the v2 `switchModel` has no per-turn /
+atomic conditional form, so `session.error`, `message.updated` and
+`session.status` retry cannot keep host and manager state consistent — an
+in-flight switch could commit on the host after a newer user turn has taken
+over. Host-native retries and their decisions are left untouched, but the
+configured fallback chain is not executed automatically. This must only be
+re-enabled once a host atomic conditional-switch capability is confirmed, not
+merely because a `switchModel` method exists.
 
 ### Agent Display Names
 

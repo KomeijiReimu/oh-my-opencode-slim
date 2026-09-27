@@ -9,7 +9,6 @@ import type { TaskControlRecovery } from './task-control-recovery';
 import { createTaskMessageTool } from './task-message';
 
 let client: Record<string, any>;
-mock.module('../utils/opencode-client', () => ({ getClient: () => client }));
 afterEach(() => mock.restore());
 
 function registerRunningChild(
@@ -41,14 +40,14 @@ function makeSession(prompt: ReturnType<typeof mock>) {
 
 function createTool(board: BackgroundJobBoard) {
   return createTaskMessageTool({
-    input: { directory: '/test' } as any,
+    input: { directory: '/test', client } as any,
     backgroundJobBoard: board,
   }).task_message;
 }
 
 function createToolWithTimeout(board: BackgroundJobBoard, timeoutMs: number) {
   return createTaskMessageTool({
-    input: { directory: '/test' } as any,
+    input: { directory: '/test', client } as any,
     backgroundJobBoard: board,
     messageTimeoutMs: timeoutMs,
   }).task_message;
@@ -118,7 +117,7 @@ function createDurableTool(
 ) {
   client = { session: makeDurableSession(prompt) };
   return createTaskMessageTool({
-    input: { directory } as any,
+    input: { directory, client } as any,
     backgroundJobBoard: board,
     recovery,
     messageTimeoutMs,
@@ -181,7 +180,7 @@ function createOrphanMessageTool(
     },
   };
   const task_message = createTaskMessageTool({
-    input: { directory: '/test' } as any,
+    input: { directory: '/test', client } as any,
     backgroundJobBoard: board,
     identityIndex:
       identityIndex === null
@@ -203,7 +202,7 @@ describe('task_message', () => {
       const prompt = makePrompt();
       client = { session: makeDurableSession(prompt) };
       const task_message = createTaskMessageTool({
-        input: { directory: project } as any,
+        input: { directory: project, client } as any,
         backgroundJobBoard: board,
         identityIndex: index,
       }).task_message;
@@ -259,7 +258,7 @@ describe('task_message', () => {
         },
       };
       const task_message = createTaskMessageTool({
-        input: { directory: project } as any,
+        input: { directory: project, client } as any,
         backgroundJobBoard: board,
         identityIndex: contender,
       }).task_message;
@@ -308,7 +307,7 @@ describe('task_message', () => {
         },
       };
       const task_message = createTaskMessageTool({
-        input: { directory: project } as any,
+        input: { directory: project, client } as any,
         backgroundJobBoard: board,
         identityIndex: index,
         messageTimeoutMs: 5,
@@ -379,7 +378,7 @@ describe('task_message', () => {
       const prompt = makePrompt();
       client = { session: makeDurableSession(prompt) };
       const task_message = createTaskMessageTool({
-        input: { directory: project } as any,
+        input: { directory: project, client } as any,
         backgroundJobBoard: board,
         identityIndex: owner,
       }).task_message;
@@ -438,7 +437,7 @@ describe('task_message', () => {
       },
     };
     const task_message = createTaskMessageTool({
-      input: { directory: '/test' } as any,
+      input: { directory: '/test', client } as any,
       backgroundJobBoard: board,
       recovery,
     }).task_message;
@@ -646,7 +645,7 @@ describe('task_message', () => {
       const prompt = mock(() => transport.promise);
       client = { session: makeDurableSession(prompt) };
       const task_message = createTaskMessageTool({
-        input: { directory: project } as any,
+        input: { directory: project, client } as any,
         backgroundJobBoard: board,
         identityIndex: index,
         messageTimeoutMs: 5,

@@ -18,13 +18,11 @@ import {
   extractChannel,
   findPluginEntry,
   getCachedVersion,
-  getCurrentRuntimePackageJsonPath,
   getLatestCompatibleVersion,
   getLocalDevVersion,
   updateInstallerManagedVersions,
 } from './checker';
 import { CACHE_DIR, PACKAGE_NAME } from './constants';
-import { syncBundledSkillsFromPackage } from './skill-sync';
 import type { AutoUpdateCheckerOptions } from './types';
 
 /**
@@ -69,8 +67,6 @@ export function createAutoUpdateCheckerHook(
   };
 }
 
-let hasReconciledAtStartup = false;
-
 /**
  * Orchestrates the version comparison and update process in the background.
  * @param ctx The plugin input context.
@@ -81,54 +77,9 @@ async function runBackgroundUpdateCheck(
   autoUpdate: boolean,
   companion: AutoUpdateCheckerOptions['companion'],
 ): Promise<void> {
-  const stagedSkillsThisUpdate = new Set<string>();
-
-  // Startup reconciliation (run once per top-level startup)
-  if (!hasReconciledAtStartup) {
-    try {
-      const runtimePackageJsonPath = getCurrentRuntimePackageJsonPath();
-      if (runtimePackageJsonPath) {
-        hasReconciledAtStartup = true;
-        const packageRoot = path.dirname(runtimePackageJsonPath);
-        log('[auto-update-checker] Running startup skill reconciliation');
-        const syncResult = syncBundledSkillsFromPackage(packageRoot);
-        for (const skill of syncResult.stagedThisSync) {
-          stagedSkillsThisUpdate.add(skill);
-        }
-        if (syncResult.installed.length > 0) {
-          log(
-            `[auto-update-checker] Startup skill sync installed: ${syncResult.installed.join(', ')}`,
-          );
-        }
-        if (syncResult.failed.length > 0) {
-          log(
-            `[auto-update-checker] Startup skill sync failures: ${syncResult.failed.join(', ')}`,
-          );
-        }
-        if (syncResult.staged.length > 0) {
-          log(
-            `[auto-update-checker] Startup skill sync staged: ${syncResult.staged.join(', ')}`,
-          );
-        }
-        if (syncResult.customized.length > 0) {
-          log(
-            `[auto-update-checker] Startup skill sync customized: ${syncResult.customized.join(', ')}`,
-          );
-        }
-      } else {
-        log(
-          '[auto-update-checker] Could not resolve runtime package path for startup skill reconciliation',
-        );
-      }
-    } catch (err) {
-      log('[auto-update-checker] Startup skill reconciliation failed:', err);
-    }
-  }
-
   const pluginInfo = findPluginEntry(ctx.directory);
   if (!pluginInfo) {
     log('[auto-update-checker] Plugin not found in config');
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -136,7 +87,6 @@ async function runBackgroundUpdateCheck(
   const currentVersion = cachedVersion ?? pluginInfo.pinnedVersion;
   if (!currentVersion) {
     log('[auto-update-checker] No version found (cached or pinned)');
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -155,7 +105,6 @@ async function runBackgroundUpdateCheck(
         8000,
       );
     }
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -164,7 +113,6 @@ async function runBackgroundUpdateCheck(
     log(
       `[auto-update-checker] Major update available; skipping auto-update: ${latestInfo.latestMajorVersion}`,
     );
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -174,7 +122,6 @@ async function runBackgroundUpdateCheck(
       '[auto-update-checker] Failed to fetch latest version for channel:',
       channel,
     );
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -183,7 +130,6 @@ async function runBackgroundUpdateCheck(
       '[auto-update-checker] Already on latest version for channel:',
       channel,
     );
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -200,7 +146,6 @@ async function runBackgroundUpdateCheck(
       8000,
     );
     log(`[auto-update-checker] Version is pinned; skipping auto-update.`);
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -213,7 +158,6 @@ async function runBackgroundUpdateCheck(
       8000,
     );
     log('[auto-update-checker] Auto-update disabled, notification only');
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -235,7 +179,6 @@ async function runBackgroundUpdateCheck(
       8000,
     );
     log('[auto-update-checker] Failed to prepare install root for auto-update');
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -261,32 +204,10 @@ async function runBackgroundUpdateCheck(
       );
       return;
     }
-    let installedSkills: string[] = [];
+
     let companionUpdated = false;
     let companionWillRetry = false;
     const packageRoot = path.join(installDir, 'node_modules', PACKAGE_NAME);
-    try {
-      const syncResult = syncBundledSkillsFromPackage(packageRoot);
-      installedSkills = syncResult.installed;
-      for (const skill of syncResult.stagedThisSync) {
-        stagedSkillsThisUpdate.add(skill);
-      }
-      for (const skill of [...syncResult.installed, ...syncResult.adopted]) {
-        stagedSkillsThisUpdate.delete(skill);
-      }
-      if (syncResult.failed.length > 0) {
-        log(
-          `[auto-update-checker] Skill sync warnings/failures: ${syncResult.failed.join(', ')}`,
-        );
-      }
-      if (syncResult.skippedExisting.length > 0) {
-        log(
-          `[auto-update-checker] Skill sync skipped existing: ${syncResult.skippedExisting.join(', ')}`,
-        );
-      }
-    } catch (err) {
-      log('[auto-update-checker] Skill sync failed silently:', err);
-    }
 
     if (companion?.enabled === true) {
       try {
@@ -319,14 +240,6 @@ async function runBackgroundUpdateCheck(
     }
 
     const messageLines = [`v${currentVersion} → v${latestVersion}`];
-    if (installedSkills.length > 0) {
-      messageLines.push(`Added bundled skills: ${installedSkills.join(', ')}`);
-    }
-    if (stagedSkillsThisUpdate.size > 0) {
-      messageLines.push(
-        `Staged skill updates require manual review: ${[...stagedSkillsThisUpdate].join(', ')}`,
-      );
-    }
     if (companionUpdated) {
       messageLines.push('Companion updated.');
     } else if (companionWillRetry) {
@@ -353,7 +266,6 @@ async function runBackgroundUpdateCheck(
       8000,
     );
     log('[auto-update-checker] bun install failed; update not installed');
-    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
   }
 }
 
@@ -364,21 +276,6 @@ function showMajorUpgradeToast(ctx: PluginInput, version: string): void {
     'It requires OpenCode background subagents.\nRun: bunx oh-my-opencode-slim@latest install',
     'info',
     12_000,
-  );
-}
-
-function showStagedSkillsReviewToast(
-  ctx: PluginInput,
-  stagedSkills: ReadonlySet<string>,
-): void {
-  if (stagedSkills.size === 0) return;
-
-  showToast(
-    ctx,
-    'Skill updates need review',
-    `Manual review required: ${[...stagedSkills].join(', ')}`,
-    'info',
-    8000,
   );
 }
 

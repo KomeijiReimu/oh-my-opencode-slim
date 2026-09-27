@@ -10,7 +10,6 @@ import { createTaskReviveTool } from './task-revive';
 import { createTaskStatusTool } from './task-status';
 
 let client: Record<string, any>;
-mock.module('../utils/opencode-client', () => ({ getClient: () => client }));
 
 function makeTool(options: {
   board: BackgroundJobBoard;
@@ -20,7 +19,7 @@ function makeTool(options: {
   recovery?: TaskControlRecovery;
 }) {
   return createTaskStatusTool({
-    input: { directory: '/test' } as any,
+    input: { directory: '/test', client } as any,
     backgroundJobBoard: options.board,
     now: options.now,
     statusTimeoutMs: options.statusTimeoutMs,
@@ -179,7 +178,7 @@ describe('task_status', () => {
         })),
       },
     };
-    const input = { directory: '/test' } as any;
+    const input = { directory: '/test', client } as any;
     const recovery = createTaskControlRecovery({
       input,
       backgroundJobBoard: board,

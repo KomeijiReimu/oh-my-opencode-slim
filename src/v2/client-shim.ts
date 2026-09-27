@@ -279,13 +279,26 @@ export function resetClientShimGenerationWarnings(): void {
 /** v1 body model (`{providerID, modelID}`) → v2 model ref
  * (`{id, providerID}`). */
 function modelRefFromBody(body: {
-  model?: { id?: string; modelID?: string; providerID?: string };
-}): { id: string; providerID: string } | undefined {
+  model?: {
+    id?: string;
+    modelID?: string;
+    providerID?: string;
+    variant?: string;
+  };
+}): V2GenerateModelRef | undefined {
   const model = body.model;
   if (!model) return undefined;
   const id = model.id ?? model.modelID ?? '';
   const providerID = model.providerID ?? '';
-  return id && providerID ? { id, providerID } : undefined;
+  return id && providerID
+    ? {
+        id,
+        providerID,
+        ...(typeof model.variant === 'string'
+          ? { variant: model.variant }
+          : {}),
+      }
+    : undefined;
 }
 
 /**
@@ -774,9 +787,6 @@ export function buildPluginInput(
         });
       },
     },
-    // Misc methods the plugin may touch; all graceful no-ops.
-    model: { list: async () => ({ data: [] }) },
-    provider: { list: async () => ({ data: [] }) },
   };
 
   const directory = resolveV2Directory(ctx);

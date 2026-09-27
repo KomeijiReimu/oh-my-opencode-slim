@@ -10,7 +10,10 @@ import {
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BackgroundJobBoard as ProductionBoard } from './background-job-board';
+import {
+  BackgroundJobBoard as ProductionBoard,
+  STATUS_UNCERTAIN_DEMOTE_AFTER_MS,
+} from './background-job-board';
 import { BackgroundJobBoard } from './background-job-fixture';
 import { createBackgroundJobIdentityIndex } from './background-job-identity-index';
 import { getBackgroundJobLifecycleLedger } from './background-job-store';
@@ -1367,6 +1370,116 @@ describe('BackgroundJobBoard', () => {
     board.markReconciled('ses_uncertain');
 
     expect(board.resolveReusable('parent-1', 'ses_uncertain')).toBeUndefined();
+  });
+
+  describe('stale uncertain removal (#1314)', () => {
+    function launchUncertain(uncertainAt: number) {
+      const board = new BackgroundJobBoard();
+      board.registerLaunch({
+        taskID: 'ses_dark',
+        parentSessionID: 'parent-1',
+        agent: 'explorer',
+        description: 'map hooks',
+        now: 1_000,
+      });
+      board.markStatusUncertain(
+        'ses_dark',
+        'status read failed',
+        undefined,
+        uncertainAt,
+      );
+      return board;
+    }
+
+    test('long-uncertain running job leaves the board render', () => {
+      const board = launchUncertain(2_000);
+      const thresholdAt = 2_000 + STATUS_UNCERTAIN_DEMOTE_AFTER_MS;
+
+      const fresh = board.formatForPrompt('parent-1', thresholdAt - 1);
+      expect(fresh).toContain(
+        '#### Active / Unreconciled\n- exp-1 / ses_dark / explorer / running, status uncertain',
+      );
+
+      // Sole stale entry: no board at all — zero reminder tokens.
+      const stale = board.formatForPrompt('parent-1', thresholdAt);
+      expect(stale).toBeUndefined();
+    });
+
+    test('a confirmed observation restarts the demotion clock on re-entry', () => {
+      const board = launchUncertain(2_000);
+      // A live busy observation confirms the child and clears uncertainty.
+      board.markRunningFromLiveSession('ses_dark', 3_000);
+      expect(board.get('ses_dark')?.statusUncertain).toBe(false);
+
+      // Uncertainty returns long after the first episode began; the fresh
+      // episode must get a full threshold, not the stale first-episode start.
+      const reEntry = 2_000 + STATUS_UNCERTAIN_DEMOTE_AFTER_MS + 60_000;
+      board.markStatusUncertain(
+        'ses_dark',
+        'status read failed again',
+        undefined,
+        reEntry,
+      );
+
+      const prompt = board.formatForPrompt(
+        'parent-1',
+        reEntry + STATUS_UNCERTAIN_DEMOTE_AFTER_MS - 1,
+      );
+      expect(prompt).toContain(
+        'ses_dark / explorer / running, status uncertain',
+      );
+    });
+
+    test('re-marking within one episode keeps the original stamp', () => {
+      const board = launchUncertain(2_000);
+      board.markStatusUncertain(
+        'ses_dark',
+        'read failed again',
+        undefined,
+        5_000,
+      );
+      expect(board.get('ses_dark')?.statusUncertainSince).toBe(2_000);
+
+      const stale = board.formatForPrompt(
+        'parent-1',
+        2_000 + STATUS_UNCERTAIN_DEMOTE_AFTER_MS,
+      );
+      expect(stale).toBeUndefined();
+    });
+
+    test('a stamp-less uncertain record demotes by its updatedAt fallback', () => {
+      const board = new BackgroundJobBoard();
+      board.registerLaunch({
+        taskID: 'ses_dark',
+        parentSessionID: 'parent-1',
+        agent: 'explorer',
+        description: 'map hooks',
+        now: 1_000,
+      });
+      // Fixture-only path: applyStatus accepts uncertainty but leaves the
+      // episode stamp unset, exercising the ?? updatedAt fallback.
+      board.updateStatus({
+        taskID: 'ses_dark',
+        state: 'running',
+        statusUncertain: true,
+        lastStatusError: 'status read failed',
+        now: 2_000,
+      });
+      const record = board.get('ses_dark');
+      expect(record?.statusUncertain).toBe(true);
+      expect(record?.statusUncertainSince).toBeUndefined();
+
+      const fresh = board.formatForPrompt(
+        'parent-1',
+        2_000 + STATUS_UNCERTAIN_DEMOTE_AFTER_MS - 1,
+      );
+      expect(fresh).toContain('ses_dark');
+      const stale = board.formatForPrompt(
+        'parent-1',
+        2_000 + STATUS_UNCERTAIN_DEMOTE_AFTER_MS,
+      );
+      expect(stale).toBeUndefined();
+    });
   });
 
   test('stale generations cannot alter a newer relaunch after terminal acknowledgement', () => {

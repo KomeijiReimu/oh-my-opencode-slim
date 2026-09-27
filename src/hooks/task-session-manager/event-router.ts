@@ -299,11 +299,22 @@ export async function handleEvent(
         observedGeneration: number,
         error?: string,
       ): void;
+      /** Bounded deferred-error backstop for the fallback-preparation
+       *  window: re-checks the fallback state on each fire and
+       *  terminalizes the deferred error once it is no longer in flight. */
+      scheduleDeferredErrorBackstop(
+        sessionID: string,
+        idleObservedAt: number,
+        observedGeneration: number,
+      ): void;
       clearIdleTimers(sessionID: string): void;
       clearAllTimers(): string[];
     };
-    /** Sessions with a deferred inline 401/410 awaiting fallback outcome. */
-    deferredInlineErrors: Set<string>;
+    /** Sessions with a deferred failover error awaiting the fallback
+     *  outcome, mapped to the summary the idle backstop publishes when
+     *  no recovery happens (managed inline 401/410, background children
+     *  with an armed fallback chain). */
+    deferredInlineErrors: Map<string, string>;
     backgroundJobBoard: BackgroundJobStore;
     terminalGate: import('../../utils/background-job-terminal-gate').BackgroundJobTerminalGate;
     pendingCallTracker: {
@@ -558,16 +569,37 @@ export async function handleEvent(
     // session being idle is itself the completion signal.
     // Delayed so FG can claim the session before we mark completed.
     if (job && sessionId && job.state === 'running') {
-      if (deps.deferredInlineErrors.has(sessionId)) {
-        // A persistent 401/410 was deferred for fallback recovery but the
-        // session ended without one: terminalize as error instead of the
-        // false completion the child-idle path would record.
-        deps.idleReconciler.scheduleChildIdleReconciliation(
-          sessionId,
-          observedAt,
-          job.generation,
-          'Session error after failed model fallback (auth/model unavailable)',
-        );
+      const deferredError = deps.deferredInlineErrors.get(sessionId);
+      if (deferredError !== undefined) {
+        if (deps.options.isFallbackInProgress?.(sessionId)) {
+          // The failed prompt's idle can arrive while the fallback
+          // re-prompt is still being prepared (the host dispatches events
+          // without awaiting the plugin hook). Committing the deferred
+          // error inside that window terminalizes the record before the
+          // observation handoff can arm and orphans the retried run's
+          // result — the exact race this deferral exists to prevent.
+          // Schedule the bounded backstop instead: it re-checks the
+          // fallback state, and live busy cancels it.
+          deps.idleReconciler.scheduleDeferredErrorBackstop(
+            sessionId,
+            observedAt,
+            job.generation,
+          );
+        } else {
+          // A failover-worthy error was deferred for fallback recovery but
+          // the session ended without one: terminalize as error instead of
+          // the false completion the child-idle path would record. The
+          // entry is consumed here — the scheduled reconcile owns the
+          // error now, and a stale entry must not poison a later reuse of
+          // this session.
+          deps.deferredInlineErrors.delete(sessionId);
+          deps.idleReconciler.scheduleChildIdleReconciliation(
+            sessionId,
+            observedAt,
+            job.generation,
+            deferredError,
+          );
+        }
       } else {
         deps.idleReconciler.scheduleChildIdleReconciliation(
           sessionId,
@@ -615,7 +647,7 @@ export async function handleEvent(
       // completed background tasks and unable to dispatch follow-ups.
       // Persistent 401/410 (auth, model gone) may ALSO be recovered by a
       // fallback reprompt, so defer while recovery is still possible:
-      // record the deferred error in the set so an idle with no recovery
+      // record the deferred error in the map so an idle with no recovery
       // terminalizes the job as 'error' instead of a false completion.
       // When no chain exists, fallback is disabled, or the chain is
       // exhausted the error is final — record it now.
@@ -650,7 +682,10 @@ export async function handleEvent(
       } else if (isInlineFailoverError(props.error)) {
         // Recovery possible: defer. The idle backstop terminalizes this
         // if the fallback fails silently; busy/deleted clears it.
-        deps.deferredInlineErrors.add(sessionId);
+        deps.deferredInlineErrors.set(
+          sessionId,
+          'Session error after failed model fallback (auth/model unavailable)',
+        );
       }
     } else if (sessionId) {
       // Child subagent sessions are not orchestrators, so the block
@@ -662,6 +697,33 @@ export async function handleEvent(
       const props = input.event.properties as { error?: unknown } | undefined;
       if (deps.options.isFallbackInProgress?.(sessionId)) return;
       const job = observation?.job ?? deps.backgroundJobBoard.get(sessionId);
+      // This router sees session.error BEFORE ForegroundFallbackManager
+      // does (event-hook dispatch order in src/index.ts), so the
+      // isFallbackInProgress guard above cannot cover the fallback this
+      // error is about to trigger. Reconciling a failover-worthy error
+      // now would publish it to the parent while the fallback re-prompt
+      // is still coming: the substituted run's result is delivered
+      // through the observation handoff, which only arms while the
+      // record is still 'running' (fallback-observation-transfer prepare
+      // guard) — an early terminal state orphans the retried run's
+      // result. Defer instead, mirroring the managed branch's 401/410
+      // contract: live busy from the re-prompt clears the deferral; an
+      // idle without recovery terminalizes the deferred error, so the
+      // parent still sees the failure.
+      if (
+        job &&
+        job.state === 'running' &&
+        props?.error &&
+        isFailoverError(props.error) &&
+        deps.options.willAttemptFallback?.(sessionId)
+      ) {
+        deps.deferredInlineErrors.set(
+          sessionId,
+          structuredErrorMessage(props.error) ?? 'Session error',
+        );
+        return;
+      }
+      deps.deferredInlineErrors.delete(sessionId);
       if (job && job.state === 'running') {
         // This is a final synchronous generation check, not a claim that
         // updateStatus is a CAS operation; the store API cannot provide that.
@@ -718,8 +780,9 @@ export async function handleEvent(
     // timer; clearIdleTimers handles the child timer.
     if (sessionId) {
       deps.idleReconciler.clearIdleTimers(sessionId);
-      // Live busy after a deferred 401/410 means the fallback re-prompt
-      // (or continued work) recovered the session — the error is not final.
+      // Live busy after a deferred failover error means the fallback
+      // re-prompt (or continued work) recovered the session — the error
+      // is not final.
       deps.deferredInlineErrors.delete(sessionId);
     }
     const before = sessionId
@@ -829,6 +892,40 @@ export async function handleEvent(
   const job = deps.backgroundJobBoard.get(sessionId);
   if (!fallbackInProgress || job?.deadlineExceededAt !== undefined) {
     deps.backgroundJobSupervisor?.onSessionDeleted(sessionId);
+  }
+
+  // A deferred failover error awaiting fallback outcome must not vanish
+  // with the session: no idle can fire for it anymore, so the backstop
+  // would never run (the token invalidation above also cancelled any
+  // pending backstop timer).
+  const deferredError = deps.deferredInlineErrors.get(sessionId);
+  if (deferredError !== undefined) {
+    if (fallbackInProgress) {
+      // Fallback teardown: the re-prompt is still coming on the recreated
+      // session. Keep the deferral and re-arm the backstop the invalidation
+      // just cancelled — a landed re-prompt clears both through live busy,
+      // a fallback that never lands still terminalizes the deferred error.
+      if (job && job.state === 'running') {
+        deps.idleReconciler.scheduleDeferredErrorBackstop(
+          sessionId,
+          observedAt,
+          job.generation,
+        );
+      }
+    } else {
+      // Genuine deletion inside the deferral window: publish the deferred
+      // error now (pre-fix behavior published it at session.error time)
+      // before the deletion cleanup drops the record, then clear the
+      // entry. Awaited so the publication lands before the coordinator's
+      // session-deleted cleanup runs.
+      deps.deferredInlineErrors.delete(sessionId);
+      if (job && job.state === 'running') {
+        await deps.terminalGate.reconcile(job, {
+          kind: 'session-error',
+          message: deferredError,
+        });
+      }
+    }
   }
 
   log('[task-session-manager] session.deleted observed', {

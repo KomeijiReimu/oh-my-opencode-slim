@@ -81,6 +81,8 @@ export interface BackgroundJobRecord {
   timedOut: boolean;
   recoverableAfterLiveBusy: boolean;
   statusUncertain: boolean;
+  /** When status became unconfirmable; drives stale-uncertain removal from the board render. */
+  statusUncertainSince?: number;
   cancellationRequested: boolean;
   terminalUnreconciled: boolean;
   launchedAt: number;
@@ -228,6 +230,12 @@ const CANONICAL_TERMINAL_STATES = new Set<TaskOutputState>([
   'error',
   'cancelled',
 ]);
+
+/**
+ * Unconfirmable-runtime age after which a running job leaves the board
+ * render (#1314). No existing stale/TTL constant family fits this scale.
+ */
+export const STATUS_UNCERTAIN_DEMOTE_AFTER_MS = 30 * 60_000;
 
 const AGENT_PREFIX: Record<string, string> = {
   council: 'cou',
@@ -404,6 +412,8 @@ export class BackgroundJobBoard implements BackgroundJobStore {
         timedOut: false,
         recoverableAfterLiveBusy: false,
         statusUncertain: false,
+        // A relaunch starts a fresh episode: no stale demotion clock.
+        statusUncertainSince: undefined,
         cancellationRequested: false,
         terminalUnreconciled: false,
         completedAt: undefined,
@@ -825,6 +835,8 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       recoverableAfterLiveBusy:
         existing.recoverableAfterLiveBusy || existing.timedOut,
       statusUncertain: existing.deadlineExceededAt !== undefined,
+      // A live observation restarts the demotion clock.
+      statusUncertainSince: undefined,
       terminalUnreconciled: false,
       terminalRevision:
         existing.terminalRevision + (existing.state === 'running' ? 0 : 1),
@@ -926,6 +938,12 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     const updated: BackgroundJobRecord = {
       ...existing,
       statusUncertain: true,
+      // Stamp the episode start once; a confirmed observation restarts the
+      // clock on re-entry. Paths flagging uncertainty elsewhere leave the
+      // stamp unset — the renderer falls back to updatedAt.
+      statusUncertainSince: existing.statusUncertain
+        ? (existing.statusUncertainSince ?? now)
+        : now,
       lastStatusError,
       updatedAt: now,
     };
@@ -1558,15 +1576,24 @@ export class BackgroundJobBoard implements BackgroundJobStore {
 
   formatForPromptWithMetadata(
     parentSessionID: string,
-    _now?: number,
+    now = Date.now(),
   ): BackgroundJobPromptMetadata | undefined {
     // Keep placeholders resolvable, but out of every operational section
     // and the corresponding terminal-consumption metadata.
     const jobs = this.list(parentSessionID).filter(
       (job) => job.provisional !== true,
     );
+    // Long-unconfirmable running jobs leave the render (#1314); the store
+    // record survives and a real terminal publication returns the entry.
+    const isStaleUncertain = (job: BackgroundJobRecord) =>
+      job.state === 'running' &&
+      job.statusUncertain &&
+      now - (job.statusUncertainSince ?? job.updatedAt) >=
+        STATUS_UNCERTAIN_DEMOTE_AFTER_MS;
     const active = jobs.filter(
-      (job) => job.state === 'running' || job.terminalUnreconciled,
+      (job) =>
+        (job.state === 'running' || job.terminalUnreconciled) &&
+        !isStaleUncertain(job),
     );
     // listReusable predates the provisional provenance contract and is
     // unaware of it: without this filter a reconciled completed

@@ -14,9 +14,16 @@
  * (agent/tool/mcp/command) stay independently try/catch-guarded.
  */
 
+import path from 'node:path';
+import type { RegistryFactoryBridge } from '../agents/registry-bridge';
+import {
+  buildBundledSkillInfos,
+  removeLegacySkillSyncState,
+} from '../cli/custom-skills';
 import { loadPluginConfig } from '../config/loader';
 import { InterviewConfigSchema } from '../config/schema';
 import { getBuildInfo } from '../generated/build-info';
+import { getCurrentRuntimePackageJsonPath } from '../hooks/auto-update-checker/checker';
 import {
   isTaggedPart,
   isVolatileTaggedMessage,
@@ -39,7 +46,13 @@ import {
 import { INTERNAL_INITIATOR_METADATA_KEY } from '../utils/internal-initiator';
 import { initLogger, log } from '../utils/logger';
 import { createSameProcessResumeEvidence } from '../utils/same-process-resume-evidence';
-import { adaptTool, applyAgentToDraft, v1PermKeyToV2 } from './adapters';
+import { OperationTimeoutError, withTimeout } from '../utils/session';
+import {
+  adaptTool,
+  applyAgentToDraft,
+  snapshotNativeAgentForRegistry,
+  v1PermKeyToV2,
+} from './adapters';
 import {
   buildPluginInput,
   resetClientShimGenerationWarnings,
@@ -59,6 +72,7 @@ import {
   type V2CommandSubmit,
 } from './session-submit';
 import type {
+  V2AgentDraft,
   V2Cleanup,
   V2CommandDefinition,
   V2CommandDraft,
@@ -792,9 +806,15 @@ export function deriveExactPermissionRules(perm: unknown): V2PermissionRule[] {
  * permissions keep governing the child.
  */
 const PERMISSION_RULES_UNAVAILABLE_WARNING =
-  '[v2][permission-rules] ctx.session.update unavailable on this host ' +
-  'context; child session permission rules are not applied';
+  '[v2][permission-rules] child permission bridge disabled: native agent ' +
+  'snapshot and ctx.session.update are required';
+const PERMISSION_IDENTITY_UNAVAILABLE_WARNING =
+  '[v2][permission-rules] child identity unavailable; its permission policy ' +
+  'cannot be verified';
+const PERMISSION_RULES_OPERATION_TIMEOUT_MS = 5_000;
+const MAX_PENDING_PERMISSION_UPDATES = 128;
 let permissionRulesUnavailableWarned = false;
+let permissionIdentityUnavailableWarned = false;
 
 /**
  * Rearm the one-time degradation warnings for a new setup generation.
@@ -808,6 +828,7 @@ let permissionRulesUnavailableWarned = false;
 export function resetV2GenerationWarnings(): void {
   modelRequestOrderingWarned = false;
   permissionRulesUnavailableWarned = false;
+  permissionIdentityUnavailableWarned = false;
   resetClientShimGenerationWarnings();
 }
 
@@ -820,9 +841,37 @@ export interface V2PermissionRulesOptions {
    * whose agent is not in this set was not spawned by the plugin's task
    * pipeline and must never have its session rules replaced. */
   pluginAgents: ReadonlySet<string>;
+  /** Marketplace child policies are a security ceiling: prompt admission
+   * must not proceed until the session identity is known and its rules have
+   * been installed. Baseline configured agents retain fail-soft behavior. */
+  requireKnownIdentity?: boolean | (() => boolean);
+  /** Canonical and visible identities owned by finalized marketplace agents. */
+  marketplaceAgentNames?: () => ReadonlySet<string>;
+  /** All finalized host/plugin agent identities, including foreign agents. */
+  knownAgentNames?: () => ReadonlySet<string>;
   /** Injectable degradation sink (tests observe the one-time warning
    * without mocking the logger). */
   onUnavailable?: () => void;
+}
+
+type PermissionIdentityState = 'managed' | 'unmanaged' | 'unknown';
+type PermissionSessionIdentity = {
+  parentKnown: boolean;
+  parentID?: string;
+  agent?: string;
+  state: PermissionIdentityState;
+};
+
+function classifyPermissionIdentity(
+  parentKnown: boolean,
+  parentID: string | undefined,
+  agent: string | undefined,
+  pluginAgents: ReadonlySet<string>,
+): PermissionIdentityState {
+  if (parentKnown && !parentID && agent) return 'unmanaged';
+  if (!parentKnown || !agent) return 'unknown';
+  if (!parentID) return 'unknown';
+  return pluginAgents.has(agent) ? 'managed' : 'unmanaged';
 }
 
 /**
@@ -837,7 +886,7 @@ export interface V2PermissionRulesOptions {
  * child's agent is plugin-defined — the v2-local equivalent of the
  * event-router's `shouldManageSession(parent)` gate, since session agent
  * metadata lives inside the v1 factory), installs the child agent's
- * task-policy as session-scoped exact-match rules via
+ * task-policy as ordered session-scoped rules via
  * `session.update({sessionID, permissions})` exactly once per sessionID
  * (duplicate event delivery is idempotent).
  *
@@ -852,17 +901,181 @@ export function createPermissionRulesBridge(
   session: V2Context['session'] | undefined,
   options: V2PermissionRulesOptions,
 ): {
-  /** Observe one raw v2 event; applies rules when it is a
-   * plugin-managed child `session.created`. Never throws. */
+  /** Observe one raw event, cache identity before any awaited permission
+   * projection, and invalidate stale session identities. Never throws. */
+  observeEvent(event: Record<string, unknown>): Promise<void>;
+  /** Compatibility seam for focused bridge tests and child creation paths. */
   observeSessionCreated(event: Record<string, unknown>): Promise<void>;
+  /** Reclassify identities observed before the finalized plugin-agent roster
+   * was available, and apply rules for newly recognized managed children. */
+  refreshPluginAgents(): Promise<void> | undefined;
+  /** Cache-first prompt barrier. Unknown identities degrade if lookup is
+   * unavailable; known managed identities fail closed on update failures.
+   * Marketplace setups also require identity and policy resolution. */
+  ensurePromptPermission(sessionID: string): Promise<void>;
+  dispose(): Promise<void>;
 } {
   /** sessionIDs whose rules application was handled (strictly once per
    * child; FIFO-bounded like every per-session bridge map). */
   const applied = new Map<string, true>();
+  const identities = new Map<string, PermissionSessionIdentity | null>();
+  const pendingIdentityLookups = new Map<
+    string,
+    { invalidated: boolean; operation?: Promise<void> }
+  >();
+  const applying = new Map<
+    string,
+    { operation: Promise<void>; timedOut: boolean }
+  >();
+  let disposed = false;
+  let disposal: Promise<void> | undefined;
+
+  function cacheIdentity(
+    sessionID: string,
+    identity: PermissionSessionIdentity | null,
+    lookup?: { invalidated: boolean; operation?: Promise<void> },
+  ): void {
+    const pendingLookup = pendingIdentityLookups.get(sessionID);
+    if (pendingLookup && pendingLookup !== lookup) {
+      pendingLookup.invalidated = true;
+    }
+    identities.set(sessionID, identity);
+    pruneSessionMap(identities);
+  }
+
+  function identityFromPayload(
+    payload: Record<string, unknown>,
+    mode: 'created' | 'lookup' | 'selected',
+    previous?: PermissionSessionIdentity | null,
+  ): PermissionSessionIdentity {
+    const parentProvided = Object.hasOwn(payload, 'parentID');
+    const parentKnown =
+      mode === 'created' ||
+      mode === 'lookup' ||
+      parentProvided ||
+      previous?.parentKnown === true;
+    const parentValue = parentProvided
+      ? payload.parentID
+      : mode === 'lookup'
+        ? undefined
+        : previous?.parentID;
+    const parentID =
+      typeof parentValue === 'string' && parentValue ? parentValue : undefined;
+    const agentValue = payload.agent ?? previous?.agent;
+    const agent =
+      typeof agentValue === 'string' && agentValue ? agentValue : undefined;
+    return {
+      parentKnown,
+      ...(parentID ? { parentID } : {}),
+      ...(agent ? { agent } : {}),
+      state: classifyPermissionIdentity(
+        parentKnown,
+        parentID,
+        agent,
+        options.pluginAgents,
+      ),
+    };
+  }
+
+  function warnUnknownIdentity(): void {
+    if (permissionIdentityUnavailableWarned) return;
+    permissionIdentityUnavailableWarned = true;
+    log(PERMISSION_IDENTITY_UNAVAILABLE_WARNING);
+  }
+
+  function rejectUnknownIdentity(): never {
+    warnUnknownIdentity();
+    throw new Error(
+      'child session identity is unknown; prompt blocked until its permission policy is installed',
+    );
+  }
+
+  function marketplacePolicyRequired(): boolean {
+    return typeof options.requireKnownIdentity === 'function'
+      ? options.requireKnownIdentity()
+      : options.requireKnownIdentity === true;
+  }
+
+  function isClassifiedAgent(agent: string | undefined): boolean {
+    return Boolean(
+      agent &&
+        (options.pluginAgents.has(agent) ||
+          options.knownAgentNames?.().has(agent)),
+    );
+  }
+
+  function rejectDirectRootMarketplaceAgent(
+    identity: PermissionSessionIdentity,
+  ): never {
+    throw new Error(
+      `direct root marketplace agent '${identity.agent}' cannot be admitted because its permission ceiling cannot be enforced without replacing root session permissions`,
+    );
+  }
+
+  function rejectDirectRootMarketplaceAgentIfNeeded(
+    identity: PermissionSessionIdentity,
+  ): void {
+    if (
+      identity.parentKnown &&
+      !identity.parentID &&
+      identity.agent &&
+      options.marketplaceAgentNames?.().has(identity.agent)
+    ) {
+      rejectDirectRootMarketplaceAgent(identity);
+    }
+  }
 
   async function applyChildSessionRules(
     sessionID: string,
     agent: string,
+    identity: PermissionSessionIdentity,
+  ): Promise<void> {
+    if (disposed) {
+      throw new Error('permission rules bridge is disposed');
+    }
+    if (applied.has(sessionID)) return;
+    const inFlight = applying.get(sessionID);
+    if (inFlight) {
+      return await withTimeout(
+        inFlight.operation,
+        PERMISSION_RULES_OPERATION_TIMEOUT_MS,
+        'Child permission update timed out',
+      );
+    }
+    if (applying.size >= MAX_PENDING_PERMISSION_UPDATES) {
+      throw new Error('too many unresolved child permission updates');
+    }
+    const task = { operation: Promise.resolve(), timedOut: false };
+    task.operation = applyRules(sessionID, agent, identity, task);
+    applying.set(sessionID, task);
+    // Observe raw completion independently of the bounded admission wait.
+    // A timed-out host call stays in the map until it really settles so a
+    // duplicate never issues a second write over an unresolved original.
+    void task.operation.then(
+      () => {
+        if (applying.get(sessionID) === task) applying.delete(sessionID);
+      },
+      () => {
+        if (applying.get(sessionID) === task) applying.delete(sessionID);
+      },
+    );
+    try {
+      await withTimeout(
+        task.operation,
+        PERMISSION_RULES_OPERATION_TIMEOUT_MS,
+        'Child permission update timed out',
+      );
+    } catch (err) {
+      if (err instanceof OperationTimeoutError) task.timedOut = true;
+      throw err;
+    }
+  }
+
+  async function applyRules(
+    sessionID: string,
+    agent: string,
+    identity: PermissionSessionIdentity,
+    attempt: { operation: Promise<void>; timedOut: boolean },
   ): Promise<void> {
     const updateFn = session?.update;
     if (typeof updateFn !== 'function') {
@@ -873,16 +1086,35 @@ export function createPermissionRulesBridge(
           (() => log(PERMISSION_RULES_UNAVAILABLE_WARNING))
         )();
       }
-      return;
+      throw new Error('ctx.session.update unavailable');
     }
-    const rules = deriveExactPermissionRules(options.permissionForAgent(agent));
+    const permission = options.permissionForAgent(agent);
+    if (permission === undefined) {
+      throw new Error(`permission policy unavailable for agent '${agent}'`);
+    }
+    const rules = Array.isArray(permission)
+      ? permission.filter(
+          (rule): rule is V2PermissionRule =>
+            isRecord(rule) &&
+            typeof rule.action === 'string' &&
+            typeof rule.resource === 'string' &&
+            (rule.effect === 'allow' ||
+              rule.effect === 'ask' ||
+              rule.effect === 'deny'),
+        )
+      : deriveExactPermissionRules(permission);
     if (rules.length === 0) {
-      // Nothing in the task-policy is expressible as an exact match
-      // (wildcard-only shapes: the `'*'` catch-all key alone, or
-      // wildcard-suffixed MCP keys): an empty replace would add nothing
-      // over the static agent permissions, so skip the host call.
+      // Legacy permission maps may contain only wildcard-only shapes; an
+      // empty replace would add nothing over static agent permissions.
       // Marked handled here — an empty derivation is a final
       // answer that cannot change between duplicate events.
+      if (
+        disposed ||
+        attempt.timedOut ||
+        identities.get(sessionID) !== identity
+      ) {
+        throw new Error('permission identity changed before policy completion');
+      }
       applied.set(sessionID, true);
       pruneSessionMap(applied);
       log(
@@ -891,7 +1123,21 @@ export function createPermissionRulesBridge(
       );
       return;
     }
-    await updateFn({ sessionID, permissions: rules });
+    if (
+      disposed ||
+      attempt.timedOut ||
+      identities.get(sessionID) !== identity
+    ) {
+      throw new Error('permission identity changed before policy update');
+    }
+    await updateFn.call(session, { sessionID, permissions: rules });
+    if (
+      disposed ||
+      attempt.timedOut ||
+      identities.get(sessionID) !== identity
+    ) {
+      throw new Error('permission update settled after its barrier expired');
+    }
     // Latch only after the host call resolves: a rejected call leaves
     // the slot free, so a replayed or duplicate session.created retries
     // instead of stranding the child on inherited session rules
@@ -899,41 +1145,247 @@ export function createPermissionRulesBridge(
     // same replace payload — idempotent on the host side.
     applied.set(sessionID, true);
     pruneSessionMap(applied);
-    log('[v2][permission-rules] applied exact-match rules to child session', {
+    log('[v2][permission-rules] applied compiled rules to child session', {
       sessionID,
       agent,
       count: rules.length,
     });
   }
 
-  return {
-    async observeSessionCreated(event) {
-      try {
-        if (!isRecord(event) || event.type !== 'session.created') return;
-        // Same payload resolution as the event adapter: live hosts carry
-        // the payload under `data`; `properties` is the legacy spelling.
-        const payload = isRecord(event.data)
-          ? event.data
-          : isRecord(event.properties)
-            ? event.properties
-            : {};
-        const sessionID = payload.sessionID;
-        const parentID = payload.parentID;
-        const agent = payload.agent;
-        if (typeof sessionID !== 'string' || !sessionID) return;
-        // Root sessions never qualify — `permissions` REPLACES the
-        // session's scoped list, so an unrelated session must not be
-        // touched.
-        if (typeof parentID !== 'string' || !parentID) return;
-        if (applied.has(sessionID)) return;
-        if (typeof agent !== 'string' || !options.pluginAgents.has(agent)) {
-          return;
-        }
-        await applyChildSessionRules(sessionID, agent);
-      } catch (err) {
-        // Fail-soft: the event pump must keep flowing.
-        log('[v2][permission-rules] bridge failed', String(err));
+  async function enforceKnownIdentity(
+    sessionID: string,
+    identity: PermissionSessionIdentity | null | undefined,
+  ): Promise<void> {
+    if (identity?.state !== 'managed' || !identity.agent) return;
+    await applyChildSessionRules(sessionID, identity.agent, identity);
+  }
+
+  function readEventPayload(
+    event: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return isRecord(event.data)
+      ? event.data
+      : isRecord(event.properties)
+        ? event.properties
+        : {};
+  }
+
+  async function observeEvent(event: Record<string, unknown>): Promise<void> {
+    try {
+      if (!isRecord(event) || typeof event.type !== 'string') return;
+      const payload = readEventPayload(event);
+      const sessionID =
+        typeof payload.sessionID === 'string'
+          ? payload.sessionID
+          : typeof payload.id === 'string'
+            ? payload.id
+            : undefined;
+      if (!sessionID) return;
+
+      if (event.type === 'session.deleted') {
+        cacheIdentity(sessionID, null);
+        applied.delete(sessionID);
+        return;
       }
+
+      if (
+        event.type !== 'session.created' &&
+        event.type !== 'session.agent.selected'
+      ) {
+        return;
+      }
+      const previous = identities.get(sessionID);
+      const identity = identityFromPayload(
+        payload,
+        event.type === 'session.created' ? 'created' : 'selected',
+        previous,
+      );
+      const unchanged =
+        event.type === 'session.created' &&
+        previous !== undefined &&
+        previous !== null &&
+        previous.parentKnown === identity.parentKnown &&
+        previous.parentID === identity.parentID &&
+        previous.agent === identity.agent &&
+        previous.state === identity.state;
+      const nextIdentity = unchanged ? previous : identity;
+      if (!unchanged) {
+        cacheIdentity(sessionID, nextIdentity);
+        applied.delete(sessionID);
+      }
+      await enforceKnownIdentity(sessionID, nextIdentity);
+    } catch (err) {
+      // The event pump stays fail-soft; a later prompt or duplicate event may
+      // retry a rejected/expired projection.
+      log('[v2][permission-rules] bridge failed', String(err));
+    }
+  }
+
+  async function ensurePromptPermission(sessionID: string): Promise<void> {
+    if (disposed) throw new Error('permission rules bridge is disposed');
+    const initialIdentity = identities.get(sessionID);
+    if (initialIdentity)
+      rejectDirectRootMarketplaceAgentIfNeeded(initialIdentity);
+    if (initialIdentity?.state === 'managed') {
+      await enforceKnownIdentity(sessionID, initialIdentity);
+      return;
+    }
+    if (initialIdentity?.state === 'unmanaged') {
+      if (
+        marketplacePolicyRequired() &&
+        initialIdentity.parentID &&
+        !isClassifiedAgent(initialIdentity.agent)
+      ) {
+        rejectUnknownIdentity();
+      }
+      return;
+    }
+
+    const getSession = session?.get;
+    if (typeof getSession !== 'function') {
+      // Marketplace roots cannot be distinguished from ordinary roots
+      // without an observed identity or a host lookup, so unknown prompts
+      // fail closed once marketplace policy is active.
+      if (
+        marketplacePolicyRequired() &&
+        (!initialIdentity ||
+          initialIdentity.state === 'unknown' ||
+          Boolean(initialIdentity.parentID))
+      ) {
+        rejectUnknownIdentity();
+      }
+      warnUnknownIdentity();
+      return;
+    }
+    let pendingLookup = pendingIdentityLookups.get(sessionID);
+    if (!pendingLookup) {
+      if (pendingIdentityLookups.size >= MAX_PENDING_PERMISSION_UPDATES) {
+        if (marketplacePolicyRequired()) rejectUnknownIdentity();
+        warnUnknownIdentity();
+        return;
+      }
+      pendingLookup = { invalidated: false };
+      pendingIdentityLookups.set(sessionID, pendingLookup);
+      const lookup = pendingLookup;
+      lookup.operation = (async () => {
+        try {
+          const response = await withTimeout(
+            getSession.call(session, { sessionID }),
+            PERMISSION_RULES_OPERATION_TIMEOUT_MS,
+            'Child session identity lookup timed out',
+          );
+          if (lookup.invalidated || disposed) return;
+          const record =
+            isRecord(response) && isRecord(response.data)
+              ? response.data
+              : response;
+          if (
+            !isRecord(record) ||
+            (!Object.hasOwn(record, 'parentID') &&
+              typeof record.agent !== 'string')
+          ) {
+            if (marketplacePolicyRequired()) rejectUnknownIdentity();
+            warnUnknownIdentity();
+            return;
+          }
+          const identity = identityFromPayload(record, 'lookup');
+          cacheIdentity(sessionID, identity, lookup);
+        } catch (err) {
+          if (!lookup.invalidated) {
+            if (marketplacePolicyRequired()) rejectUnknownIdentity();
+            warnUnknownIdentity();
+            log(
+              '[v2][permission-rules] session identity lookup failed',
+              String(err),
+            );
+          }
+        } finally {
+          if (pendingIdentityLookups.get(sessionID) === lookup) {
+            pendingIdentityLookups.delete(sessionID);
+          }
+        }
+      })();
+    }
+    await pendingLookup.operation;
+    if (disposed) throw new Error('permission rules bridge is disposed');
+    const current = identities.get(sessionID);
+    if (current) rejectDirectRootMarketplaceAgentIfNeeded(current);
+    if (current?.state === 'managed') {
+      await enforceKnownIdentity(sessionID, current);
+    } else if (
+      current?.state === 'unknown' ||
+      current === null ||
+      !current ||
+      (marketplacePolicyRequired() &&
+        current.parentID !== undefined &&
+        !isClassifiedAgent(current.agent))
+    ) {
+      if (marketplacePolicyRequired()) rejectUnknownIdentity();
+      warnUnknownIdentity();
+    }
+  }
+
+  function refreshPluginAgents(): Promise<void> | undefined {
+    const newlyManaged: Array<[string, PermissionSessionIdentity]> = [];
+    for (const [sessionID, identity] of identities) {
+      if (!identity) continue;
+      const state = classifyPermissionIdentity(
+        identity.parentKnown,
+        identity.parentID,
+        identity.agent,
+        options.pluginAgents,
+      );
+      if (state === identity.state) continue;
+      const updated = { ...identity, state };
+      identities.set(sessionID, updated);
+      if (state === 'managed') newlyManaged.push([sessionID, updated]);
+    }
+    if (newlyManaged.length === 0) return;
+    return Promise.all(
+      newlyManaged.map(async ([sessionID, identity]) => {
+        try {
+          await enforceKnownIdentity(sessionID, identity);
+        } catch (err) {
+          // The later prompt barrier retries a failed child rules update.
+          log('[v2][permission-rules] deferred child projection failed', {
+            sessionID,
+            err: String(err),
+          });
+        }
+      }),
+    ).then(() => undefined);
+  }
+
+  return {
+    observeEvent,
+    observeSessionCreated: observeEvent,
+    ensurePromptPermission,
+    refreshPluginAgents,
+    dispose() {
+      if (disposal) return disposal;
+      disposed = true;
+      const active = [...applying.values()];
+      disposal = withTimeout(
+        Promise.allSettled(active.map((attempt) => attempt.operation)).then(
+          () => undefined,
+        ),
+        PERMISSION_RULES_OPERATION_TIMEOUT_MS,
+        'Timed out draining child permission updates during shutdown',
+      )
+        .catch((err) => {
+          for (const attempt of active) attempt.timedOut = true;
+          log(
+            '[v2][permission-rules] bounded shutdown drain ended',
+            String(err),
+          );
+        })
+        .then(() => {
+          applying.clear();
+          identities.clear();
+          pendingIdentityLookups.clear();
+          applied.clear();
+        });
+      return disposal;
     },
   };
 }
@@ -1426,7 +1878,27 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
     const disposers: Array<() => Promise<void> | void> = [];
     const sameProcessResumeEvidence = createSameProcessResumeEvidence();
     disposers.push(() => sameProcessResumeEvidence.dispose());
+    let generationDisposed = false;
+    let stopPermissionPromptAdmission: (() => Promise<void>) | undefined;
+    let stopPermissionEventIntake: (() => Promise<void>) | undefined;
     let v1Hooks: Record<string, unknown> | undefined;
+    let registryBridge: RegistryFactoryBridge | undefined;
+
+    const boundedPermissionStop = (
+      stop: () => Promise<void> | void,
+      message: string,
+    ): (() => Promise<void>) => {
+      let stopping: Promise<void> | undefined;
+      return () => {
+        if (stopping) return stopping;
+        stopping = withTimeout(
+          Promise.resolve().then(stop),
+          PERMISSION_RULES_OPERATION_TIMEOUT_MS,
+          message,
+        );
+        return stopping;
+      };
+    };
 
     // ── Storage domain (optional): background-job persistence ──
     // Configured BEFORE the v1 factory runs so board/ledger creation
@@ -1495,6 +1967,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       v1Hooks = (await OhMyOpenCodeLite(
         pluginInput as never,
       )) as unknown as Record<string, unknown>;
+      registryBridge = v1Hooks.registryBridge as RegistryFactoryBridge;
       log('[v2] v1 factory initialized', {
         agents: Object.keys((v1Hooks as { agent?: object }).agent ?? {}).length,
         tools: Object.keys((v1Hooks as { tool?: object }).tool ?? {}).length,
@@ -1528,65 +2001,208 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       const interviewBridge = createV2InterviewBridge(ctx, interviewConfig);
       disposers.push(() => interviewBridge.dispose());
 
-      // Resolve agents/commands via the v1 config() hook (model resolution etc.).
+      // Commands do not depend on agent finalization or host state.
       let resolvedAgents: Record<string, Record<string, unknown>> | undefined;
+      let finalizedRegistry:
+        | ReturnType<RegistryFactoryBridge['requireRegistry']>
+        | undefined;
+      let permissionSnapshotReady = false;
+      let permissionSnapshotFailure: Error | undefined;
+      let resolvePermissionSnapshotReady!: () => void;
+      const permissionSnapshotReadiness = new Promise<void>((resolve) => {
+        resolvePermissionSnapshotReady = resolve;
+      });
+      let pendingAgentDraft: V2AgentDraft | undefined;
+      let nativeAgentSnapshot:
+        | {
+            agents: Record<string, Record<string, unknown>>;
+            permissions: Record<string, V2PermissionRule[]>;
+          }
+        | undefined;
+      let permissionRulesBridgeEnabled = false;
+      const pluginAgents = new Set<string>();
+      let marketplaceAgentsRequirePromptPolicy = false;
+      let permissionRulesBridge:
+        | ReturnType<typeof createPermissionRulesBridge>
+        | undefined;
+      let permissionReadiness: Promise<void> | undefined;
       let synthCommands:
         | Record<string, { template?: string; description?: string }>
         | undefined;
-      try {
-        const synth: Record<string, unknown> = {};
-        const configFn = v1Hooks.config as
-          | ((c: Record<string, unknown>) => Promise<void>)
-          | undefined;
-        if (configFn) {
-          await configFn(synth);
-          if (synth.agent && typeof synth.agent === 'object') {
-            resolvedAgents = synth.agent as Record<
-              string,
-              Record<string, unknown>
-            >;
-          }
-          const cmd = synth.command as
-            | Record<string, { template?: string; description?: string }>
-            | undefined;
-          if (cmd) synthCommands = cmd;
+      if (!registryBridge)
+        throw new Error('v1 factory registry bridge is unavailable');
+      const configCommands: Record<string, unknown> = {};
+      registryBridge.prepareCommands(configCommands);
+      const command = configCommands.command as
+        | Record<string, { template?: string; description?: string }>
+        | undefined;
+      if (command) synthCommands = command;
+
+      // Read configured namespaces from the MCP transform draft, before
+      // finalizing agent permissions. `mcp.list()` would describe live
+      // connections, not the configured namespace inventory.
+      const mcps = (v1Hooks.mcp ?? {}) as Record<string, McpConfig>;
+      let hostMcpSnapshot: Record<string, unknown> | undefined;
+
+      const finalizeAgentDraft = (draft: V2AgentDraft) => {
+        if (permissionSnapshotFailure) return;
+        if (
+          hostMcpSnapshot === undefined ||
+          nativeAgentSnapshot === undefined
+        ) {
+          return;
         }
+        const registry =
+          finalizedRegistry ??
+          registryBridge.finalize(
+            { agent: nativeAgentSnapshot.agents, mcp: hostMcpSnapshot },
+            nativeAgentSnapshot.permissions,
+          );
+        finalizedRegistry = registry;
+        marketplaceAgentsRequirePromptPolicy =
+          registry.marketplaceAgentNames.length > 0;
+        // Deferred agent finalization is the first point where marketplace
+        // agents are known. Latch capability failures for the readiness barrier.
+        if (
+          registry.marketplaceAgentNames.length &&
+          typeof ctx.session.update !== 'function'
+        ) {
+          permissionSnapshotFailure = new Error(
+            'Marketplace agents require ctx.session.update to enforce child permission ceilings',
+          );
+          resolvePermissionSnapshotReady();
+          return;
+        }
+        resolvedAgents = registry.getSdkAgentProjection() as Record<
+          string,
+          Record<string, unknown>
+        >;
+        pluginAgents.clear();
+        for (const name of Object.keys(resolvedAgents)) pluginAgents.add(name);
+        if (permissionRulesBridge) {
+          permissionReadiness = permissionRulesBridge.refreshPluginAgents();
+        }
+        for (const [name, cfg] of Object.entries(resolvedAgents)) {
+          if (
+            !registry.agentNames.includes(name) &&
+            !Object.hasOwn(registry.identities, name)
+          )
+            continue;
+          applyAgentToDraft(
+            draft,
+            name,
+            cfg,
+            registry.nativePolicies[name]?.rules,
+          );
+        }
+        if (resolvedAgents.orchestrator) {
+          try {
+            draft.default(registry.identities.orchestrator ?? 'orchestrator');
+          } catch {
+            /* default() optional */
+          }
+        }
+        permissionSnapshotReady = true;
+        resolvePermissionSnapshotReady();
+      };
+      const captureAgentDraft = (draft: V2AgentDraft) => {
+        if (permissionSnapshotFailure) {
+          if (generationDisposed) {
+            throw new Error(
+              'Agent transform callback belongs to a retired generation',
+            );
+          }
+          return;
+        }
+        pendingAgentDraft = draft;
+        try {
+          if (!nativeSnapshotCaptured) {
+            const nativeByAgent: Record<string, V2PermissionRule[]> = {};
+            const hostAgents: Record<string, Record<string, unknown>> = {};
+            const listedAgents = draft.list();
+            if (!Array.isArray(listedAgents)) {
+              throw new Error('agent transform did not expose a native list');
+            }
+            for (const listed of listedAgents) {
+              const name = typeof listed.id === 'string' ? listed.id : '';
+              if (!name) continue;
+              const native = draft.get(name) ?? listed;
+              if (!Array.isArray(native.permissions)) {
+                throw new Error(
+                  `Native agent '${name}' did not expose a permissions array`,
+                );
+              }
+              const snapshot = snapshotNativeAgentForRegistry(native);
+              hostAgents[name] = snapshot.config;
+              nativeByAgent[name] = snapshot.permissions;
+            }
+            nativeAgentSnapshot = {
+              agents: hostAgents,
+              permissions: nativeByAgent,
+            };
+            nativeSnapshotCaptured = true;
+          }
+          finalizeAgentDraft(draft);
+        } catch (error) {
+          if (generationDisposed) throw error;
+          permissionSnapshotFailure =
+            error instanceof Error ? error : new Error(String(error));
+          resolvePermissionSnapshotReady();
+        }
+      };
+      try {
+        if (typeof ctx.mcp?.transform !== 'function') {
+          throw new Error('MCP configuration draft is unavailable');
+        }
+        const reg = await ctx.mcp.transform((draft) => {
+          const configured = draft.list();
+          if (!Array.isArray(configured)) {
+            throw new Error('MCP configuration draft returned no inventory');
+          }
+          hostMcpSnapshot = Object.fromEntries(configured);
+          for (const [name, config] of Object.entries(mcps)) {
+            draft.set(name, adaptMcpServer(config));
+          }
+          if (pendingAgentDraft) finalizeAgentDraft(pendingAgentDraft);
+        });
+        disposers.push(() => reg.dispose());
       } catch (err) {
-        log(
-          '[v2] config() hook failed (continuing with raw agents)',
-          String(err),
+        throw new Error(
+          'Unable to snapshot configured MCP namespaces: this host cannot ' +
+            'expose configured MCP namespaces; update to a supported v2 host',
+          { cause: err },
         );
-      }
-      if (!resolvedAgents) {
-        resolvedAgents =
-          (v1Hooks.agent as Record<string, Record<string, unknown>>) ?? {};
       }
 
       // ── Agents ──
+      let nativeSnapshotCaptured = false;
       try {
-        const reg = await ctx.agent.transform((draft) => {
-          for (const [name, cfg] of Object.entries(resolvedAgents ?? {})) {
-            try {
-              applyAgentToDraft(draft, name, cfg);
-            } catch (err) {
-              log('[v2] agent adapt failed', { name, err: String(err) });
-            }
-          }
-          // Make orchestrator the default primary agent.
-          if (resolvedAgents?.orchestrator) {
-            try {
-              draft.default('orchestrator');
-            } catch {
-              /* default() optional */
-            }
-          }
-        });
+        const reg = await ctx.agent.transform(captureAgentDraft);
         disposers.push(() => reg.dispose());
+        if (permissionSnapshotFailure) {
+          if (
+            permissionSnapshotFailure.message.startsWith(
+              'Marketplace agents require ctx.session.update',
+            )
+          ) {
+            throw permissionSnapshotFailure;
+          }
+          throw new Error('Agent permission snapshot finalization failed', {
+            cause: permissionSnapshotFailure,
+          });
+        }
         log('[v2] agents registered', {
           count: Object.keys(resolvedAgents ?? {}).length,
         });
       } catch (err) {
-        log('[v2] agent.transform failed', String(err));
+        registryBridge.retire();
+        throw err;
+      }
+
+      permissionRulesBridgeEnabled = typeof ctx.session.update === 'function';
+      if (!permissionRulesBridgeEnabled && !permissionRulesUnavailableWarned) {
+        permissionRulesUnavailableWarned = true;
+        log(PERMISSION_RULES_UNAVAILABLE_WARNING);
       }
 
       // ── Tools ──
@@ -1636,28 +2252,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         log('[v2] tool.transform failed', String(err));
       }
 
-      // ── Built-in MCPs (ctx.mcp.transform, v2 ≥ #45408) ──
-      try {
-        const mcps = (v1Hooks.mcp ?? {}) as Record<string, McpConfig>;
-        const entries = Object.entries(mcps);
-        if (entries.length > 0 && typeof ctx.mcp?.transform === 'function') {
-          const reg = await ctx.mcp.transform((draft) => {
-            for (const [name, cfg] of entries) {
-              try {
-                draft.set(name, adaptMcpServer(cfg));
-              } catch (err) {
-                log('[v2] mcp adapt failed', { name, err: String(err) });
-              }
-            }
-          });
-          disposers.push(() => reg.dispose());
-          log('[v2] mcp servers registered', { count: entries.length });
-        } else if (entries.length > 0) {
-          log('[v2] ctx.mcp.transform unavailable; MCPs stay config-only');
-        }
-      } catch (err) {
-        log('[v2] mcp.transform failed', String(err));
-      }
+      log('[v2] mcp servers registered', { count: Object.keys(mcps).length });
 
       // ── Commands (deepwork / reflect / loop slash commands) ──
       try {
@@ -1691,6 +2286,70 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         disposers.push(() => reg.dispose());
       } catch (err) {
         log('[v2] interview command registration failed', String(err));
+      }
+
+      // ── Bundled skills (ctx.skill.transform — in-process, never disk-copied) ──
+      try {
+        if (typeof ctx.skill?.transform === 'function') {
+          const runtimePackageJson = getCurrentRuntimePackageJsonPath();
+          if (!runtimePackageJson) {
+            log(
+              '[v2] bundled skill registration skipped: runtime package.json unresolved',
+            );
+          } else {
+            const packageRoot = path.dirname(runtimePackageJson);
+            const disabled = [
+              ...(loadPluginConfig(directory).disabled_skills ?? []),
+            ];
+            const infos = buildBundledSkillInfos(packageRoot, disabled);
+            if (infos.length === 0) {
+              log(
+                '[v2] bundled skill registration produced no skills (check package root)',
+                { packageRoot },
+              );
+            }
+            let registered = false;
+            const reg = await ctx.skill.transform((draft) => {
+              // v1-era drafts expose {source,list}, not add — probe before use.
+              if (typeof draft.add !== 'function') return;
+              for (const info of infos) draft.add(info);
+              registered = true;
+            });
+            if (registered) {
+              if (typeof reg?.dispose === 'function') {
+                disposers.push(() => reg.dispose());
+              }
+              // Retire the legacy disk-copy state only after registration
+              // succeeded, so hosts without a working add() keep their copies.
+              const legacy = removeLegacySkillSyncState(undefined, disabled);
+              if (legacy.kept.length > 0 || legacy.backedUp.length > 0) {
+                log(
+                  '[v2] legacy skill copies: kept customized (shadow the in-process registration), backed up disabled',
+                  { kept: legacy.kept, backedUp: legacy.backedUp },
+                );
+              }
+              if (legacy.manifestUnreadable) {
+                log(
+                  '[v2] legacy skills manifest unreadable — stale copies may shadow registrations; remove ~/.config/opencode/.oh-my-opencode-slim manually',
+                );
+              }
+              log('[v2] bundled skills registered in-process', {
+                count: infos.length,
+                disabled: disabled.length,
+              });
+            } else {
+              log(
+                '[v2] ctx.skill draft lacks add(); bundled skills not registered',
+              );
+            }
+          }
+        } else {
+          log(
+            '[v2] ctx.skill.transform unavailable; bundled skills not registered',
+          );
+        }
+      } catch (err) {
+        log('[v2] bundled skill registration failed', String(err));
       }
 
       // ── Session context hook: command markers + system/messages transforms ──
@@ -1742,8 +2401,38 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
           observeAdmission: (admission) =>
             sameProcessResumeEvidence.observeAdmission(admission),
         });
-        const promptReg = await ctx.session.hook('prompt', bridge.handlePrompt);
-        disposers.push(() => promptReg.dispose());
+        const promptReg = await ctx.session.hook('prompt', async (event) => {
+          if (!permissionSnapshotReady) {
+            await withTimeout(
+              permissionSnapshotReadiness,
+              PERMISSION_RULES_OPERATION_TIMEOUT_MS,
+              'Agent permission snapshot readiness timed out',
+            );
+          }
+          if (permissionSnapshotFailure) {
+            if (
+              permissionSnapshotFailure.message.startsWith(
+                'Marketplace agents require ctx.session.update',
+              )
+            ) {
+              throw permissionSnapshotFailure;
+            }
+            throw new Error('Agent permission snapshot finalization failed', {
+              cause: permissionSnapshotFailure,
+            });
+          }
+          const permissionBridge = permissionRulesBridge;
+          if (permissionBridge) {
+            if (permissionReadiness) await permissionReadiness;
+            await permissionBridge.ensurePromptPermission(event.sessionID);
+          }
+          await bridge.handlePrompt(event);
+        });
+        stopPermissionPromptAdmission = boundedPermissionStop(
+          () => promptReg.dispose(),
+          'Permission prompt hook disposal timed out',
+        );
+        disposers.push(stopPermissionPromptAdmission);
         promptBridge = bridge;
         log('[v2] native session prompt hook registered');
       }
@@ -1872,19 +2561,53 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         if (eventHook || interviewBridge) {
           // ── Per-session permission rules (ctx.session.update) ──
           // Plugin-managed child sessions get their agent's task-policy
-          // installed as session-scoped exact-match rules at creation
+          // installed as ordered session-scoped rules at creation
           // (session.update's `permissions` REPLACES the session-scoped
           // list). Fail-soft inside the bridge; the v1 event dispatch
           // below never depends on it (capability-absent hosts degrade
           // with a one-time deterministic warning).
-          const permissionRulesBridge = createPermissionRulesBridge(
-            ctx.session,
-            {
-              permissionForAgent: (agent) =>
-                resolvedAgents?.[agent]?.permission,
-              pluginAgents: new Set(Object.keys(resolvedAgents ?? {})),
-            },
-          );
+          if (permissionRulesBridgeEnabled) {
+            permissionRulesBridge = createPermissionRulesBridge(ctx.session, {
+              permissionForAgent: (agent) => {
+                return finalizedRegistry?.nativePolicies[agent]?.rules;
+              },
+              pluginAgents,
+              requireKnownIdentity: () => marketplaceAgentsRequirePromptPolicy,
+              marketplaceAgentNames: () => {
+                const registry = finalizedRegistry;
+                if (!registry) return new Set();
+                return new Set(
+                  registry.marketplaceAgentNames.flatMap((name) => [
+                    name,
+                    registry.identities[name] ?? name,
+                  ]),
+                );
+              },
+              knownAgentNames: () => {
+                const names = new Set<string>(pluginAgents);
+                for (const [name, config] of Object.entries(
+                  nativeAgentSnapshot?.agents ?? {},
+                )) {
+                  names.add(name);
+                  if (typeof config.displayName === 'string') {
+                    names.add(config.displayName);
+                  }
+                }
+                const registry = finalizedRegistry;
+                if (registry) {
+                  for (const [name, identity] of Object.entries(
+                    registry.identities,
+                  )) {
+                    names.add(name);
+                    names.add(identity);
+                  }
+                }
+                return names;
+              },
+            });
+            const permissionBridge = permissionRulesBridge;
+            disposers.push(() => permissionBridge.dispose());
+          }
           const iter = ctx.event.subscribe();
           const eventIterator = iter[Symbol.asyncIterator]();
           let eventStopped = false;
@@ -1909,10 +2632,10 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                     if (eventHook) await eventHook({ event: next.value });
                     continue;
                   }
-                  // Child-session permission tightening sees the same RAW
+                  // Child-session permission projection sees the same RAW
                   // event (before v1-shape synthesis) so it is independent
                   // of v1 event-hook presence.
-                  await permissionRulesBridge.observeSessionCreated(next.value);
+                  await permissionRulesBridge?.observeEvent(next.value);
                   if (eventHook) {
                     for (const ev of mapV2EventToV1(next.value)) {
                       await eventHook({ event: ev });
@@ -1926,10 +2649,11 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
               log('[v2] event stream ended', String(err));
             }
           })();
-          disposers.push(async () => {
+          stopPermissionEventIntake = boundedPermissionStop(async () => {
             eventStopped = true;
             await eventIterator.return?.();
-          });
+          }, 'Permission event intake stop timed out');
+          disposers.push(stopPermissionEventIntake);
           log('[v2] event stream subscribed');
         }
       } catch (err) {
@@ -1953,9 +2677,35 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
 
       return async () => {
         log('[v2] dispose invoked');
+        generationDisposed = true;
+        registryBridge?.retire();
+        // Mark disposed immediately, then stop new admissions and event
+        // intake before awaiting the bounded drain. The OpenCode plugin
+        // adapter does not forward AbortSignal; a timed-out host update may
+        // still commit remotely later, but it cannot mark this generation
+        // successful locally.
+        const permissionDrain = permissionRulesBridge?.dispose();
+        for (const stop of [
+          stopPermissionPromptAdmission,
+          stopPermissionEventIntake,
+        ]) {
+          try {
+            if (!stop) continue;
+            await stop();
+          } catch (err) {
+            log('[v2] permission bridge stop failed', String(err));
+          }
+        }
+        await permissionDrain;
         // FIFO is intentional: the success path preserves the historical
         // registration-order teardown; only the abort path unwinds LIFO.
         for (const d of disposers) {
+          if (
+            d === stopPermissionPromptAdmission ||
+            d === stopPermissionEventIntake
+          ) {
+            continue;
+          }
           try {
             await d();
           } catch (err) {
@@ -1973,6 +2723,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         }
       };
     } catch (err) {
+      registryBridge?.retire();
       // Best-effort abort-path cleanup: LIFO over the saved disposers,
       // each isolated so a failing disposer cannot mask the original
       // error, then the v1 dispose hook, then rethrow unchanged.

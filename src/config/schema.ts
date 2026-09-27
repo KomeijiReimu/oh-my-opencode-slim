@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MarketplacePackageIdSchema } from '../marketplace/schemas';
 import {
   AGENT_THEME_COLORS,
   DEFAULT_MAX_RETAINED_SNAPSHOTS,
@@ -341,6 +342,55 @@ export const PresetAgentsSchema = z.record(
 
 export type Preset = z.infer<typeof PresetAgentsSchema>;
 
+const MarketplacePackageIdsSchema = z
+  .array(MarketplacePackageIdSchema)
+  .superRefine((ids, ctx) => {
+    if (new Set(ids).size !== ids.length) {
+      ctx.addIssue({ code: 'custom', message: 'Package IDs must be unique' });
+    }
+  });
+
+export const MarketplaceActivationSchema = z
+  .object({
+    agents: MarketplacePackageIdsSchema.optional(),
+    agents_add: MarketplacePackageIdsSchema.optional().describe(
+      'Package IDs to add to the inherited marketplace agents list after optional agents replacement.',
+    ),
+    agents_remove: MarketplacePackageIdsSchema.optional().describe(
+      'Package IDs to remove after additions; removal wins over addition.',
+    ),
+  })
+  .strict();
+
+export type MarketplaceActivation = z.infer<typeof MarketplaceActivationSchema>;
+
+const MARKETPLACE_ACTIVATION_KEYS = [
+  'agents',
+  'agents_add',
+  'agents_remove',
+] as const;
+
+/**
+ * Flat presets historically allowed an agent named `marketplace`. Treat the
+ * value as activation only when it contains an explicit activation directive;
+ * an empty object remains a valid empty agent override.
+ */
+export function hasMarketplaceActivationDirectives(
+  value: unknown,
+): value is Record<(typeof MARKETPLACE_ACTIVATION_KEYS)[number], unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    MARKETPLACE_ACTIVATION_KEYS.some((key) => Object.hasOwn(value, key))
+  );
+}
+
+const FlatMarketplaceValueSchema = z.union([
+  MarketplaceActivationSchema,
+  AgentOverrideConfigSchema,
+]);
+
 /**
  * Structured preset syntax. The `agents` wrapper is the preferred syntax for
  * new presets; the loader also accepts the inline form below so adding an
@@ -350,18 +400,26 @@ export const PresetDefinitionSchema = z
   .object({
     extends: z.string().min(1).optional(),
     agents: PresetAgentsSchema,
+    marketplace: MarketplaceActivationSchema.optional(),
   })
   .strict();
 
 const InlinePresetDefinitionSchema = z
   .object({
     extends: z.string().min(1),
+    marketplace: FlatMarketplaceValueSchema.optional(),
+  })
+  .catchall(AgentOverrideConfigSchema);
+
+const FlatPresetSchema = z
+  .object({
+    marketplace: FlatMarketplaceValueSchema.optional(),
   })
   .catchall(AgentOverrideConfigSchema);
 
 /** Raw preset syntax accepted in configuration files. */
 export const PresetSchema = z.xor(
-  [PresetDefinitionSchema, InlinePresetDefinitionSchema, PresetAgentsSchema],
+  [PresetDefinitionSchema, InlinePresetDefinitionSchema, FlatPresetSchema],
   {
     error:
       'Preset syntax is ambiguous: use a non-colliding custom agent name instead of an agents wrapper collision.',
@@ -542,6 +600,12 @@ export const BackgroundJobsConfigSchema = z.object({
     .describe(
       'When true, intercept wait_for_user calls made while background tasks are still running and the orchestrator wake scheduler is enabled, returning guidance to end the turn instead of blocking on manual input. Default enabled.',
     ),
+  boardInjection: z
+    .boolean()
+    .default(true)
+    .describe(
+      'When false, the Background Job Board reminder is never injected into prompts. Background task tracking, wake, and task_status all keep working; the orchestrator simply no longer passively sees the board. Default enabled.',
+    ),
   childInputWake: z
     .boolean()
     .default(true)
@@ -594,9 +658,12 @@ export const FailoverConfigSchema = z.preprocess(
         .min(0)
         .default(3)
         .describe(
-          'Number of consecutive 429/rate-limit responses tolerated on the ' +
-            'same model before aborting (or swapping to the next fallback ' +
-            'model when a chain is configured).',
+          'Number of current-model retries allowed before Slim switches to ' +
+            'the next fallback model (or aborts when no chain is configured). ' +
+            'The budget is shared across the whole fallback chain and is not ' +
+            'reset by a model switch; it resets only on a successful ' +
+            'assistant response, session deletion, or a new user turn. 0 ' +
+            'switches immediately.',
         ),
       initialRetryDelayMs: z
         .number()
@@ -813,7 +880,12 @@ export const RawPluginConfigSchema = z
             ? presetRecord.agents
             : Object.fromEntries(
                 Object.entries(presetRecord).filter(
-                  ([name]) => name !== 'extends',
+                  ([name, entry]) =>
+                    name !== 'extends' &&
+                    !(
+                      name === 'marketplace' &&
+                      hasMarketplaceActivationDirectives(entry)
+                    ),
                 ),
               );
         rejectOrchestratorPromptOnOrchestrator(

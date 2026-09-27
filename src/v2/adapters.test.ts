@@ -3,8 +3,10 @@ import { createReadOnlyAgentPermission } from '../agents/permissions';
 import {
   adaptPermissions,
   applyAgentToDraft,
+  compileAgentPermissions,
   parseModelRef,
   rewritePromptForV2,
+  snapshotNativeAgentForRegistry,
 } from './adapters';
 import type { V2AgentDraft } from './types';
 
@@ -136,6 +138,76 @@ describe('adaptPermissions', () => {
   });
 });
 
+describe('compileAgentPermissions', () => {
+  test('native host allow overrides an earlier v1 baseline denial', () => {
+    const rules = compileAgentPermissions(
+      { edit: 'deny' },
+      {
+        hostRules: [{ action: 'edit', resource: '*', effect: 'allow' }],
+      },
+    );
+
+    expect(evaluatePermission(rules, 'edit')).toBe('allow');
+  });
+
+  test('final denials remain after host rules', () => {
+    const rules = compileAgentPermissions(
+      { edit: 'deny' },
+      {
+        hostRules: [{ action: 'edit', resource: '*', effect: 'allow' }],
+        finalDenials: ['edit'],
+      },
+    );
+
+    expect(evaluatePermission(rules, 'edit')).toBe('deny');
+  });
+
+  test('action ceilings remain after host rules', () => {
+    const rules = compileAgentPermissions(
+      { edit: 'deny' },
+      {
+        hostRules: [{ action: 'edit', resource: '*', effect: 'allow' }],
+        ceilings: {
+          actions: { edit: 'deny' },
+          namespaces: [],
+        },
+      },
+    );
+
+    expect(evaluatePermission(rules, 'edit')).toBe('deny');
+  });
+
+  test('preserves native ordered exceptions after the v1 baseline', () => {
+    const rules = compileAgentPermissions(undefined, {
+      hostRules: [
+        { action: 'read', resource: 'src/**', effect: 'deny' },
+        { action: 'read', resource: 'src/public.ts', effect: 'allow' },
+      ],
+    });
+    expect(evaluatePermission(rules, 'read', 'src/private.ts')).toBe('deny');
+    expect(evaluatePermission(rules, 'read', 'src/public.ts')).toBe('allow');
+    expect(evaluatePermission(rules, 'subagent')).toBe('allow');
+  });
+
+  test('applies final denials and action, namespace, and resource ceilings', () => {
+    const rules = compileAgentPermissions(undefined, {
+      hostRules: [{ action: '*', resource: '*', effect: 'allow' }],
+      ceilings: {
+        actions: { read: 'ask' },
+        namespaces: ['context7_*'],
+        namespaceEffects: { 'context7_*': 'deny' },
+        resources: { read: { 'private/**': 'deny' } },
+      },
+      finalDenials: ['execute'],
+    });
+    expect(evaluatePermission(rules, 'read', 'public.ts')).toBe('ask');
+    expect(evaluatePermission(rules, 'read', 'private/key.ts')).toBe('deny');
+    expect(evaluatePermission(rules, 'context7_search')).toBe('deny');
+    expect(evaluatePermission(rules, 'execute')).toBe('deny');
+    expect(evaluatePermission(rules, 'unadmitted_action')).toBe('deny');
+  });
+});
+
 describe('rewritePromptForV2', () => {
   test('rewrites delegation call + param', () => {
     expect(
@@ -216,7 +288,10 @@ describe('applyAgentToDraft', () => {
 
     const request = calls[0].agent.request as Record<string, unknown>;
     expect(
-      Object.hasOwn(request.settings as Record<string, unknown>, 'temperature'),
+      Object.hasOwn(
+        (request.settings as Record<string, unknown> | undefined) ?? {},
+        'temperature',
+      ),
     ).toBe(false);
   });
 
@@ -226,6 +301,111 @@ describe('applyAgentToDraft', () => {
 
     const request = calls[0].agent.request as Record<string, unknown>;
     expect((request.settings as Record<string, unknown>).temperature).toBe(0);
+  });
+
+  test('clears an existing model when the finalized config inherits it', () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const draft: V2AgentDraft = {
+      list: () => [],
+      get: () => undefined,
+      default: () => {},
+      remove: () => {},
+      update: (_id, update) => {
+        const agent: Record<string, unknown> = {
+          model: { providerID: 'old-provider', id: 'old-model' },
+        };
+        update(agent);
+        calls.push(agent);
+      },
+    };
+    applyAgentToDraft(draft, 'a', {});
+
+    expect(calls[0]).not.toHaveProperty('model');
+  });
+
+  test('merges request fields without discarding native sibling values', () => {
+    const existing = {
+      settings: { topP: 0.8, temperature: 0.4 },
+      headers: { authorization: 'host-token', existing: 'yes' },
+      body: { hostValue: true },
+    };
+    const draft: V2AgentDraft = {
+      list: () => [],
+      get: () => undefined,
+      default: () => {},
+      remove: () => {},
+      update: (_id, update) => {
+        const agent: Record<string, unknown> = { request: existing };
+        update(agent);
+        expect(agent.request).toEqual({
+          settings: { topP: 0.8, temperature: 0.2, frequencyPenalty: 0.1 },
+          headers: {
+            authorization: 'host-token',
+            existing: 'yes',
+            extra: 'v1',
+          },
+          body: { hostValue: true, extra: 'v1' },
+        });
+      },
+    };
+    applyAgentToDraft(draft, 'a', {
+      temperature: 0.2,
+      request: {
+        settings: { frequencyPenalty: 0.1 },
+        headers: { extra: 'v1' },
+        body: { extra: 'v1' },
+      },
+    });
+  });
+
+  test('snapshots and reapplies a native agent without flattening permissions', () => {
+    const native = {
+      id: 'native',
+      name: 'Native',
+      description: 'host description',
+      system: 'host system',
+      mode: 'primary',
+      hidden: true,
+      model: { providerID: 'anthropic', id: 'claude', variant: 'thinking' },
+      request: {
+        settings: { temperature: 0.3, topP: 0.9 },
+        headers: { 'x-host': 'kept' },
+        body: { hostOption: true },
+      },
+      permissions: [
+        { action: 'read', resource: 'private/**', effect: 'deny' },
+        { action: 'read', resource: 'public/**', effect: 'allow' },
+      ],
+    };
+    const snapshot = snapshotNativeAgentForRegistry(native);
+    const { draft, calls } = recorder();
+    applyAgentToDraft(draft, 'native', snapshot.config, snapshot.permissions);
+
+    expect(snapshot.config).toMatchObject({
+      model: 'anthropic/claude',
+      variant: 'thinking',
+      prompt: 'host system',
+      mode: 'primary',
+      hidden: true,
+      description: 'host description',
+    });
+    expect(snapshot.config).not.toHaveProperty('permission');
+    expect(snapshot.permissions).toEqual(native.permissions);
+    expect(calls[0].agent).toMatchObject({
+      model: { providerID: 'anthropic', id: 'claude', variant: 'thinking' },
+      system: 'host system',
+      request: {
+        settings: { temperature: 0.3, topP: 0.9 },
+        headers: { 'x-host': 'kept' },
+        body: { hostOption: true },
+      },
+      permissions: native.permissions,
+    });
+  });
+
+  test('model-less native agents do not override configured models', () => {
+    const snapshot = snapshotNativeAgentForRegistry({ id: 'explorer' });
+    expect(snapshot.config).not.toHaveProperty('model');
   });
 
   test('permission deny beats tools-list allow (tools first, last-wins)', () => {

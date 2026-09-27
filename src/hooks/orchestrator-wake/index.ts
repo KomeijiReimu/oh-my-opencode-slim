@@ -709,8 +709,9 @@ export function createOrchestratorWakeScheduler(
    * delivery. */
   const pendingStoppedRecoveries = new Map<string, PendingStoppedRecovery>();
 
-  /** Last terminal-publication wake per parent (epoch ms), for the
-   * `publicationWakeMinIntervalMs` throttle. */
+  /** Last delivered publication wake per parent (epoch ms), for the
+   * `publicationWakeMinIntervalMs` throttle. Direct, timer and waiter
+   * deliveries all consume the window; failed attempts do not. */
   const lastPublicationWakeAt = new Map<string, number>();
 
   type PendingChildInput = {
@@ -1052,7 +1053,11 @@ export function createOrchestratorWakeScheduler(
     return undefined;
   }
 
-  function reportScheduleBlocker(sessionID: string, reason: string): void {
+  function reportScheduleBlocker(
+    sessionID: string,
+    reason: string,
+    trigger?: 'stopped-job-recovery' | 'child-input',
+  ): void {
     let reasons = reportedScheduleBlockers.get(sessionID);
     if (!reasons) {
       reasons = new Set();
@@ -1062,9 +1067,18 @@ export function createOrchestratorWakeScheduler(
         if (oldest !== undefined) reportedScheduleBlockers.delete(oldest);
       }
     }
-    if (reasons.has(reason)) return;
-    reasons.add(reason);
-    log('[orchestrator-wake] backstop not armed', { sessionID, reason });
+    const key = trigger ? `${trigger}:${reason}` : reason;
+    if (reasons.has(key)) return;
+    reasons.add(key);
+    if (trigger) {
+      log('[orchestrator-wake] forced wake blocked', {
+        sessionID,
+        trigger,
+        reason,
+      });
+    } else {
+      log('[orchestrator-wake] backstop not armed', { sessionID, reason });
+    }
   }
 
   function schedule(sessionID: string): void {
@@ -1511,8 +1525,9 @@ export function createOrchestratorWakeScheduler(
    * evaluation actually queued/delivered a wake admission (the
    * promptAsync success path); every vetoed, stale, suppressed, or
    * errored exit resolves false so callers that gate side effects on
-   * delivery (the publication throttle) burn nothing on a no-delivery
-   * evaluation. */
+   * delivery burn nothing on a no-delivery evaluation. The publication
+   * throttle is stamped here so timer and one-flight waiter deliveries
+   * count even when the original trigger returned undelivered. */
   async function evaluate(
     sessionID: string,
     generation: symbol,
@@ -1910,6 +1925,10 @@ export function createOrchestratorWakeScheduler(
       }
       // Delivered: the wake admission was queued and accepted above.
       if (state.generation === generation) state.retryReason = undefined;
+      if (reason === 'publication') {
+        lastPublicationWakeAt.set(sessionID, Date.now());
+        boundTrackedMap(lastPublicationWakeAt);
+      }
       return true;
     } catch (error) {
       // Only accepted sends consume the cap. Preserve the reservation's
@@ -2053,7 +2072,11 @@ export function createOrchestratorWakeScheduler(
       return;
     }
     rearmWakeProgress(sessionID);
-    if (scheduleBlocker(sessionID)) return;
+    const blocker = scheduleBlocker(sessionID);
+    if (blocker) {
+      reportScheduleBlocker(sessionID, blocker, 'stopped-job-recovery');
+      return;
+    }
     const state = touchLocal(sessionID);
     clearTimer(state);
     bumpGeneration(state);
@@ -2079,13 +2102,12 @@ export function createOrchestratorWakeScheduler(
    *   a queued wake would double-notify;
    * - per-parent throttle (`publicationWakeMinIntervalMs`): a burst of
    *   publications collapses into one wake;
-   * - `hasInputWait` / fallback / archived (via canSchedule).
+   * - `hasInputWait` / fallback / archived (via scheduleBlocker).
    *
-   * The throttle window is consumed and the `waking` verdict logged only
-   * AFTER a wake is actually DELIVERED (evaluate resolved true — the
-   * promptAsync admission was accepted). A wake suppressed by
-   * canSchedule or vetoed inside evaluate burns nothing, so the next
-   * eligible publication inside the window still wakes.
+   * The throttle is consumed at publication DELIVERY inside evaluate,
+   * including timer retries and one-flight waiters; vetoed or failed
+   * attempts burn nothing. The `waking` verdict is written only for a
+   * delivery made directly by this trigger (never a retry or waiter).
    *
    * Unlike stopped-job recovery this does NOT rearm the no-progress cap:
    * the publication path enters evaluation past the cap pre-check, and the
@@ -2141,24 +2163,26 @@ export function createOrchestratorWakeScheduler(
     if (localSessions.get(sessionID)?.archived) {
       return;
     }
-    if (
-      scheduleBlocker(sessionID, {
-        // The fingerprint comparison inside evaluate is the authoritative
-        // no-progress test for this path (see the docstring above).
-        ignoreProgressCap: true,
-      })
-    )
+    const blocker = scheduleBlocker(sessionID, {
+      // The fingerprint comparison inside evaluate is the authoritative
+      // no-progress test for this path (see the docstring above).
+      ignoreProgressCap: true,
+    });
+    if (blocker) {
+      log('[orchestrator-wake] terminal publication wake skipped', {
+        sessionID,
+        taskID,
+        generation,
+        trigger: 'terminal-publication',
+        verdict: 'skipped',
+        reason: blocker,
+      });
       return;
-    // Delivered wake: only after `evaluate` actually queued and delivered
-    // a wake admission (promptAsync accepted) is the throttle window
-    // consumed and the wake logged. A publication suppressed by
-    // canSchedule (input wait, fallback in progress) OR vetoed inside
-    // evaluate (no-work classification, unchanged-fingerprint no-progress
-    // stop, lost reservation, SDK error) burns nothing — the next
-    // eligible publication inside the window still wakes — and the
-    // verdict:"waking" count stays an honest delivered-wake count. The
-    // one-flight wake gate dedups concurrent evaluations, so deferring
-    // consumption until after delivery cannot create a wake storm.
+    }
+    // evaluate consumes the throttle on every publication delivery. A
+    // suppressed or failed attempt burns nothing; the one-flight gate
+    // deduplicates concurrent evaluations. Only this direct trigger logs
+    // `waking` (timer/waiter deliveries have no taskID to log here).
     const state = touchLocal(sessionID);
     clearTimer(state);
     bumpGeneration(state);
@@ -2176,8 +2200,6 @@ export function createOrchestratorWakeScheduler(
       trigger: 'terminal-publication',
       verdict: 'waking',
     });
-    lastPublicationWakeAt.set(sessionID, Date.now());
-    boundTrackedMap(lastPublicationWakeAt);
   }
 
   /**
@@ -2218,7 +2240,11 @@ export function createOrchestratorWakeScheduler(
       return;
     }
     rearmWakeProgress(sessionID);
-    if (scheduleBlocker(sessionID)) return;
+    const blocker = scheduleBlocker(sessionID);
+    if (blocker) {
+      reportScheduleBlocker(sessionID, blocker, 'child-input');
+      return;
+    }
     const state = touchLocal(sessionID);
     clearTimer(state);
     bumpGeneration(state);

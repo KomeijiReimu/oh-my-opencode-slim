@@ -189,6 +189,9 @@ function deliverReopenCorrections(
   messages: unknown[],
   baseInfo: MessageWithParts['info'],
 ): void {
+  // Off stops every board-flavored injection, correction notice included
+  // (#1314 thread).
+  if (state.boardInjection === false) return;
   const reported = state.reportedTerminalRunsByParent?.get(parentSessionID);
   if (!reported || reported.size === 0) return;
   for (const [key, run] of reported) {
@@ -248,6 +251,8 @@ export interface InjectionState {
   lifecycleLedger: BackgroundJobLifecycleLedger;
   maxRetainedSnapshots: number;
   strategy: 'latest' | 'checkpoint-compatible';
+  /** When false, the board reminder is never injected (backgroundJobs.boardInjection). */
+  boardInjection?: boolean;
   processedInjectedCompletions: Set<string>;
   processedInjectedCompletionOrder: string[];
   /**
@@ -1376,7 +1381,9 @@ function injectLatestBoard(state: InjectionState, messages: unknown[]): void {
   }
 
   const boardMeta =
-    state.backgroundJobBoard.formatForPromptWithMetadata(sessionID);
+    state.boardInjection === false
+      ? undefined
+      : state.backgroundJobBoard.formatForPromptWithMetadata(sessionID);
   const reminder = boardMeta?.text;
   if (!reminder) return;
 
@@ -1750,7 +1757,9 @@ function injectCheckpointBoard(
   if (canSurface) reconcileConsumedTerminalJobs(state, sessionID, shapeKey);
 
   const boardMeta =
-    state.backgroundJobBoard.formatForPromptWithMetadata(sessionID);
+    state.boardInjection === false
+      ? undefined
+      : state.backgroundJobBoard.formatForPromptWithMetadata(sessionID);
   const reminder = boardMeta?.text;
   const canCreateSnapshot = canSurface && reminder !== undefined;
 

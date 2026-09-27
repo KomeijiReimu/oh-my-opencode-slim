@@ -172,7 +172,7 @@ Balance: respect dependencies, avoid parallelizing what must be sequential, and 
 ${
   wakeSchedulerEnabled
     ? `#### End Turn After Background Tasks
-After spawning all independent background tasks and any remaining non-overlapping work, end the turn immediately with a brief status message. Do not call \`wait_for_user\` to await background task completion — the system notifies you automatically via the Background Job Board when tasks finish, and the orchestrator wake scheduler resumes you. Do not poll for status with repeated tool calls. The correct flow is: launch tasks → brief status → end turn → completion hook or wake scheduler resumes → reconcile results.
+After spawning all independent background tasks and any remaining non-overlapping work, end the turn immediately with a brief status message. Do not call \`wait_for_user\` to await background task completion — the system notifies you automatically via the Background Job Board when tasks finish, and the orchestrator wake scheduler resumes you. Do not poll for status with repeated tool calls. The correct flow is: launch tasks → brief status → end turn → completion hook or wake scheduler resumes → reconcile results. The board itself is ambient status: never restate, quote, or acknowledge it in your visible replies.
 
 `
     : ''

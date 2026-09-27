@@ -3,19 +3,11 @@ import { registerCommandHook } from '../command-hook-utils';
 
 const COMMAND_NAME = 'deepwork';
 
-function activationPrompt(task: string): string {
+function activationPrompt(task: string, sessionID: string): string {
   return [
     'Use the deepwork skill for this task. Treat it as a heavy coding session.',
     '',
-    'Deepwork requirements:',
-    '- before planning, delegation, or creating state, inspect existing `.gitignore` and `.ignore`; add only missing entries without duplicates: `.gitignore` must contain `.slim/deepwork/`, and `.ignore` must contain `!.slim/deepwork/` and `!.slim/deepwork/**`; this keeps state git-local yet OpenCode-readable;',
-    '- create/update a `.slim/deepwork/` progress file;',
-    '- save code/doc deliverables to project paths (e.g. `src/`, `docs/`); reserve `.slim/deepwork/` strictly for progress files;',
-    '- draft a phased implementation/delegation plan with a small number of coherent phases based on dependencies and natural delivery boundaries; do not split work merely to reduce review scope;',
-    '- before execution, show the user a compact overview with phase titles/order, delegated specialists and ownership/scope, plus the Oracle review total, gate after each phase, and a short reason for each;',
-    '- execute phase by phase with background specialists where useful;',
-    '- wait for hook-driven background completion, reconcile results, validate and update state, then ask `@oracle` to review every planned phase before continuing;',
-    '- batch material actionable Oracle findings, including simplify/readability feedback, into one bounded remediation pass and validate it with focused evidence; only re-review when the remediation changes the reviewed decision/risk or the original concern cannot otherwise be verified.',
+    `Your deepwork state file is \`.slim/deepwork/${sessionID}.md\` — create/update only this file; the skill covers setup, planning, gates, and state rules.`,
     '',
     'Task:',
     task,
@@ -53,7 +45,10 @@ export function createDeepworkCommandHook(): {
         return;
       }
 
-      output.parts.push({ type: 'text', text: activationPrompt(task) });
+      output.parts.push({
+        type: 'text',
+        text: activationPrompt(task, input.sessionID),
+      });
     },
   };
 }

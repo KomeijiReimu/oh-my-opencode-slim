@@ -7,12 +7,15 @@ register it.
 
 The verified compatibility baseline is **OpenCode v2.0.7**. The plugin
 requires OpenCode v2.0.7+ on v2 hosts; older v2 hosts are unsupported.
+Bundled-skill delivery requires the host's in-process skill registration
+channel (a `ctx.skill` draft with `add`), available on OpenCode v2 hosts. On
+v1 hosts bundled skills are **not** delivered: the legacy disk-copy sync was
+removed, and v1-era skill drafts expose `{source, list}` rather than `add`.
 The adapter targets the v2 plugin API surface (see
 [The v2 plugin API surface](#the-v2-plugin-api-surface-this-adapter-uses)),
 and the compile-time mirror guard below is pinned to `@opencode/plugin`
-2.0.15 (revalidated: `bun run typecheck` passes against 2.0.15 with no
-official session-hook surface drift from the 2.0.12 pin. Transitive
-`@opencode/schema` 2.0.15 adds `session.metadata.updated`; the event
+2.0.18 (revalidated: `bun run typecheck` passes against 2.0.18 with no
+official session-hook surface drift from the 2.0.15 pin; the event
 adapter ignores unknown event types, so no new mapping is required.
 Live host verification remains the v2.0.7 baseline above).
 
@@ -67,9 +70,13 @@ Three builds are produced:
 | `./server` | `dist/server/index.js` | `build:v2` | jsdom only (self-contained for v2) |
 | `./tui` | `dist/tui2.js` | `build:tui` | same external set as `build:plugin` (composes the v1 TUI entry; inlines zod) |
 
-The optional `@opentui/*` peers track `@opencode/plugin`'s peer floor
-(`>=0.5.10`; pinned exactly at `0.5.11`) so the v2 TUI entry satisfies
-the stable host's peer range.
+The optional `@opentui/*` pins (0.5.11) provide the v2 TUI entry's rendering
+stack. `@opencode/plugin` 2.0.18 raised its (optional) peer floor to
+`>=0.5.12`; the floor is not enforced on the plugin loading path, so the
+pins deliberately stay at 0.5.11 until the live-verified host baseline
+moves past v2.0.7 and the TUI smoke is re-run. `@opentui/solid` pins
+`solid-js` exactly (0.5.12 still requires 1.9.12), so any future OpenTUI
+bump must re-check that pin.
 
 v2's plugin resolver tries the `server` subpath first
 (`subpaths: ["server", ""]`), which the exports map resolves directly to
@@ -103,18 +110,21 @@ orchestrator-wake children-driven degraded mode are exercised end-to-end
 on the stable host — live mock-driven re-verification on 2026-09-09
 included a queued wake firing after 60 s of parent idle with a stalled
 background child). v2 conformance is compile-time-pinned by the
-mirror-conformance guard against the `@opencode/plugin` 2.0.15
+mirror-conformance guard against the `@opencode/plugin` 2.0.18
 devDependency and exercised by the mock-driven bridge tests. Every v2
 API the adapter touches is
-capability-probed at runtime (`typeof ctx.mcp?.transform === 'function'`,
-`s.switchModel`, `ctx.generate`, …), so a host lacking one capability
-degrades that single feature with a log line instead of breaking the load.
+capability-probed at runtime (`s.switchModel`, `ctx.generate`, …), so a host
+lacking an optional capability degrades that single feature with a log line
+instead of breaking the load. The configured MCP namespace inventory is a
+required input to finalized-registry permission policy: a host without
+`ctx.mcp.transform` is unsupported and setup fails with an actionable error.
 The session hooks are the deliberate exception: on full contexts they
 register unconditionally and a
 registration failure fails setup (see
 [The v2 adapter](#the-v2-adapter-srcv2setupts)).
-`ctx.mcp.transform` in particular is present in **all** v2.0.x stable hosts;
-its probe only ever matters on non-stable host builds.
+`ctx.mcp.transform` is present in **all** v2.0.x stable hosts. Its inventory
+snapshot is required to preserve host-only MCP namespace policy; missing it is
+not an optional-degradation path.
 
 ## The v2 adapter (`src/v2/setup.ts`)
 
@@ -231,7 +241,7 @@ its probe only ever matters on non-stable host builds.
       the v1 after-hook output from the error text (so json-error-recovery
       still appends its reminder to a failed call's output), and an
       errored call never presents its result content as a success.
-    - `event` → `ctx.event.subscribe()` loop feeding `mapV2EventToV1`
+   - `event` → `ctx.event.subscribe()` loop feeding `mapV2EventToV1`
       (`src/v2/event-adapter.ts`): additive synthesis only — the raw v2 event
       is always dispatched first (the interview bridge depends on it), then
       synthesized v1 shapes: flat child `session.created` → v1
@@ -272,13 +282,19 @@ its probe only ever matters on non-stable host builds.
      secondary-model summaries without a temp session
    - `dispose` → returned cleanup
 
-Each domain-transform bridge (agent/tool/mcp/command) is independently
+Agent/tool/command domain-transform bridges are independently
 try/catch-guarded so one failure cannot disable the rest, and a
-zero-registration load logs a loud health-check warning. The session hooks
+zero-registration load logs a loud health-check warning. MCP setup is
+different: it first snapshots the configured host namespace inventory from
+`ctx.mcp.transform`, which is required for finalized-registry permission
+policy. A missing transform or unavailable inventory fails setup and
+unwinds registrations already acquired. The session hooks
 (`prompt`, `context`, `model.request`, `compaction`) register
 **unconditionally** on full v2 contexts: a registration failure fails
 setup loudly instead of degrading — hook-name rejection is treated as a
-host contract violation, not a degrade path.
+host contract violation, not a degrade path. Separately, `session.update`
+remains optional for PR7's child permission bridge: without it, only that
+child bridge degrades with a one-time warning.
 
 ### Task-control prompt and idle-wait contracts
 
@@ -338,6 +354,16 @@ an outcome read. Note `stopConfirmationMs` doubles as the retry cadence —
 raising it stretches the stranding window proportionally (~4× its value at
 the default budget).
 
+The first complete native agent snapshot finalizes the managed registry for
+the current plugin generation. Subsequent v1 `config()` calls and v2 agent
+transform replays reproject that same owned model and permission policy; they
+do not absorb later changes to managed host entries or native rules. Foreign
+host-owned entries remain outside the managed projection. To apply changed
+managed configuration, reload the plugin so a fresh generation can capture a
+new snapshot. This is a generation boundary, not hot configuration: the
+planned V3 PR 10 status/reload work will report desired-versus-live state and
+provide explicit reload control, without making an active registry mutable.
+
 ## Feature matrix
 
 | Capability | v1 (`opencode`) | v2 (`opencode2`) | Notes |
@@ -356,7 +382,8 @@ the default budget).
 | Background-job identity index (new alias mappings) | ✅ project-local | ✅ project-local | private local file, independent of `ctx.storage`; reuse after restart requires host verification (see [Identity index](#project-local-identity-index-v1v2)) |
 | Foreground model fallback (rate-limit failover) | ✅ | ✅ shim translates re-prompt into `session.switchModel` + `delivery:"steer"` prompt | — |
 | `/preset` (interactive switcher) | ✅ | ✅ TUI plugin entry (`./tui` → `dist/tui2.js`): sidebar + `/preset` dialog or `/preset <name>` fast path | The layer registers from an `append: "app"` slot render because the host's `keymap.layer` is provider-scoped (calling it from plugin `setup` throws `Keymap.Provider is missing`); the command carries an `id` and `slash.arguments`; host needs `ui.slot` + `keymap.layer`; the interactive picker needs `ui.dialog.select` while `/preset <name>` works without it; feedback uses `ui.toast.show`; config-file `preset` still applies at load |
-| TUI default agent | ✅ orchestrator | ✅ orchestrator — `draft.default("orchestrator")`; the v2 TUI honors `default_agent` and hoists the default to the head of the agent list | — |
+| Default primary agent | ✅ finalized visible orchestrator identity | ✅ `draft.default(<visible orchestrator identity>)`; the canonical `orchestrator` entry remains a hidden alias when `displayName` is configured | v1 `default_agent` and v2 draft default target the same visible entry |
+| TUI default agent | ✅ orchestrator | ✅ host follows the default primary agent and hoists it to the head of the agent list | — |
 | Multiplexer (tmux/zellij/herdr/cmux-tui panes) | ✅ | ❌ host-gated off (`hostFlavor: 'v2'` → `shouldEnableMultiplexer` returns false and the session manager is forced to `type: "none"`) | by design — v2 renders subagents natively |
 | Orchestrator-wake scheduler | ✅ todo-gated (host `todo`/`children`/`status` APIs) | ✅ children-driven degraded mode (`backgroundJobs.orchestratorWake.mode`) | v2 wake enumerates children via `session.list({parentID})` with an event-tracked fallback, gates on children without a terminal `outcome` (staleness-bounded), and delivers with `queue`; v2's native subagent completion nudges still cover the happy path — the port adds a periodic watchdog for stuck children and unreconciled jobs |
 | `chat.headers` (Copilot `x-initiator` routing) | ✅ | ✅ via `session.hook("model.request")` | transport-level only; auxiliary kinds are covered by v2's built-in Copilot provider hook |

@@ -7,9 +7,6 @@ import {
 import { getRuntimeSessionStatusSnapshot } from '../utils/session-runtime-status';
 import { createTaskResultTool } from './task-result';
 
-mock.module('../utils/opencode-client', () => ({
-  getClient: (input: { client: unknown }) => input.client,
-}));
 const gates: BackgroundJobTerminalGate[] = [];
 afterEach(() => {
   for (const gate of gates.splice(0)) gate.dispose();

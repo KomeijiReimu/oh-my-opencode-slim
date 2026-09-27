@@ -25,11 +25,12 @@ function createDeps(board: BackgroundJobBoard) {
     idleReconciler: {
       scheduleIdleReconciliation: mock(() => {}),
       scheduleChildIdleReconciliation: mock(() => {}),
+      scheduleDeferredErrorBackstop: mock(() => {}),
       scheduleErrorTerminalize: mock(() => {}),
       clearIdleTimers: mock(() => {}),
       clearAllTimers: mock(() => []),
     },
-    deferredInlineErrors: new Set<string>(),
+    deferredInlineErrors: new Map<string, string>(),
     backgroundJobBoard: board,
     pendingCallTracker: createPendingCallTracker(),
     taskContextTracker: {

@@ -34,8 +34,11 @@ fallback), the wake condition is children without a terminal `outcome`
     session, no input wait (`hasInputWait`), no fallback in progress, gate
     not stopped. Reports a reason when blocked, deduplicated per session/reason
     within one idle spell; ending the spell or arming a timer resets that
-    deduplication so later blocks remain visible. Logs when the backstop is
-    armed or halted and when evaluation aborts/defers at a checkpoint.
+    deduplication so later blocks remain visible. Forced recovery and
+    child-input blockers log their trigger separately from the periodic
+    `backstop not armed` payload; blocked publications log task identity.
+    Logs when the backstop is armed or halted and when evaluation
+    aborts/defers at a checkpoint.
   - Reads a host snapshot (todo mode: todos + children + status map +
     session model/archive state; children mode: children list + event-tracked
     parent status + optional model/archive state) and computes a fingerprint; unchanged
@@ -58,6 +61,10 @@ fallback), the wake condition is children without a terminal `outcome`
     Retries follow the interval timer; failed publication/recovery retains its
     reason until delivery or a generation change. v2 children mode passes
     `delivery: 'queue'` (v1 call shape unchanged).
+  - A delivered publication consumes the per-parent throttle inside
+    `evaluate`, whether delivered directly, by timer or by one-flight
+    waiter. Failed/vetoed attempts and periodic deliveries do not consume
+    it; `waking` with task identity is logged only by the direct trigger.
   - `triggerStoppedJobRecovery`: immediate recovery wake for jobs that stopped
     without a native terminal result (separate from the periodic TODO wake;
     bypasses the wake condition, as on v1). Queued facts are revalidated by

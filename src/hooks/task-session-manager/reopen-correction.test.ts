@@ -41,13 +41,17 @@ function userMsg(id: string, text: string, createdAt: number) {
   };
 }
 
-function createInjectionState(board: BackgroundJobBoard): InjectionState {
+function createInjectionState(
+  board: BackgroundJobBoard,
+  boardInjection?: boolean,
+): InjectionState {
   return {
     backgroundJobBoard: board,
     terminalGate: {} as never,
     lifecycleLedger: {} as never,
     maxRetainedSnapshots: 20,
     strategy: 'latest',
+    boardInjection,
     processedInjectedCompletions: new Set(),
     processedInjectedCompletionOrder: [],
     terminalJobsInjectedByParent: new Map(),
@@ -345,5 +349,55 @@ describe('reopen corrective notice', () => {
       isVolatileTaggedMessage(correction, BACKGROUND_JOB_BOARD_METADATA_KEY),
     ).toBe(true);
     expect((request.messages as unknown[]).at(-1)).toBe(correction);
+  });
+});
+
+describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
+  test('off: the reopen correction is not delivered at all', async () => {
+    const board = new BackgroundJobBoard();
+    const state = createInjectionState(board, false);
+
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'mapped hooks',
+    });
+    rememberInjectedTerminalJobs(
+      state,
+      SESSION,
+      [
+        {
+          taskID: 'child-1',
+          generation: 1,
+          terminalRevision: 1,
+        },
+      ],
+      'shape-1',
+    );
+    reconcileInjectedTerminalJobs(state, SESSION);
+    expect(board.getState('child-1')).toBe('reconciled');
+    board.markRunningFromLiveSession('child-1', Date.now() + 60_000);
+    expect(board.getState('child-1')).toBe('running');
+
+    const request = {
+      messages: [structuredClone(userMsg('msg_u1', 'continue', BASE_TIME))],
+    };
+    await injectBackgroundJobBoard(state, {}, request as never);
+
+    const corrections = (request.messages as unknown[]).filter(
+      (message) => solePartMetadata(message)?.reopenCorrection === true,
+    );
+    expect(corrections).toHaveLength(0);
+    expect(
+      (request.messages as unknown[]).some((message) =>
+        JSON.stringify(message).includes('Background Job Board'),
+      ),
+    ).toBe(false);
   });
 });

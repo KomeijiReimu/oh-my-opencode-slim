@@ -43,10 +43,6 @@ const VOLATILE_PATTERNS: Array<{ name: string; regex: RegExp }> = [
  */
 const ALLOWLIST = new Map<string, string>([
   [
-    'hooks/auto-update-checker/skill-sync.ts',
-    'Update scheduling and install bookkeeping; produces no prompt content.',
-  ],
-  [
     'hooks/loop-command/index.ts',
     'Timestamps/randomness name per-run loop-history directories; the path only appears inside a newly appended user turn (payload tail), never in earlier prefix bytes.',
   ],

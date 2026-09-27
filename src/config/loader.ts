@@ -90,6 +90,14 @@ const DISABLED_CONFIG_KEYS = [
   'disabled_skills',
 ] as const;
 
+/** Apply the environment placeholder syntax shared by config consumers. */
+export function interpolateEnvironmentVariables(value: string): string {
+  return value.replace(
+    /\{env:([^}]+)\}/g,
+    (_match, varName: string) => process.env[varName] ?? '',
+  );
+}
+
 /**
  * Normalize disabled_* config keys in place so a non-array value does not
  * reject the whole config object during schema validation. A string value
@@ -306,7 +314,7 @@ function normalizePresetDeclarations(config: RawPluginConfig): RawPluginConfig {
  * @param onWarning - Optional callback for warnings
  * @returns Validated config object, or null if loading failed
  */
-function loadConfigFromPath(
+export function loadPluginConfigFromPath(
   configPath: string,
   options?: LoadPluginConfigOptions,
 ): RawPluginConfig | null {
@@ -318,10 +326,7 @@ function loadConfigFromPath(
     let rawConfig: unknown;
     try {
       const stripped = stripJsonComments(content);
-      const interpolated = stripped.replace(
-        /\{env:([^}]+)\}/g,
-        (_, varName) => process.env[varName] ?? '',
-      );
+      const interpolated = interpolateEnvironmentVariables(stripped);
       rawConfig = JSON.parse(interpolated);
     } catch (error) {
       // Empty file or JSON parse error is treated as invalid-json
@@ -426,7 +431,7 @@ function loadConfigFromPath(
         .fallback as Record<string, unknown>;
       const present = LEGACY_FALLBACK_KEYS.filter((key) => key in fallback);
       if (present.length > 0) {
-        const fallbackMsg = `Deprecated fallback config key${present.length === 1 ? '' : 's'} ${present.join(', ')} found and ignored. These fields were removed in 2.3.x; fallback behavior is controlled by fallback.enabled and fallback.maxRetries.`;
+        const fallbackMsg = `Deprecated fallback config key${present.length === 1 ? '' : 's'} ${present.join(', ')} found and ignored. These keys are no longer supported by foreground fallback and have no effect.`;
         options?.onWarning?.({
           path: configPath,
           kind: 'deprecated-key',
@@ -676,11 +681,11 @@ export function loadPluginConfig(
     findPluginConfigPaths(directory);
 
   let config: RawPluginConfig = userConfigPath
-    ? (loadConfigFromPath(userConfigPath, options) ?? {})
+    ? (loadPluginConfigFromPath(userConfigPath, options) ?? {})
     : {};
 
   const projectConfig = projectConfigPath
-    ? loadConfigFromPath(projectConfigPath, options)
+    ? loadPluginConfigFromPath(projectConfigPath, options)
     : null;
   if (projectConfig) {
     config = mergePluginConfigs(config, projectConfig);
