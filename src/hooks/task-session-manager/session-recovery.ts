@@ -220,15 +220,16 @@ function toolOutput(part: MessagePart): string | undefined {
 
 /** A completed task() for some other session does not cancel this child's
  * task_result. The id has to come from the tool header. Description, prompt,
- * and `<task_result>` body text do not count. Missing output, this task id,
- * this alias, or an input task_id that points at either of those still
- * ends the turn via taskPartEndsTurn. */
+ * and `<task_result>` body text do not count. A failed call still ends the
+ * turn, even when its header names another session. Missing output, this
+ * task id, this alias, or an input task_id that points at either of those
+ * still ends the turn via taskPartEndsTurn. */
 function otherSessionTaskPart(
   part: MessagePart,
   taskID: string,
   alias: string | undefined,
 ): boolean {
-  if (!isTaskToolPart(part)) return false;
+  if (!isTaskToolPart(part) || !foreignTaskCompletedCleanly(part)) return false;
   const output = toolOutput(part);
   if (typeof output !== 'string') return false;
   const parsed = parseTaskIdFromTaskOutput(output);
@@ -238,6 +239,12 @@ function otherSessionTaskPart(
   const input = isRecord(part.state) ? part.state.input : undefined;
   if (!isRecord(input) || typeof input.task_id !== 'string') return true;
   return input.task_id !== taskID && input.task_id !== alias;
+}
+
+function foreignTaskCompletedCleanly(part: MessagePart): boolean {
+  if (!isRecord(part.state)) return false;
+  if (part.state.status !== 'completed') return false;
+  return part.state.error == null && part.error == null;
 }
 
 /** Validate and collect every structured delegation for one exact child ID. */

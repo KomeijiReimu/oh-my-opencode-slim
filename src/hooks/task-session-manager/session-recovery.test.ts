@@ -2177,6 +2177,37 @@ describe('classifySessionRecovery', () => {
     }
   });
 
+  test('a failed foreign task() before task_result stays unacknowledged', async () => {
+    const output =
+      '<task id="ses_other" state="error">other child failed</task>';
+    const errored = {
+      type: 'tool',
+      tool: 'task',
+      state: {
+        status: 'error',
+        input: { background: true },
+        output,
+        error: 'child exited',
+      },
+    };
+    const completedWithError = {
+      type: 'tool',
+      tool: 'task',
+      error: 'child exited',
+      state: {
+        status: 'completed',
+        input: { background: true, task_id: 'ses_other' },
+        output,
+        error: 'child exited',
+      },
+    };
+    expectAckUnproven(await recoveryBeforeResult(errored), 'status-error');
+    expectAckUnproven(
+      await recoveryBeforeResult(completedWithError),
+      'completed-with-error',
+    );
+  });
+
   test('a failed sibling beside a foreign task() stays unacknowledged', async () => {
     const foreign = completedTaskCall({
       output: '<task id="ses_other" state="running">other child</task>',
