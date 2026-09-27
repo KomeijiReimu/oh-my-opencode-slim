@@ -405,14 +405,42 @@ function parentToolSucceeded(part: MessagePart): boolean {
 }
 
 function parentTurnContinues(message: MessageWithParts): boolean {
-  return message.parts.every(
-    (part) =>
-      PARENT_TURN_ASIDE_TYPES.has(part.type) ||
-      parentToolSucceeded(part) ||
-      refusedTaskCreatedNoSession(part) ||
-      inFlightTaskPart(part) ||
-      inFlightOrdinaryTool(part),
+  return message.parts.every((part) => partLeavesTurnIntact(part));
+}
+
+function partLeavesTurnIntact(part: MessagePart): boolean {
+  return (
+    PARENT_TURN_ASIDE_TYPES.has(part.type) ||
+    parentToolSucceeded(part) ||
+    refusedTaskCreatedNoSession(part) ||
+    inFlightTaskPart(part) ||
+    inFlightOrdinaryTool(part)
   );
+}
+
+/** Ignore a foreign task() by itself. A failed or unknown sibling in that
+ * same message still blocks. A failed tool with no foreign task() does not:
+ * this slice never treated one as acknowledgement. */
+function interveningMessageBlocksAck(
+  message: MessageWithParts,
+  taskID: string,
+  alias: string | undefined,
+): boolean {
+  let sawForeign = false;
+  let sawBlockingTask = false;
+  let sawNonBenign = false;
+  for (const item of message.parts) {
+    if (otherSessionTaskPart(item, taskID, alias)) {
+      sawForeign = true;
+      continue;
+    }
+    if (taskPartEndsTurn(item)) {
+      sawBlockingTask = true;
+      continue;
+    }
+    if (!partLeavesTurnIntact(item)) sawNonBenign = true;
+  }
+  return sawBlockingTask || (sawForeign && sawNonBenign);
 }
 
 /** Sibling parts in the task_result message count. A failed tool or an
@@ -618,23 +646,17 @@ function parentCompletion(
         return { notifiedAt: notice.at, acknowledgedAt };
     }
     // A matching task_result is the acknowledgement. A later stop is not
-    // required. A synthetic notice still is not enough on its own. A task()
-    // between this delegation and the retrieval blocks it, unless that
-    // call's header names a different session and its task_id does not
-    // point back here.
+    // required. A synthetic notice still is not enough on its own. Between
+    // this delegation and the retrieval, a task() blocks unless its header
+    // names another session and its task_id does not point back here.
+    // Ignoring that part does not ignore a failed or unknown sibling.
     if (
       !blocked &&
       notice.retrieved &&
       retrievedMessageAllowsAck(messages[notice.messageIndex]) &&
       !messages
         .slice(part.messageIndex + 1, notice.messageIndex)
-        .some((message) =>
-          message.parts.some(
-            (item) =>
-              taskPartEndsTurn(item) &&
-              !otherSessionTaskPart(item, taskID, alias),
-          ),
-        )
+        .some((message) => interveningMessageBlocksAck(message, taskID, alias))
     )
       return { notifiedAt: notice.at, acknowledgedAt: notice.at };
   }

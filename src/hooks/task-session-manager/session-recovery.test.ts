@@ -455,22 +455,23 @@ async function expectTailUncertain(label: string, tail: unknown[]) {
   });
 }
 
-function transcriptWithTaskBeforeResult(part: unknown, created = 200) {
+async function recoveryBeforeResult(part: unknown, created = 200) {
+  return recoveryBeforeParts([part], created);
+}
+
+async function recoveryBeforeParts(parts: unknown[], created = 200) {
   const transcript = v2ParentResult({ acknowledge: false });
   transcript.data.splice(
     1,
     0,
-    parentMessage('between', 'assistant', created, [
-      part,
-    ]) as (typeof transcript.data)[number],
+    parentMessage(
+      'between',
+      'assistant',
+      created,
+      parts,
+    ) as (typeof transcript.data)[number],
   );
-  return transcript;
-}
-
-async function recoveryBeforeResult(part: unknown, created = 200) {
-  return classifySessionRecovery(
-    v2Recovery(transcriptWithTaskBeforeResult(part, created)),
-  );
+  return classifySessionRecovery(v2Recovery(transcript));
 }
 
 function expectAckUnproven(
@@ -2174,6 +2175,54 @@ describe('classifySessionRecovery', () => {
         acknowledged: acknowledgedFlag(result),
       }).toEqual({ label, kind: 'reusable', acknowledged: true });
     }
+  });
+
+  test('a failed sibling beside a foreign task() stays unacknowledged', async () => {
+    const foreign = completedTaskCall({
+      output: '<task id="ses_other" state="running">other child</task>',
+    });
+    const failed = {
+      type: 'tool',
+      tool: 'bash',
+      name: 'bash',
+      state: { status: 'completed', error: 'command failed' },
+    };
+    expectAckUnproven(
+      await recoveryBeforeParts([foreign, failed]),
+      'failed-sibling',
+    );
+    expectAckUnproven(
+      await recoveryBeforeParts([foreign, { type: 'unknown-part' }]),
+      'unknown-sibling',
+    );
+  });
+
+  test('a successful sibling beside a foreign task() stays reusable', async () => {
+    const result = await recoveryBeforeParts([
+      completedTaskCall({
+        output: '<task id="ses_other" state="running">other child</task>',
+      }),
+      completedBash(),
+    ]);
+    expect(result).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
+  });
+
+  test('a failed tool alone before task_result stays reusable', async () => {
+    const result = await recoveryBeforeParts([
+      {
+        type: 'tool',
+        tool: 'bash',
+        name: 'bash',
+        state: { status: 'completed', error: 'command failed' },
+      },
+    ]);
+    expect(result).toMatchObject({
+      kind: 'reusable',
+      evidence: { acknowledged: true },
+    });
   });
 
   test('an unparsed task() before task_result stays unacknowledged', async () => {
