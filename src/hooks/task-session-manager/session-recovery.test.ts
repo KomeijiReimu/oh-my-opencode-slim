@@ -413,6 +413,26 @@ function childDelegation(options: {
   };
 }
 
+function completedTaskCall(options: {
+  output?: string;
+  taskId?: string;
+  agent?: string;
+}) {
+  return {
+    type: 'tool',
+    tool: 'task',
+    state: {
+      status: 'completed',
+      input: {
+        background: true,
+        ...(options.agent ? { agent: options.agent } : {}),
+        ...(options.taskId ? { task_id: options.taskId } : {}),
+      },
+      ...(options.output === undefined ? {} : { output: options.output }),
+    },
+  };
+}
+
 async function recoveryForTail(tail: unknown[]) {
   const transcript = v2ParentResult({ acknowledge: false });
   for (const message of tail)
@@ -422,6 +442,41 @@ async function recoveryForTail(tail: unknown[]) {
 
 async function expectTailUncertain(label: string, tail: unknown[]) {
   const result = await recoveryForTail(tail);
+  expect({
+    label,
+    kind: result.kind,
+    reason: 'reason' in result ? result.reason : undefined,
+    acknowledged: acknowledgedFlag(result),
+  }).toEqual({
+    label,
+    kind: 'uncertain',
+    reason: 'parent acknowledgement unproven',
+    acknowledged: false,
+  });
+}
+
+function transcriptWithTaskBeforeResult(part: unknown, created = 200) {
+  const transcript = v2ParentResult({ acknowledge: false });
+  transcript.data.splice(
+    1,
+    0,
+    parentMessage('between', 'assistant', created, [
+      part,
+    ]) as (typeof transcript.data)[number],
+  );
+  return transcript;
+}
+
+async function recoveryBeforeResult(part: unknown, created = 200) {
+  return classifySessionRecovery(
+    v2Recovery(transcriptWithTaskBeforeResult(part, created)),
+  );
+}
+
+function expectAckUnproven(
+  result: Awaited<ReturnType<typeof classifySessionRecovery>>,
+  label: string,
+) {
   expect({
     label,
     kind: result.kind,
@@ -2104,6 +2159,92 @@ describe('classifySessionRecovery', () => {
       kind: 'reusable',
       evidence: { acknowledged: true },
     });
+  });
+
+  test('a completed foreign task() before task_result stays reusable', async () => {
+    const output = '<task id="ses_other" state="running">other child</task>';
+    for (const [label, part] of [
+      ['no-task-id', completedTaskCall({ output })],
+      ['other-task-id', completedTaskCall({ output, taskId: 'ses_other' })],
+    ] as const) {
+      const result = await recoveryBeforeResult(part);
+      expect({
+        label,
+        kind: result.kind,
+        acknowledged: acknowledgedFlag(result),
+      }).toEqual({ label, kind: 'reusable', acknowledged: true });
+    }
+  });
+
+  test('an unparsed task() before task_result stays unacknowledged', async () => {
+    const parts = [
+      ['no-output', completedTaskCall({})],
+      [
+        'id-only-in-body',
+        completedTaskCall({
+          output: '<task_result>ses_other</task_result>',
+        }),
+      ],
+    ] as const;
+    for (const [label, part] of parts)
+      expectAckUnproven(await recoveryBeforeResult(part), label);
+  });
+
+  test('a completed task() for this session without a foreign header stays unacknowledged', async () => {
+    expectAckUnproven(
+      await recoveryBeforeResult(completedTaskCall({ taskId: taskID })),
+      'input-task-id',
+    );
+  });
+
+  test('a later same-session delegation before task_result is not reusable', async () => {
+    const result = await recoveryBeforeResult(
+      completedTaskCall({
+        output: `<task id="${taskID}" state="running">Working</task>`,
+        taskId: taskID,
+        agent: 'fixer',
+      }),
+      200,
+    );
+    expect({
+      kind: result.kind,
+      reason: 'reason' in result ? result.reason : undefined,
+      acknowledged: acknowledgedFlag(result),
+    }).toEqual({
+      kind: 'uncertain',
+      reason: 'parent terminal notice unproven',
+      acknowledged: false,
+    });
+  });
+
+  test('a foreign header with this session task_id stays unacknowledged', async () => {
+    expectAckUnproven(
+      await recoveryBeforeResult(
+        completedTaskCall({
+          output: '<task id="ses_other" state="running">other child</task>',
+          taskId: taskID,
+        }),
+      ),
+      'input-points-here',
+    );
+  });
+
+  test('an alias header or task_id before task_result stays unacknowledged', async () => {
+    expectAckUnproven(
+      await recoveryBeforeResult(
+        completedTaskCall({ output: 'task_id: fix-1' }),
+      ),
+      'alias-header',
+    );
+    expectAckUnproven(
+      await recoveryBeforeResult(
+        completedTaskCall({
+          output: '<task id="ses_other" state="running">other child</task>',
+          taskId: 'fix-1',
+        }),
+      ),
+      'alias-task-id',
+    );
   });
 
   test('a failed tool in a stopped parent message stays unacknowledged', async () => {

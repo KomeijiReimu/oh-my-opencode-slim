@@ -218,6 +218,28 @@ function toolOutput(part: MessagePart): string | undefined {
       : undefined;
 }
 
+/** A completed task() for some other session does not cancel this child's
+ * task_result. The id has to come from the tool header. Description, prompt,
+ * and `<task_result>` body text do not count. Missing output, this task id,
+ * this alias, or an input task_id that points at either of those still
+ * ends the turn via taskPartEndsTurn. */
+function otherSessionTaskPart(
+  part: MessagePart,
+  taskID: string,
+  alias: string | undefined,
+): boolean {
+  if (!isTaskToolPart(part)) return false;
+  const output = toolOutput(part);
+  if (typeof output !== 'string') return false;
+  const parsed = parseTaskIdFromTaskOutput(output);
+  if (typeof parsed !== 'string') return false;
+  if (parsed === taskID || (alias !== undefined && parsed === alias))
+    return false;
+  const input = isRecord(part.state) ? part.state.input : undefined;
+  if (!isRecord(input) || typeof input.task_id !== 'string') return true;
+  return input.task_id !== taskID && input.task_id !== alias;
+}
+
 /** Validate and collect every structured delegation for one exact child ID. */
 function parentTaskTranscript(
   response: unknown,
@@ -596,15 +618,23 @@ function parentCompletion(
         return { notifiedAt: notice.at, acknowledgedAt };
     }
     // A matching task_result is the acknowledgement. A later stop is not
-    // required. A synthetic notice still is not enough on its own, and a
-    // task() already dispatched after the child finished blocks it.
+    // required. A synthetic notice still is not enough on its own. A task()
+    // between this delegation and the retrieval blocks it, unless that
+    // call's header names a different session and its task_id does not
+    // point back here.
     if (
       !blocked &&
       notice.retrieved &&
       retrievedMessageAllowsAck(messages[notice.messageIndex]) &&
       !messages
         .slice(part.messageIndex + 1, notice.messageIndex)
-        .some((message) => message.parts.some((item) => taskPartEndsTurn(item)))
+        .some((message) =>
+          message.parts.some(
+            (item) =>
+              taskPartEndsTurn(item) &&
+              !otherSessionTaskPart(item, taskID, alias),
+          ),
+        )
     )
       return { notifiedAt: notice.at, acknowledgedAt: notice.at };
   }
