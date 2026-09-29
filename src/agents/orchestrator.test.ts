@@ -28,6 +28,10 @@ describe('orchestrator prompt', () => {
     expect(prompt).toContain(
       '`task(subagent_type: "<agent>", task_id: "<task-id>", prompt: "...", background: true)`',
     );
+    expect(prompt).toContain(
+      'Before resuming a completed session, call `task_result`',
+    );
+    expect(prompt).toContain('Do not call `task` first.');
   });
 
   test('falls back to question when wait_for_user is disabled', () => {

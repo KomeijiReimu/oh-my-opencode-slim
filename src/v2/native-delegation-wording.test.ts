@@ -166,6 +166,7 @@ describe('createAgents council dispatch vocabulary', () => {
         .replaceAll('subagent_type', 'agent')
         .replaceAll('task(', 'subagent(')
         .replaceAll('`task` call', '`subagent` call')
+        .replaceAll('`task`', '`subagent`')
         .replaceAll("the task tool's", "the subagent tool's")
         .replaceAll('call task with', 'call subagent with'),
     );
