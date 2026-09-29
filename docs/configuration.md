@@ -28,6 +28,12 @@ OH_MY_OPENCODE_SLIM_DISABLE=1 opencode
 
 If OmO-slim detects an invalid plugin config for the current project, the TUI sidebar shows a warning. Run `oh-my-opencode-slim doctor` from your project root for full diagnostics.
 
+Marketplace agent packages are selected through the active preset's
+`marketplace` configuration. The CLI and orchestrator tools update desired
+disk state only; they do not mutate the current session's agent registry. See
+the [Marketplace guide](marketplace.md) for activation, status, and reload
+commands.
+
 The TUI sidebar uses the compact layout by default. Set `compactSidebar` to
 `false` in `oh-my-opencode-slim.jsonc` to use the expanded layout:
 
@@ -116,10 +122,21 @@ All config files support **JSONC** (JSON with Comments):
 ### Runtime Preset Switching
 
 Presets can also be selected from the TUI with `/preset`. The selection is
-written to the user config file; reload OpenCode for it to take effect. See
+written to the user config file. On v2 hosts the write requests the live
+refresh: after the server-side watcher has re-read the config, the
+saved/applied preset's inference fields (`model`, `variant`, `temperature`,
+`options`) apply to **new child dispatches** (frozen for each child before
+its first request) and the sidebar. Every existing session and every
+non-inference preset field (`prompt`, `tools`, `permission`, `skills`,
+`mcps`, `displayName`) stays frozen until a full reload. A malformed config
+is rejected before any swap — the last-known-good profiles and sidebar are
+kept until the config is fixed. The TUI reports `Saved … Live refresh
+requested` (it cannot observe the server-side watcher); fix the config and
+reload if new dispatches still use the old fields. On v1 hosts, reload
+OpenCode for the change to take effect. See
 [Preset Switching](preset-switching.md) for details.
 
-| `presets` | object | - | Named preset configurations |
+| `presets` | object | - | Named preset configurations. New preset names are limited to letters, digits, `-`, and `_`; `__omo_*` and JavaScript reserved property names (`__proto__`, `constructor`, `prototype`) are rejected for new presets (pre-existing entries with other names stay visible and applicable) |
 |-----------|--------|---|-----------------------------|
 | `presets.<name>.extends` | string | - | Optional single parent preset. The parent is resolved before the child; multiple parents are not supported |
 | `presets.<name>.<agent>.model` | string | - | Model ID in `provider/model` format |
@@ -158,11 +175,11 @@ an MCP tool remains authoritative.
 | `disabled_agents` | string[] | `["observer"]` | Agent names to disable globally. Set to `[]` to enable Observer; this is global, not per-preset See [Custom Agents](#custom-agents). |
 | `image_routing` | `"auto"` \| `"direct"` | omitted (legacy conditional) | Optional. When omitted, resolves to `"auto"` if Observer is enabled, otherwise `"direct"`. Explicit `"auto"` requires Observer enabled and saves image attachments to disk before nudging delegation to @observer. `"direct"`: always pass images to the orchestrator. |
 | `autoUpdate` | boolean | `true` | Automatically install plugin updates in the background; set to `false` for notification-only mode |
-| `multiplexer.type` | string | `"none"` | Multiplexer mode: `auto`, `tmux`, `zellij`, `herdr`, `cmux-tui`, `kitty`, or `none` See [Multiplexer Integration](multiplexer-integration.md). |
+| `multiplexer.type` | string | `"none"` | Multiplexer mode: `auto`, `tmux`, `zellij`, `herdr`, `cmux-tui`, `kitty`, or `none` See [Multiplexer Integration](multiplexer-integration.md). On OpenCode v2 hosts the setting is ignored (no pane feature; one diagnostic per process). |
 | `multiplexer.layout` | string | `"main-vertical"` | Layout preset: `main-vertical`, `main-horizontal`, `tiled`, `even-horizontal`, `even-vertical`. Each adapter maps it to its nearest native expression (tmux full layouts; split directions for Zellij/Herdr; built-in layouts for kitty); cmux-tui has no layout expression and ignores it. See [Multiplexer Integration](multiplexer-integration.md#layouts). |
 | `multiplexer.main_pane_size` | number | `60` | Main pane size as percentage (20–80) for tmux main layouts; ignored by Zellij, Herdr, kitty, and cmux-tui See [Multiplexer Integration](multiplexer-integration.md#layouts). |
 | `multiplexer.cmux_tui_binary` | string | omitted | Explicit path to the cmux-tui binary. When omitted, the client resolves `cmux-tui` first, then `cmux`, on `PATH` See [Multiplexer Integration](multiplexer-integration.md). |
-| `multiplexer.zellij_pane_mode` | string | — | **Deprecated and ignored.** Zellij panes always open in the tab containing the parent OpenCode pane; a once-per-process warning is logged and pane management keeps working See [Behavior Changes and Removals](multiplexer-integration.md#behavior-changes-and-removals-行为变更与移除清单). |
+| `multiplexer.zellij_pane_mode` | string | — | **Deprecated and ignored.** Zellij panes always open in the tab containing the parent OpenCode pane; a once-per-process warning is logged and pane management keeps working See [Behavior Changes and Removals](multiplexer-integration.md#behavior-changes-and-removals). |
 | `tmux.enabled` | boolean | — | **Deprecated and ignored** (legacy key); use `multiplexer.type = "tmux"` See [Multiplexer Integration](multiplexer-integration.md#legacy-tmux-config). |
 | `tmux.layout` | string | — | **Deprecated and ignored** (legacy key); use `multiplexer.layout` See [Multiplexer Integration](multiplexer-integration.md#legacy-tmux-config). |
 | `tmux.main_pane_size` | number | — | **Deprecated and ignored** (legacy key); use `multiplexer.main_pane_size` See [Multiplexer Integration](multiplexer-integration.md#legacy-tmux-config). |
@@ -243,8 +260,13 @@ entry is global: it overrides the active preset, so do not put an agent there
 if its value should vary by preset. Host config remains the final override.
 
 The `/preset` TUI persists the selected preset name and does not create an
-in-memory agent override or hot-swap the current agent registry. Reload
-OpenCode after changing the active preset.
+in-memory agent override. On v2 hosts the write requests the live refresh and
+the re-resolved inference fields apply to new child dispatches (captured
+before their first request) and the sidebar once the server-side watcher has
+refreshed; existing sessions and the prompt/tool/permission/skill/MCP surfaces
+stay frozen until a full reload. A malformed config keeps the last-known-good
+profiles and sidebar and must be fixed (then reloaded) before the change can
+apply. On v1 hosts, reload OpenCode after changing the active preset.
 
 > **niri note:** `companion-v0.1.3` includes the fixed native companion release.
 > To make it open as a bottom-right overlay, add a niri rule matching its stable
@@ -834,7 +856,7 @@ Use the `skills`/`mcps` arrays for skill and MCP gating. Use `permission` for ev
 
 ### Multiplexer
 
-The multiplexer hosts child agent sessions in terminal panes. See [Multiplexer Integration](multiplexer-integration.md) for backend setup, layout configuration, and troubleshooting.
+The multiplexer hosts child agent sessions in terminal panes. See [Multiplexer Integration](multiplexer-integration.md) for backend setup, layout configuration, and troubleshooting. On OpenCode v2 hosts pane creation is unavailable by design: `multiplexer.type` is ignored and one diagnostic per process is logged (v2's native subagent UX replaces panes).
 
 ### Desktop Companion App
 
