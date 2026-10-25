@@ -2954,6 +2954,11 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         return sessionProfileBridge.drain();
       };
 
+      // These are preparation credentials, not a best-effort cache. Unrelated
+      // sessions must never evict a valid context before its model request.
+      const contextRevisions = new Map<string, number>();
+      disposers.push(() => contextRevisions.clear());
+
       // Skip session hook registration if ctx.session is unavailable (v1 host
       // embedded v2 core with limited context). On full v2 contexts, session
       // hooks are required and registration failures fail setup.
@@ -2962,7 +2967,6 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
           '[v2] ctx.session unavailable; skipping session hooks (v1 host embedded v2 core)',
         );
       } else {
-        const contextRevisions = new Map<string, number>();
         const assertTransitionIdle = v1Hooks[
           'v2.assertSessionTransitionIdle'
         ] as
@@ -3099,11 +3103,9 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
             throw new Error(
               'Session preset changed during context preparation',
             );
-          contextRevisions.set(event.sessionID, revision);
-          if (contextRevisions.size > 1024) {
-            const oldest = contextRevisions.keys().next().value;
-            if (oldest !== undefined) contextRevisions.delete(oldest);
-          }
+          if (binding?.parentID && revision > 0)
+            contextRevisions.set(event.sessionID, revision);
+          else contextRevisions.delete(event.sessionID);
         });
         disposers.push(() => reg.dispose());
         log('[v2] session context hook registered');
@@ -3640,13 +3642,14 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                         await sessionProfileBridge.observeEvent(next.value);
                       }
                     } else if (rawType === 'session.deleted') {
-                      await sessionProfileBridge.observeEvent(next.value);
                       const payload = next.value.data ?? next.value.properties;
-                      if (isRecord(payload)) {
-                        const id = payload.sessionID ?? payload.id;
-                        if (typeof id === 'string')
-                          await sessionPresets.remove(id);
-                      }
+                      const id = isRecord(payload)
+                        ? (payload.sessionID ?? payload.id)
+                        : undefined;
+                      if (typeof id === 'string') contextRevisions.delete(id);
+                      await sessionProfileBridge.observeEvent(next.value);
+                      if (typeof id === 'string')
+                        await sessionPresets.remove(id);
                     }
                     await permissionRulesBridge?.observeEvent(next.value);
                     if (eventHook) {

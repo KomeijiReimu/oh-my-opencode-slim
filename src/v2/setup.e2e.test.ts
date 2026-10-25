@@ -1737,6 +1737,109 @@ describe('createV2Setup e2e', () => {
     }
   });
 
+  test('managed context revision survives >1024 interleaved contexts, rejects stale preparation, and clears on deletion', async () => {
+    const { ctx, calls, events } = makeMockV2Context(projectDir);
+    const stored = new Map<string, any>();
+    const binding = {
+      schemaVersion: 2,
+      revision: 1,
+      parentID: 'root',
+      preserveModel: true,
+      bundle: {
+        presetName: 'frozen',
+        fallbackEnabled: false,
+        profiles: {
+          explorer: {
+            model: { providerID: 'test', id: 'prepared' },
+            sidebarModel: 'test/prepared',
+            temperature: 0.2,
+          },
+        },
+        chains: {},
+        inheritance: {},
+      },
+    };
+    const id = 'ses_prepared_child';
+    const key = `session-preset/v1/${id}`;
+    const deleted = Promise.withResolvers<void>();
+    (ctx as any).storage = {
+      get: async (entry: string) => structuredClone(stored.get(entry)),
+      set: async (entry: string, value: unknown) => {
+        stored.set(entry, structuredClone(value));
+      },
+      remove: async (entry: string) => {
+        stored.delete(entry);
+        if (entry === key) deleted.resolve();
+      },
+      scan: async () => ({ entries: [] }),
+    };
+    ctx.session.get = async ({ sessionID }) => ({
+      id: sessionID,
+      parentID: 'root',
+      directory: projectDir,
+      agent: 'explorer',
+      model: { providerID: 'test', id: 'prepared' },
+    });
+    let requestHook: ((event: any) => Promise<void>) | undefined;
+    const originalHook = ctx.session.hook;
+    (ctx.session as any).hook = (name: string, callback: any) => {
+      if (name === 'model.request') requestHook = callback;
+      return originalHook.call(ctx.session, name as never, callback);
+    };
+    const context = (sessionID: string) => ({
+      sessionID,
+      agent: 'explorer',
+      model: { providerID: 'test', id: 'prepared' },
+      options: {},
+      system: [],
+      messages: [],
+      tools: {},
+    });
+    const request = {
+      sessionID: id,
+      kind: 'primary',
+      model: { providerID: 'test', id: 'prepared' },
+      headers: {},
+    };
+    stored.set(key, structuredClone(binding));
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      expect(requestHook).toBeFunction();
+      // A current persistent record is not a context-preparation credential.
+      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
+      await calls.contextHookCb?.(context(id));
+      await requestHook?.(request);
+      for (let index = 0; index < 1025; index++) {
+        const otherID = `ses_interleaved_${index}`;
+        stored.set(`session-preset/v1/${otherID}`, structuredClone(binding));
+        await calls.contextHookCb?.(context(otherID));
+      }
+      // All interleaved sessions are managed children: merely skipping roots
+      // or refreshing a FIFO/LRU entry cannot make this assertion safe.
+      await requestHook?.(request);
+      stored.set(key, { ...structuredClone(binding), revision: 2 });
+      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
+      stored.set(key, structuredClone(binding));
+      await requestHook?.(request);
+      events.push({
+        id: 'evt_delete_prepared',
+        type: 'session.deleted',
+        location: { directory: projectDir },
+        data: { sessionID: id },
+      });
+      await deleted.promise;
+      // Reusing the ID and exact revision after deletion must not resurrect
+      // the old preparation credential, even though public identity matches.
+      stored.set(key, structuredClone(binding));
+      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
+      await calls.contextHookCb?.(context(id));
+      await requestHook?.(request);
+    } finally {
+      await cleanup();
+    }
+    await expect(requestHook?.(request)).rejects.toThrow('retired');
+  }, 20_000);
+
   test('returns cleanly without registering when disabled by env', async () => {
     process.env.OH_MY_OPENCODE_SLIM_DISABLE = '1';
     const { ctx, calls } = makeMockV2Context(projectDir);
