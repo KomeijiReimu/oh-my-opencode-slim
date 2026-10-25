@@ -3,6 +3,11 @@
 Use `/preset` to choose a session's subagent inference configuration or change
 the default for future sessions.
 
+> **Storage compatibility:** New bindings and explicit updates write v2 records,
+> which the previous v1-only reader rejects. See
+> [Testing and downgrading](#testing-and-downgrading) before trying a prerelease
+> with your existing sessions.
+
 ## Controls
 
 `/preset` opens a **three-level preset manager** in the TUI — pure TUI, like
@@ -30,6 +35,11 @@ separately. Inspect the session's saved team to see its models and variants;
 editing a preset with the same name does not change that saved view. Project
 and environment overrides can make the effective default differ from the
 user configuration's selection.
+
+The v2 sidebar's **Current model** is the committed host model. In a root
+orchestrator session, **Next prompt** shows a different picker selection
+immediately, before submission. **Team · next delegation** remains the saved
+team projection.
 
 ## Scope and when changes take effect
 
@@ -80,6 +90,10 @@ the preset default. An explicit model selection disables that execution's
 preset fallback chain. A later team change can select a new preset model;
 an ordinary continuation with unchanged settings preserves the current model
 and fallback state.
+
+For a managed continuation, explicit model/variant availability is checked
+before starting a configuration change. Failure at that check leaves the saved
+execution unchanged; the native tool still validates the selection again.
 
 ### Start a session with a preset
 
@@ -143,9 +157,12 @@ New bindings and explicit updates use storage format v2. Existing v1 bindings
 remain readable; ordinary reads and unchanged continuations do not migrate
 them. Apply or an execution change writes the new format.
 
-Test a prerelease with separate OpenCode configuration and data directories.
-Older plugin versions may reject v2 records. Restoring the previous plugin
-reference does not convert records back or undo saved native model selections.
+The previous v1-only reader rejects v2 records; there is no automatic downgrade.
+For a reversible trial, use separate OpenCode configuration and data directories,
+or stop the host and back up its data before testing with your usual sessions.
+Restoring the previous plugin reference alone does not convert records back or
+undo saved native model selections. If you test with your usual data, restoring
+its pre-test state requires the previous plugin and the matching data backup.
 
 Sessions created before this feature have no historical snapshot to recover.
 A root's first binding uses the then-current effective default. A child with
