@@ -1840,6 +1840,222 @@ describe('createV2Setup e2e', () => {
     await expect(requestHook?.(request)).rejects.toThrow('retired');
   }, 20_000);
 
+  test('native automatic model survives real before/wrapper admission and options-only revision while stale prepared requests reject', async () => {
+    await Bun.write(
+      path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        companion: { enabled: false },
+        preset: 'A',
+        presets: {
+          A: { agents: { explorer: { temperature: 0.2 } } },
+          B: {
+            agents: {
+              explorer: { temperature: 0.7, options: { changed: true } },
+            },
+          },
+          InheritedTail: {
+            agents: {
+              explorer: {
+                model: ['test/tail-A', 'test/tail-B'],
+                inheritModelFrom: 'session',
+              },
+            },
+          },
+          SelectedChain: {
+            agents: {
+              explorer: { model: ['test/selected-A', 'test/selected-B'] },
+            },
+          },
+        },
+      }),
+    );
+    const { ctx, calls } = makeMockV2Context(projectDir);
+    const identities = new Map<string, any>([
+      ['root', { id: 'root', directory: projectDir, agent: 'orchestrator' }],
+    ]);
+    ctx.session.get = async ({ sessionID }) => identities.get(sessionID);
+    let switches = 0;
+    ctx.session.switchModel = async () => {
+      switches++;
+    };
+    let rpc: any;
+    (ctx as any).rpc = {
+      register: async (_definition: unknown, handlers: unknown) => {
+        rpc = handlers;
+        return { dispose() {} };
+      },
+    };
+    let requestHook: ((event: any) => Promise<void>) | undefined;
+    const hook = ctx.session.hook;
+    (ctx.session as any).hook = (name: string, callback: any) => {
+      if (name === 'model.request') requestHook = callback;
+      return hook.call(ctx.session, name as never, callback);
+    };
+    const childID = 'ses_automatic_child';
+    const native = {
+      description: 'native',
+      execute: async (input: any, context: any) => {
+        expect(input).not.toHaveProperty('model');
+        expect(
+          calls.agentUpdates.find((agent) => agent.id === 'explorer')?.model,
+        ).toBeUndefined();
+        // Pinned native create precedence: override ?? agent.model ?? parent.model.
+        // None is selected here, so the native runner supplies the request ref.
+        if (!input.sessionID)
+          identities.set(childID, {
+            id: childID,
+            parentID: 'root',
+            agent: 'explorer',
+            directory: projectDir,
+          });
+        await context.progress({ sessionID: childID, status: 'running' });
+        await calls.promptHookCb?.({
+          sessionID: childID,
+          messageID: context.id,
+          prompt: { text: 'work' },
+        });
+        return {
+          output: { sessionID: childID, status: 'running' },
+          content: 'running',
+        };
+      },
+    };
+    ctx.tool.transform = async (callback) => {
+      callback({
+        add: (tool) => calls.toolAdds.push(tool),
+        update: (id, update) => {
+          if (id === 'subagent') update(native);
+        },
+        get: (id) => (id === 'subagent' ? native : undefined),
+      });
+      return { dispose() {} };
+    };
+    const cleanup = await createV2Setup()(ctx);
+    const launch = async (id: string, resume: boolean) => {
+      const call = {
+        tool: 'subagent',
+        sessionID: 'root',
+        id,
+        input: {
+          agent: 'explorer',
+          prompt: 'work',
+          background: true,
+          ...(resume ? { sessionID: childID } : {}),
+        },
+      };
+      await calls.toolBeforeCb?.(call);
+      expect(call.input).not.toHaveProperty('model');
+      let result: unknown;
+      let error: unknown;
+      try {
+        result = await native.execute(call.input, {
+          sessionID: 'root',
+          id,
+          signal: new AbortController().signal,
+          progress: async () => {},
+        });
+      } catch (failure) {
+        error = failure;
+        throw failure;
+      } finally {
+        await calls.toolAfterCb?.({
+          ...call,
+          status: error ? 'error' : 'completed',
+          result,
+          error,
+        });
+      }
+    };
+    const context = () => ({
+      sessionID: childID,
+      agent: 'explorer',
+      model: { providerID: 'native', id: 'resolved-default' },
+      options: {},
+      system: [],
+      messages: [],
+      tools: {},
+    });
+    const request = { ...context(), kind: 'primary', headers: {} };
+    try {
+      await calls.promptHookCb?.({
+        sessionID: 'root',
+        messageID: 'root-message',
+        prompt: { text: 'delegate' },
+      });
+      await launch('auto-create', false);
+      expect(requestHook).toBeFunction();
+      const first = context();
+      await calls.contextHookCb?.(first);
+      expect(first.options).toMatchObject({ temperature: 0.2 });
+      await requestHook?.(request); // revision 0, host model still absent
+      await rpc.apply(
+        { sessionID: 'root', presetName: 'B' },
+        { signal: new AbortController().signal },
+      );
+      await launch('auto-options-revision', true);
+      expect(identities.get(childID)).not.toHaveProperty('model');
+      expect(switches).toBe(0);
+      // Same real Model.Ref, different execution revision: the old prepared
+      // context cannot use current KV to pretend it prepared the new options.
+      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
+      const second = context();
+      await calls.contextHookCb?.(second);
+      expect(second.options).toMatchObject({ temperature: 0.7 });
+      await requestHook?.(request);
+      // Check the actual compiler + before boundary, not a synthetic bundle:
+      // a tail-only chain compiles without a model only under inheritance;
+      // before refuses it without the required parent ref, before native runs.
+      await rpc.apply(
+        { sessionID: 'root', presetName: 'InheritedTail' },
+        { signal: new AbortController().signal },
+      );
+      const inherited = (await ctx.storage?.get(
+        'session-preset/v1/root',
+      )) as any;
+      expect(inherited.bundle.profiles.explorer.model).toBeUndefined();
+      expect(inherited.bundle.chains.explorer).toHaveLength(2);
+      expect(inherited.bundle.inheritance.explorer).toBe('session');
+      await expect(
+        calls.toolBeforeCb?.({
+          tool: 'subagent',
+          sessionID: 'root',
+          id: 'unresolved-inheritance',
+          input: { agent: 'explorer', prompt: 'work', background: true },
+        }),
+      ).rejects.toThrow('Inherited subagent parent model unavailable');
+      // An independent configured chain instead owns a concrete head model.
+      await rpc.apply(
+        { sessionID: 'root', presetName: 'SelectedChain' },
+        { signal: new AbortController().signal },
+      );
+      const chained = (await ctx.storage?.get('session-preset/v1/root')) as any;
+      expect(chained.bundle.profiles.explorer.model).toMatchObject({
+        providerID: 'test',
+        id: 'selected-A',
+      });
+      expect(chained.bundle.chains.explorer).toHaveLength(2);
+      const selectedCall = {
+        tool: 'subagent',
+        sessionID: 'root',
+        id: 'compiled-selection',
+        input: {
+          agent: 'explorer',
+          prompt: 'work',
+          background: true,
+        } as Record<string, unknown>,
+      };
+      await calls.toolBeforeCb?.(selectedCall);
+      expect(selectedCall.input.model).toBe('test/selected-A');
+      await calls.toolAfterCb?.({
+        ...selectedCall,
+        status: 'error',
+        error: new Error('fixture ends before native selection'),
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
   test('returns cleanly without registering when disabled by env', async () => {
     process.env.OH_MY_OPENCODE_SLIM_DISABLE = '1';
     const { ctx, calls } = makeMockV2Context(projectDir);

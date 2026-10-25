@@ -737,11 +737,34 @@ export function createSessionPresets(options: {
       assertStable(id, record);
       if ((record?.revision ?? 0) !== revision)
         throw new Error('Session preset request revision mismatch');
+      const request = model.safeParse(actual);
+      if (!request.success || request.data.variant === '')
+        throw new Error('Session preset request model/variant mismatch');
+      const agent = typeof info.agent === 'string' ? info.agent : undefined;
+      const bundle = record?.execution ?? record?.bundle;
+      // The native runner can resolve a default without persisting session.model.
+      // This is an automatic-selection policy, not equality with a missing ref:
+      // an explicit/preset/inherited selection still requires a complete host ref.
+      if (
+        info.model == null &&
+        record?.parentID &&
+        record.parentID === info.parentID &&
+        record?.explicitModel === false &&
+        !record.executionModel &&
+        !record.inheritedProviderID &&
+        agent &&
+        bundle &&
+        !bundle.profiles[agent]?.model &&
+        !bundle.inheritance[agent] &&
+        (!bundle.fallbackEnabled || !bundle.chains[agent]?.length)
+      )
+        return;
       if (!sameSelection(info.model, actual))
         throw new Error('Session preset request model/variant mismatch');
     },
     assertStable: (id: string) => assertStable(id, cache.get(id)),
     resumeChild,
+    inspectResume,
     ensure,
     bindChild,
     checkActive: check,
