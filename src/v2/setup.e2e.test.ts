@@ -27,11 +27,13 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import type { BundledSkillInfo } from '../cli/custom-skills';
-import { stateFilePath } from '../companion/manager';
+import { CompanionManager, stateFilePath } from '../companion/manager';
 import { RuntimeConfig } from '../config/runtime';
+import { ForegroundFallbackManager } from '../hooks/foreground-fallback';
 import { MarketplaceStore } from '../marketplace/store';
 import { createEventDirectoryScope } from '../utils/event-directory-scope';
 import { flushLoggerForTesting } from '../utils/logger';
+import { tick } from '../utils/test-timers';
 import { compilePermissionPolicy } from './permissions';
 import { createV2Setup } from './setup';
 import * as subagentWrapper from './subagent-executor-wrapper';
@@ -1561,6 +1563,127 @@ describe('createV2Setup e2e', () => {
       await cleanup();
     }
   }, 20_000);
+
+  test.each([false, true])(
+    'setup cleanup drains actual fallback native switch before replacement publication (other cleanup throws: %s)',
+    async (cleanupThrows) => {
+      const { ctx, calls, events } = makeMockV2Context(projectDir);
+      const id = 'ses_real_fallback_drain';
+      const record = {
+        schemaVersion: 2,
+        revision: 0,
+        parentID: 'root',
+        preserveModel: true,
+        explicitModel: false,
+        bundle: {
+          presetName: null,
+          fallbackEnabled: true,
+          profiles: {
+            explorer: {
+              model: { providerID: 'test', id: 'A' },
+              sidebarModel: 'test/A',
+            },
+          },
+          chains: { explorer: [{ id: 'test/A' }, { id: 'test/B' }] },
+          inheritance: {},
+        },
+      };
+      await ctx.storage?.set(`session-preset/v1/${id}`, record);
+      let selected = { providerID: 'test', id: 'A' };
+      ctx.session.get = async ({ sessionID }) => ({
+        id: sessionID,
+        parentID: 'root',
+        directory: projectDir,
+        agent: 'explorer',
+        model: selected,
+      });
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      ctx.session.switchModel = async ({ model }) => {
+        entered.resolve();
+        await release.promise;
+        selected = model;
+      };
+      let retryHook: ((event: any) => Promise<void>) | undefined;
+      const hook = ctx.session.hook;
+      (ctx.session as any).hook = (name: string, callback: any) => {
+        if (name === 'retry') retryHook = callback;
+        return hook.call(ctx.session, name as never, callback);
+      };
+      const cleanup = await createV2Setup()(ctx);
+      const prompt = {
+        sessionID: id,
+        messageID: 'prepare',
+        prompt: { text: 'work' },
+      };
+      await calls.promptHookCb?.(prompt);
+      expect(retryHook).toBeFunction();
+      const retry = retryHook?.({
+        sessionID: id,
+        agent: 'explorer',
+        model: selected,
+        error: { message: 'Rate limit exceeded' },
+        decision: { retry: false },
+      });
+      await entered.promise;
+      const retiring = Promise.withResolvers<void>();
+      const disposeFallback = ForegroundFallbackManager.prototype.dispose;
+      const disposeSpy = spyOn(
+        ForegroundFallbackManager.prototype,
+        'dispose',
+      ).mockImplementation(function () {
+        const drain = disposeFallback.call(this);
+        retiring.resolve();
+        return drain;
+      });
+      const exit = CompanionManager.prototype.onExit;
+      const exitSpy = cleanupThrows
+        ? spyOn(CompanionManager.prototype, 'onExit').mockImplementation(
+            function () {
+              exit.call(this);
+              throw new Error('other cleanup failed');
+            },
+          )
+        : undefined;
+      let finished = false;
+      const draining = cleanup().then(() => {
+        finished = true;
+      });
+      try {
+        await retiring.promise;
+        await tick();
+        expect(finished).toBe(false);
+        expect(events.isReturnCalled()).toBe(true);
+        expect(selected.id).toBe('A');
+        release.resolve();
+        await draining;
+        await retry;
+        expect(selected.id).toBe('B');
+        exitSpy?.mockRestore();
+        disposeSpy.mockRestore();
+        const next = makeMockV2Context(projectDir);
+        (next.ctx as any).storage = ctx.storage;
+        next.ctx.session.get = ctx.session.get;
+        const disposeNext = await createV2Setup()(next.ctx);
+        try {
+          // The next generation's FIRST real publisher must not see an old
+          // global inProgress owner after the previous setup cleanup resolved.
+          await next.calls.promptHookCb?.({
+            ...prompt,
+            messageID: 'next-generation',
+          });
+        } finally {
+          await disposeNext();
+        }
+      } finally {
+        release.resolve();
+        await retry;
+        await draining;
+        exitSpy?.mockRestore();
+        disposeSpy.mockRestore();
+      }
+    },
+  );
 
   test('returns cleanly without registering when disabled by env', async () => {
     process.env.OH_MY_OPENCODE_SLIM_DISABLE = '1';

@@ -669,6 +669,9 @@ export class ForegroundFallbackManager {
   private readonly quotaExhaustedProviders = new Map<string, Set<string>>();
   /** Process-local sessions with an active fallback switch in flight. */
   private readonly inProgress = getProcessFallbacksInProgress();
+  /** This instance's real v2 native calls, including calls whose admission
+   * timed out. Other locations retain their own independent drain. */
+  private readonly switchRequests = new Set<Promise<unknown>>();
   /** One-shot v2 retry-hook delivery notices, keyed by sessionID and the
    *  failing model ("providerID/modelID"). Proves hook delivery per
    *  session/model episode without per-event log noise. */
@@ -932,8 +935,9 @@ export class ForegroundFallbackManager {
    *  mid-attempt — pending timers are cancelled here, and suspension
    *  points inside tryFallback/tryFallbackWithAbort/execFallback abandon
    *  their continuation (see abandonedByDispose) so no replay, abort, or
-   *  transcript read runs through the destroyed generation's client. */
-  dispose(): void {
+   *  transcript read runs through the destroyed generation's client. Real
+   *  native switches cannot be cancelled: return their settlement barrier. */
+  dispose(): Promise<void> {
     this.disposed = true;
     for (const pending of this.pendingInitialDelay.values()) {
       clearTimeout(pending.timer);
@@ -942,6 +946,7 @@ export class ForegroundFallbackManager {
     this.replayMessageIds.clear();
     this.userEventSequence.clear();
     this.v2RetryNotices.clear();
+    return Promise.allSettled([...this.switchRequests]).then(() => {});
   }
 
   /** Dispose fence for fallback chains: true when this generation was
@@ -1900,19 +1905,25 @@ export class ForegroundFallbackManager {
       const { agentName, nextModel, ref, variant } = selected;
       picked = nextModel;
       this.inProgress.add(sessionID);
-      switchRequest = Promise.resolve().then(() =>
-        switchModel(sessionID, {
+      switchRequest = Promise.resolve().then(() => {
+        // Disposal can run after the slot is claimed but before this queued
+        // callback starts. Never issue a fresh native write from that callback.
+        if (this.disposed) return;
+        return switchModel(sessionID, {
           providerID: ref.providerID,
           id: ref.modelID,
           ...(variant ? { variant } : {}),
-        }),
-      );
+        });
+      });
+      const request = switchRequest;
+      this.switchRequests.add(request);
       // The timeout does not cancel the native switch. Keep the real flight
       // fenced until settlement, including across a plugin-generation reload.
-      void switchRequest.then(
-        () => this.inProgress.delete(sessionID),
-        () => this.inProgress.delete(sessionID),
-      );
+      const release = () => {
+        this.switchRequests.delete(request);
+        this.inProgress.delete(sessionID);
+      };
+      void request.then(release, release);
       await withTimeout(
         switchRequest,
         HOST_CALL_TIMEOUT_MS,
