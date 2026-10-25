@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { testRender } from '@opentui/solid';
-import { projectSidebarTeam, renderSidebar } from '../tui';
+import {
+  getSidebarAgentTargets,
+  getSidebarReusableTargets,
+  projectSidebarTeam,
+  renderSidebar,
+} from '../tui';
 import { readTuiSnapshot } from '../tui-state';
 import type { SessionPresetState } from './preset-rpc';
 import { makeTestEnv } from './test-fixtures';
@@ -45,6 +50,20 @@ describe('window-local sidebar team', () => {
     });
     expect(first.agentVariants).toEqual({});
     expect(second.agentModels.oracle).toBe('second/same-name-update');
+    const legacy = projectSidebarTeam(snapshot, {
+      ...state(),
+      team: {
+        agentModels: { librarian: 'saved/legacy-model' },
+        agentVariants: { librarian: 'medium' },
+        inheritance: { 'frontend-ui-ux-engineer': 'session' },
+      },
+    });
+    expect(legacy.agentModels).toEqual({
+      oracle: 'Unknown',
+      explorer: 'saved/legacy-model',
+      designer: 'Inherits session',
+    });
+    expect(legacy.agentVariants).toEqual({ explorer: 'medium' });
     expect(snapshot).toEqual(before);
     expect(readTuiSnapshot(env.projectDir).agentModels).toEqual({});
   });
@@ -61,47 +80,110 @@ describe('window-local sidebar team', () => {
 
   test('current model, future delegation and existing task model have separate labels', async () => {
     const snapshot = readTuiSnapshot(env.projectDir);
-    snapshot.agentModels = { oracle: 'latest/definition' };
-    snapshot.activeSessions = { ses_task: 'oracle' };
+    snapshot.agentModels = {
+      oracle: 'latest/definition',
+      explorer: 'latest/explorer',
+    };
+    snapshot.agentDisplayNames = {
+      explore: 'explorer',
+      librarian: 'explorer',
+      custom_a: 'custom reviewer',
+      custom_b: 'custom reviewer',
+    };
     snapshot.sessionParents = { ses_task: 'ses_root' };
-    const saved = state();
-    const rendered = await testRender(
-      () =>
-        renderSidebar(
-          projectSidebarTeam(snapshot, saved),
-          'test',
-          {
-            accent: '#777777',
-            background: '#111111',
-            borderActive: '#555555',
-            text: '#eeeeee',
-            textMuted: '#aaaaaa',
-          },
-          false,
-          false,
-          () => 0,
-          'ses_root',
-          undefined,
-          { name: 'global', sessionLabel: 'same-name' },
-          undefined,
-          {
-            state: saved,
-            nativeModel: 'native/main-model',
-            taskModel: () => 'actual/task-model',
-          },
-        ),
-      { width: 80, height: 30 },
-    );
-    try {
-      await rendered.renderOnce();
-      const frame = rendered.captureCharFrame();
-      expect(frame).toContain('Current model: native/main-model');
-      expect(frame).toContain('Team · next delegation');
-      expect(frame).toContain('team-model');
-      expect(frame).toContain('Task: actual/task-model');
-      expect(frame).not.toContain('latest/definition');
-    } finally {
-      rendered.renderer.destroy();
+    const saved: SessionPresetState = {
+      ...state(),
+      team: {
+        agentModels: {
+          orchestrator: 'capture/root',
+          // Canonical entries win even when inserted after their aliases.
+          explore: 'legacy/explore',
+          librarian: 'legacy/librarian',
+          explorer: 'capture/b',
+          oracle: 'saved/team-model',
+          custom_a: 'saved/custom-model',
+          custom_b: 'saved/custom-model',
+        },
+        agentVariants: {
+          explore: 'low',
+          librarian: 'medium',
+          explorer: 'high',
+        },
+        inheritance: {},
+      },
+    };
+    const savedBefore = structuredClone(saved);
+    for (const taskAgent of ['explorer', 'explore', 'librarian']) {
+      snapshot.activeSessions = { ses_task: taskAgent };
+      snapshot.reusableByAgent = {
+        ses_root: {
+          explorer: [{ taskID: 'ses_task', alias: 'exp-1', running: true }],
+          librarian: [{ taskID: 'ses_task', alias: 'exp-1', running: true }],
+        },
+      };
+      const before = structuredClone(snapshot);
+      const projected = projectSidebarTeam(snapshot, saved);
+      expect(projected.agentModels).toEqual({
+        oracle: 'saved/team-model',
+        explorer: 'capture/b',
+        orchestrator: 'capture/root',
+        custom_a: 'saved/custom-model',
+        custom_b: 'saved/custom-model',
+      });
+      expect(projected.agentVariants).toEqual({ explorer: 'high' });
+      expect(getSidebarAgentTargets(projected, 'ses_root')).toMatchObject([
+        {
+          agentName: 'explorer',
+          sessions: [{ sessionID: 'ses_task', agentName: 'explorer' }],
+        },
+      ]);
+      expect(
+        getSidebarReusableTargets(projected, 'ses_root').get('explorer'),
+      ).toHaveLength(1);
+      const rendered = await testRender(
+        () =>
+          renderSidebar(
+            projected,
+            'test',
+            {
+              accent: '#777777',
+              background: '#111111',
+              borderActive: '#555555',
+              text: '#eeeeee',
+              textMuted: '#aaaaaa',
+            },
+            false,
+            false,
+            () => 0,
+            'ses_root',
+            undefined,
+            { name: 'global', sessionLabel: 'same-name' },
+            undefined,
+            {
+              state: saved,
+              nativeModel: 'native/main-model',
+              taskModel: () => 'actual/task-model',
+            },
+          ),
+        { width: 80, height: 40 },
+      );
+      try {
+        await rendered.renderOnce();
+        const frame = rendered.captureCharFrame();
+        expect(frame).toContain('Current model: native/main-model');
+        expect(frame).toContain('Team · next delegation');
+        expect(frame).toContain('team-model');
+        expect(frame).toContain('Task: actual/task-model');
+        expect(frame.match(/\bexplorer\b/g)).toHaveLength(1);
+        expect(frame.match(/custom reviewer/g)).toHaveLength(2);
+        expect(frame.match(/Task: actual\/task-model/g)).toHaveLength(1);
+        expect(frame).not.toContain('legacy/');
+        expect(frame).not.toContain('latest/definition');
+        expect(snapshot).toEqual(before);
+        expect(saved).toEqual(savedBefore);
+      } finally {
+        rendered.renderer.destroy();
+      }
     }
   });
 });

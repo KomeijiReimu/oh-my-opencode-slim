@@ -9,12 +9,14 @@ import type { JSX } from '@opentui/solid';
 import { createElement, insert, setProp } from '@opentui/solid';
 import { createSignal } from 'solid-js';
 import {
+  AGENT_ALIASES,
   ALL_AGENT_NAMES,
   DEFAULT_DISABLED_AGENTS,
   SUBAGENT_NAMES,
 } from './config/constants';
 import { loadPluginConfig } from './config/loader';
 import { MultiplexerConfigSchema, type MultiplexerType } from './config/schema';
+import { lookupWithAliases } from './config/utils';
 import {
   createOnceGate,
   logHostUnsupported,
@@ -1425,28 +1427,74 @@ export interface SidebarSessionView {
   taskModel?: (sessionID: string) => string | undefined;
 }
 
+function canonicalSidebarAgentName(name: string): string {
+  return Object.hasOwn(AGENT_ALIASES, name) ? AGENT_ALIASES[name] : name;
+}
+
 /** Window-local view only. Never writes the directory-wide TuiSnapshot. */
 export function projectSidebarTeam(
   snapshot: TuiSnapshot,
   state?: SessionPresetState,
 ): TuiSnapshot {
   const team = state?.team;
-  const names = new Set([
-    ...getSidebarAgentNames(snapshot),
-    ...Object.keys(team?.agentModels ?? {}),
-    ...Object.keys(team?.inheritance ?? {}),
-  ]);
+  // Compatibility IDs are not extra team members. Do not deduplicate display
+  // names or models: distinct custom agents can legitimately share either.
+  const names = new Set(
+    [
+      ...getSidebarAgentNames(snapshot),
+      ...Object.keys(team?.agentModels ?? {}),
+      ...Object.keys(team?.inheritance ?? {}),
+    ].map(canonicalSidebarAgentName),
+  );
   return {
     ...snapshot,
     agentModels: Object.fromEntries(
-      [...names].map((name) => [
-        name,
-        team?.inheritance[name]
-          ? `Inherits ${team.inheritance[name]}`
-          : (team?.agentModels[name] ?? 'Unknown'),
+      [...names].map((name) => {
+        const inheritance = lookupWithAliases(team?.inheritance ?? {}, name);
+        return [
+          name,
+          inheritance
+            ? `Inherits ${inheritance}`
+            : (lookupWithAliases(team?.agentModels ?? {}, name) ?? 'Unknown'),
+        ];
+      }),
+    ),
+    agentVariants: Object.fromEntries(
+      [...names].flatMap((name) => {
+        const variant = lookupWithAliases(team?.agentVariants ?? {}, name);
+        return variant === undefined ? [] : [[name, variant]];
+      }),
+    ),
+    // Preserve legacy task destinations under their canonical row. Only the
+    // local projection changes; the original execution IDs remain untouched.
+    activeSessions: Object.fromEntries(
+      Object.entries(snapshot.activeSessions).map(([sessionID, name]) => [
+        sessionID,
+        canonicalSidebarAgentName(name),
       ]),
     ),
-    agentVariants: { ...team?.agentVariants },
+    reusableByAgent: Object.fromEntries(
+      Object.entries(snapshot.reusableByAgent).map(([parentID, byAgent]) => {
+        const canonical = new Map<string, (typeof byAgent)[string]>();
+        for (const [name, entries] of Object.entries(byAgent)) {
+          const key = canonicalSidebarAgentName(name);
+          canonical.set(key, [...(canonical.get(key) ?? []), ...entries]);
+        }
+        // The activity reader expects running entries before terminal history.
+        return [
+          parentID,
+          Object.fromEntries(
+            [...canonical].map(([name, entries]) => [
+              name,
+              entries.sort(
+                (a, b) =>
+                  Number(b.running === true) - Number(a.running === true),
+              ),
+            ]),
+          ),
+        ];
+      }),
+    ),
   };
 }
 
