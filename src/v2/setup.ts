@@ -2548,6 +2548,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         storage: ctx.storage,
         session: ctx.session,
         directory,
+        location: ctx.location,
         agents: () => ctx.agent.list(),
         current: () => {
           if (!currentBundle)

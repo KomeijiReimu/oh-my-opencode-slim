@@ -34,6 +34,7 @@
 import type { RpcCallOptions } from '@opencode/client';
 import type { EventDomain } from '@opencode/plugin/promise/event';
 import type { PermissionDomain } from '@opencode/plugin/promise/permission';
+import type { Context as OfficialContext } from '@opencode/plugin/promise/plugin';
 import type { RpcDomain, RpcHandlers } from '@opencode/plugin/promise/rpc';
 import type {
   SessionDomain,
@@ -202,6 +203,25 @@ type _createMirrorInput = Expect<
   Parameters<
     NonNullable<V2Context['session']['create']>
   >[0] extends NonNullable<Parameters<SessionDomain['create']>[0]>
+    ? true
+    : false
+>;
+type _contextCreationScope = Expect<
+  OfficialContext['location'] extends NonNullable<V2Context['location']>
+    ? true
+    : false
+>;
+type _contextWorkspaceAvailable = Expect<
+  Equal<
+    'workspaceID' extends keyof OfficialContext['location'] ? true : false,
+    true
+  >
+>;
+type _createDefaultLocation = Expect<
+  Omit<
+    Parameters<NonNullable<V2Context['session']['create']>>[0],
+    'location'
+  > extends NonNullable<Parameters<SessionDomain['create']>[0]>
     ? true
     : false
 >;

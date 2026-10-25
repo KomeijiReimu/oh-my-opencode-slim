@@ -143,6 +143,7 @@ describe('durable session team presets', () => {
         storage,
         session: session as never,
         directory: '/project',
+        location: { directory: '/project' },
         current: () => current,
         named: async (name) => bundle(name),
       });
@@ -415,6 +416,7 @@ describe('durable session team presets', () => {
         storage: f.storage,
         session: session as never,
         directory: '/project',
+        location: { directory: '/project' },
         current: () => f.bundle('default'),
         named: async (name) => {
           namedCalls++;

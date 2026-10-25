@@ -55,9 +55,17 @@ const stableSchema = z
     executionModel: model.optional(),
   })
   .strict();
+const creationScopeSchema = z
+  .object({
+    directory: z.string().min(1),
+    // null is proven local; absent scope on old records means unknown.
+    workspaceID: z.string().min(1).nullable(),
+  })
+  .strict();
 const createInputSchema = z
   .object({
     directory: z.string().min(1),
+    scope: creationScopeSchema.optional(),
     operationID: z.string().min(1),
     presetName: z.string().min(1),
     agent: z.string().min(1),
@@ -238,6 +246,10 @@ export function createSessionPresets(options: {
   storage: V2Context['storage'];
   session: V2Context['session'];
   directory: string;
+  location?: Pick<
+    NonNullable<V2Context['location']>,
+    'directory' | 'workspaceID'
+  >;
   current: () => SessionTeamBundle;
   named: (name: string) => Promise<SessionTeamBundle>;
   agents?: () => Promise<unknown>;
@@ -257,6 +269,26 @@ export function createSessionPresets(options: {
   const check = (signal?: AbortSignal) => {
     if (retired) throw new Error('Session preset generation retired');
     signal?.throwIfAborted();
+  };
+  const creationScope = () => {
+    if (!options.location)
+      throw new Error('Bound session creation scope unavailable');
+    const scope = creationScopeSchema.parse({
+      directory: path.resolve(options.location.directory),
+      workspaceID: options.location.workspaceID ?? null,
+    });
+    if (scope.directory !== path.resolve(options.directory))
+      throw new Error('Bound session creation scope mismatch');
+    return scope;
+  };
+  const assertCreationScope = (input: z.infer<typeof createInputSchema>) => {
+    if (!input.scope)
+      throw new Error('Bound session creation scope unknown; cannot retry');
+    if (
+      input.directory !== input.scope.directory ||
+      !isDeepStrictEqual(input.scope, creationScope())
+    )
+      throw new Error('Bound session creation scope mismatch');
   };
   const requireAvailable = () => {
     check();
@@ -552,23 +584,26 @@ export function createSessionPresets(options: {
       );
     }
     const { input } = operation;
-    if (input.directory !== path.resolve(options.directory))
-      throw new Error('Session preset initialization location mismatch');
+    assertCreationScope(input);
     const create = options.session.create;
     if (!create) throw new Error('Bound session creation unavailable');
     // Native create is idempotent by caller-supplied ID. On retry a created
     // session is verified, not recreated or silently replaced by another ID.
     const found = await lookup(id);
+    check(signal);
+    assertCreationScope(input);
     if (!found) {
       await create.call(options.session, {
         id,
         agent: input.agent,
         model: input.model,
-        location: { directory: options.directory },
+        // Public create.location strips workspaceID. The frozen, verified
+        // context scope above authorizes using the host's complete default.
       });
     }
     check(signal);
     const info = await identity(id);
+    assertCreationScope(input);
     if (
       info.parentID ||
       info.agent !== input.agent ||
@@ -757,7 +792,7 @@ export function createSessionPresets(options: {
       });
     },
     async createBound(
-      input: Omit<z.infer<typeof createInputSchema>, 'directory'> & {
+      input: Omit<z.infer<typeof createInputSchema>, 'directory' | 'scope'> & {
         sessionID: string;
       },
       signal?: AbortSignal,
@@ -769,6 +804,7 @@ export function createSessionPresets(options: {
       const frozenInput = createInputSchema.parse({
         ...intent,
         directory: path.resolve(options.directory),
+        scope: creationScope(),
       });
       return serial(id, async () => {
         const previous = await read(id);

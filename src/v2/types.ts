@@ -271,7 +271,7 @@ export interface V2Context {
       id: string;
       agent: string;
       model: ModelRef;
-      location: { directory: string };
+      location?: { directory: string };
     }): Promise<unknown>;
     hook(
       name: 'context',

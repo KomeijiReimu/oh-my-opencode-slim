@@ -705,7 +705,7 @@ async function createEmptySession(run: ManagerRun, presetName: string) {
       run.ctx,
       'warning',
       'Creation already recorded',
-      'Use the recorded creation in Presets before starting another.',
+      'Finish it in the recorded workspace, or forget the local retry record in Presets.',
     );
     return;
   }

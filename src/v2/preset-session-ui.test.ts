@@ -262,6 +262,15 @@ describe('local creation retry record', () => {
       expect(h.toasts.at(-1)?.title).toBe('Creation not confirmed');
       expect(rpcCalls).toBe(1);
 
+      h.script.push('cheap', 'create-session');
+      await openPresetManagerV2(h.ctx, directory);
+      expect(h.toasts.at(-1)?.title).toBe('Creation already recorded');
+      expect(h.toasts.at(-1)?.message).toContain('recorded workspace');
+      expect(h.toasts.at(-1)?.message).toContain(
+        'forget the local retry record',
+      );
+      expect(rpcCalls).toBe(1);
+
       accept = true;
       h.script.push('__omo_forget_create__');
       await openPresetManagerV2(h.ctx, directory);
