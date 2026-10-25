@@ -78,7 +78,7 @@ describe('window-local sidebar team', () => {
     ).toBe('Unknown');
   });
 
-  test('current model, future delegation and existing task model have separate labels', async () => {
+  test('committed model, picker, future delegation and existing task keep separate labels', async () => {
     const snapshot = readTuiSnapshot(env.projectDir);
     snapshot.agentModels = {
       oracle: 'latest/definition',
@@ -162,6 +162,7 @@ describe('window-local sidebar team', () => {
             {
               state: saved,
               nativeModel: 'native/main-model',
+              selectedModel: 'picker/next-model #high',
               taskModel: () => 'actual/task-model',
             },
           ),
@@ -171,7 +172,11 @@ describe('window-local sidebar team', () => {
         await rendered.renderOnce();
         const frame = rendered.captureCharFrame();
         expect(frame).toContain('Current model: native/main-model');
+        expect(frame).toContain('Next prompt: picker/next-model #high');
         expect(frame).toContain('Team · next delegation');
+        expect(frame.indexOf('Next prompt:')).toBeLessThan(
+          frame.indexOf('Team · next delegation'),
+        );
         expect(frame).toContain('team-model');
         expect(frame).toContain('Task: actual/task-model');
         expect(frame.match(/\bexplorer\b/g)).toHaveLength(1);

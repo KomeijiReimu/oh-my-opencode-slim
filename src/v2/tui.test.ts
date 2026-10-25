@@ -6,7 +6,12 @@ import { testRender } from '@opentui/solid';
 import { createSignal } from 'solid-js';
 import type { PluginConfig } from '../config';
 import baseTui from '../tui';
-import { recordTuiAgentActivity, recordTuiSessionParent } from '../tui-state';
+import {
+  readTuiSnapshot,
+  recordTuiAgentActivity,
+  recordTuiAgentModels,
+  recordTuiSessionParent,
+} from '../tui-state';
 import {
   notifyConfigChanged,
   registerConfigChangeListener,
@@ -790,6 +795,185 @@ describe('v2 tui preset plugin', () => {
           presetName: null,
           affects: 'future-delegations',
         });
+        cleanup?.();
+        screen?.renderer.destroy();
+      }
+    });
+
+    test('root picker updates immediately without overwriting committed models or saved team targets', async () => {
+      writeUserConfig(makeConfig() as unknown as Record<string, unknown>);
+      process.env.XDG_DATA_HOME = path.join(configHome, 'overlay-data');
+      process.env.OPENCODE_LOG_DIR = path.join(configHome, 'logs');
+      process.env.OH_MY_OPENCODE_SLIM_TUI_REFRESH_MS = '60000';
+      // Directory defaults, committed selection and saved team intentionally differ.
+      recordTuiAgentModels(
+        { agentModels: { orchestrator: 'zai-coding-plan/glm-5.3' } },
+        projectDir,
+      );
+      const [route, setRoute] = createSignal({
+        type: 'session',
+        sessionID: 'root-a',
+      });
+      const [selected, setSelected] = createSignal<{
+        providerID: string;
+        modelID: string;
+        variant?: string;
+      }>({ providerID: 'opencode-go', modelID: 'gemini-x', variant: 'high' });
+      const [committed, setCommitted] = createSignal({
+        providerID: 'native',
+        id: 'committed',
+        variant: 'high',
+      });
+      const team = {
+        agentModels: {
+          orchestrator: 'saved/team-root',
+          explorer: 'saved/team-child',
+          explore: 'saved/team-child',
+          librarian: 'saved/team-child',
+        },
+        agentVariants: { orchestrator: 'medium' },
+        inheritance: {},
+      };
+      const teamBefore = structuredClone(team);
+      const diskBefore = readTuiSnapshot(projectDir);
+      const stub = makeSetupCtx();
+      const ui = stub.ctx.ui as {
+        router: { current: () => unknown };
+        model?: unknown;
+      };
+      ui.router.current = route;
+      ui.model = { current: selected };
+      stub.ctx.data = {
+        session: {
+          get: (sessionID: string) =>
+            sessionID === 'root-a'
+              ? { agent: 'orchestrator', model: committed() }
+              : sessionID === 'child-1'
+                ? {
+                    parentID: 'root-a',
+                    agent: 'explorer',
+                    model: {
+                      providerID: 'native',
+                      id: 'child-model',
+                      variant: 'default',
+                    },
+                  }
+                : {
+                    agent: 'general',
+                    model: { providerID: 'native', id: 'other-root' },
+                  },
+        },
+      };
+      let notifyRendered = () => {};
+      const rendered = new Promise<void>((resolve) => {
+        notifyRendered = resolve;
+      });
+      stub.ctx.renderer = { requestRender: () => notifyRendered() };
+      let readCalls = 0;
+      stub.ctx.client = {
+        rpc: () => ({
+          read: async (input: { sessionID: string }) => {
+            readCalls++;
+            return {
+              sessionID: input.sessionID,
+              status: 'bound',
+              presetName: 'saved',
+              affects: 'future-delegations',
+              team,
+            };
+          },
+        }),
+      };
+      let cleanup: (() => void) | undefined;
+      let screen: Awaited<ReturnType<typeof testRender>> | undefined;
+      try {
+        cleanup = await tui2Plugin.setup(
+          stub.ctx as unknown as V2TuiPluginContext,
+        );
+        await rendered;
+        const sidebar = stub.slotClaims.find(
+          (slot) => slot.append === 'sidebar.content',
+        );
+        if (!sidebar?.render) throw new Error('Sidebar slot missing');
+        screen = await testRender(() => sidebar.render?.() as never, {
+          width: 80,
+          height: 32,
+        });
+        await screen.renderOnce();
+        const frame = screen.captureCharFrame();
+        expect(frame).toContain('Current model: native/committed #high');
+        expect(frame).toContain('Next prompt: opencode-go/gemini-x #high');
+        expect(frame).toContain('team-root');
+        expect(frame).toContain('team-child');
+        expect(frame.match(/\bexplorer\b/g)).toHaveLength(1);
+        expect(frame).not.toContain('glm-5.3');
+
+        // No config refresh, RPC or prompt: native reactive selection changes
+        // repaint immediately, and clearing a variant does not change the team.
+        for (const variant of [undefined, '', 'default']) {
+          setSelected({
+            providerID: 'opencode-go',
+            modelID: 'gemini-x',
+            variant,
+          });
+          await screen.renderOnce();
+          const updated = screen.captureCharFrame();
+          expect(
+            updated.split('\n').find((line) => line.includes('Next prompt:')),
+          ).not.toContain('#');
+          expect(updated).toContain('Current model: native/committed #high');
+          expect(updated).toContain('team-root');
+        }
+        setCommitted({
+          providerID: 'opencode-go',
+          id: 'gemini-x',
+          variant: 'default',
+        });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).toContain(
+          'Current model: opencode-go/gemini-x',
+        );
+        expect(screen.captureCharFrame()).not.toContain('Next prompt:');
+        expect(screen.captureCharFrame()).not.toContain('#default');
+
+        setSelected({
+          providerID: 'picked',
+          modelID: 'unsent',
+          variant: 'medium',
+        });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).toContain(
+          'Next prompt: picked/unsent #medium',
+        );
+        setRoute({ type: 'session', sessionID: 'child-1' });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).toContain(
+          'Current model: native/child-model',
+        );
+        expect(screen.captureCharFrame()).not.toContain('Next prompt:');
+        expect(screen.captureCharFrame()).not.toContain('picked/unsent');
+        expect(screen.captureCharFrame()).not.toContain('#default');
+        setRoute({ type: 'session', sessionID: 'root-a' });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).toContain(
+          'Next prompt: picked/unsent #medium',
+        );
+        expect(screen.captureCharFrame()).toContain('team-root');
+        setRoute({ type: 'session', sessionID: 'root-b' });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).toContain(
+          'Current model: native/other-root',
+        );
+        expect(screen.captureCharFrame()).not.toContain('Next prompt:');
+        setRoute({ type: 'home', sessionID: '' });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).toContain('glm-5.3');
+        expect(screen.captureCharFrame()).not.toContain('Next prompt:');
+        expect(screen.captureCharFrame()).not.toContain('Current model:');
+        expect(readCalls).toBe(1);
+        expect(team).toEqual(teamBefore);
+        expect(readTuiSnapshot(projectDir)).toEqual(diskBefore);
+      } finally {
         cleanup?.();
         screen?.renderer.destroy();
       }

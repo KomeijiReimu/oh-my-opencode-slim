@@ -26,6 +26,7 @@ import {
   readConfigState,
   renderSidebar,
   resolveHoverBackground,
+  resolveSelectedRootModel,
   resolveSidebarSlotOrder,
   resolveTuiPaneDirectory,
   STATUS_DOT_GLYPH,
@@ -208,6 +209,86 @@ function createSnapshot(overrides: Partial<TuiSnapshot> = {}): TuiSnapshot {
   };
 }
 
+describe('resolveSelectedRootModel', () => {
+  const selection = {
+    providerID: 'opencode-go',
+    modelID: 'gemini-x',
+    variant: 'high',
+  };
+
+  test('root orchestrator session yields the picker model', () => {
+    for (const variant of ['high', undefined, '', 'default']) {
+      expect(
+        resolveSelectedRootModel({
+          route: { type: 'session', sessionID: 'root-a' },
+          sessionInfo: { agent: 'orchestrator' },
+          selected: { ...selection, variant },
+        }),
+      ).toBe(`opencode-go/gemini-x${variant === 'high' ? ' #high' : ''}`);
+    }
+  });
+
+  test('agent-less root session (host default shape) still yields it', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'root-a' },
+        sessionInfo: {},
+        selected: { providerID: 'zai-coding-plan', modelID: 'glm-5.3' },
+      }),
+    ).toBe('zai-coding-plan/glm-5.3');
+  });
+
+  test('child session (parentID) is not overlaid', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'child-1' },
+        sessionInfo: { parentID: 'root-a', agent: 'explorer' },
+        selected: selection,
+      }),
+    ).toBeUndefined();
+  });
+
+  test('home screen has no session to speak for', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'home' },
+        sessionInfo: { agent: 'orchestrator' },
+        selected: selection,
+      }),
+    ).toBeUndefined();
+  });
+
+  test('root session under another primary agent is not overlaid', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'root-b' },
+        sessionInfo: { agent: 'general' },
+        selected: selection,
+      }),
+    ).toBeUndefined();
+  });
+
+  test('missing optional host APIs degrade to no overlay', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'root-a' },
+        sessionInfo: undefined, // data.session.get absent
+        selected: undefined, // ui.model.current absent
+      }),
+    ).toBeUndefined();
+  });
+
+  test('malformed selection payload is rejected', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'root-a' },
+        sessionInfo: { agent: 'orchestrator' },
+        selected: { providerID: 42, modelID: 'gemini-x' },
+      }),
+    ).toBeUndefined();
+  });
+});
+
 describe('tui sidebar agents', () => {
   test('scopes active agents to the visible conversation (#1147)', () => {
     const snapshot = createSnapshot({
@@ -255,6 +336,41 @@ describe('tui sidebar agents', () => {
 
     expect(agentNames).toEqual(['explorer', 'fixer']);
     expect(agentNames).not.toContain('observer');
+  });
+
+  test('hides council agents from persisted snapshot models (#1672)', () => {
+    const agentNames = getSidebarAgentNames(
+      createSnapshot({
+        agentModels: {
+          oracle: 'openai/gpt-6',
+          council: 'openai/gpt-6',
+          councillor: 'openai/gpt-6',
+          'councillor-alpha': 'openai/gpt-6',
+          'councillor-beta': 'anthropic/claude-x',
+          explorer: 'openai/gpt-6-luna',
+        },
+      }),
+    );
+
+    // Ordinary agents keep their snapshot order; council surfaces never show.
+    expect(agentNames).toEqual(['oracle', 'explorer']);
+  });
+
+  test('council-only snapshot models fall back to the default agent list (#1672)', () => {
+    const agentNames = getSidebarAgentNames(
+      createSnapshot({
+        agentModels: {
+          council: 'openai/gpt-6',
+          'councillor-alpha': 'openai/gpt-6',
+        },
+      }),
+    );
+
+    expect(agentNames).toContain('explorer');
+    expect(agentNames).toContain('fixer');
+    expect(agentNames).not.toContain('council');
+    expect(agentNames).not.toContain('councillor');
+    expect(agentNames).not.toContain('councillor-alpha');
   });
 
   test('fills empty snapshot models from the v1 host agent list (#1133)', async () => {

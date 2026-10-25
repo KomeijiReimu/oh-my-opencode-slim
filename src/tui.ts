@@ -63,11 +63,23 @@ import type { SessionPresetState } from './v2/preset-rpc';
 
 const PLUGIN_NAME = 'oh-my-opencode-slim';
 const CONFIG_WARNING_COLOR = 'orange';
+/**
+ * Council agents are internal orchestration surfaces: `council`,
+ * `councillor`, and the dynamic `councillor-<name>` agents (v3 registry
+ * writes them into `snapshot.agentModels`). They must never appear as
+ * sidebar rows (#1672).
+ */
+function isCouncilSidebarAgent(agent: string): boolean {
+  return (
+    agent === 'council' ||
+    agent === 'councillor' ||
+    agent.startsWith('councillor-')
+  );
+}
+
 const FALLBACK_SIDEBAR_AGENTS = SUBAGENT_NAMES.filter(
   (agent) =>
-    agent !== 'councillor' &&
-    agent !== 'council' &&
-    !DEFAULT_DISABLED_AGENTS.includes(agent),
+    !isCouncilSidebarAgent(agent) && !DEFAULT_DISABLED_AGENTS.includes(agent),
 );
 const BORDER = { type: 'single' };
 const ACTIVITY_FRAME_MS = 100;
@@ -256,7 +268,9 @@ export function splitSidebarModelId(model: string): {
 }
 
 export function getSidebarAgentNames(snapshot: TuiSnapshot): string[] {
-  const configuredAgents = Object.keys(snapshot.agentModels);
+  const configuredAgents = Object.keys(snapshot.agentModels).filter(
+    (agent) => !isCouncilSidebarAgent(agent),
+  );
   return configuredAgents.length > 0
     ? configuredAgents
     : FALLBACK_SIDEBAR_AGENTS;
@@ -303,6 +317,18 @@ function remoteModelId(model: unknown): string | undefined {
         ? rec.id
         : undefined;
   return id ? `${rec.providerID}/${id}` : undefined;
+}
+
+/** Native committed models and picker selections share the same display rules. */
+function formatSidebarModel(model: unknown): string | undefined {
+  const id = remoteModelId(model);
+  if (!id) return undefined;
+  const variant =
+    model && typeof model === 'object' && 'variant' in model
+      ? model.variant
+      : undefined;
+  // Both absence and "default" mean no variant override in the native host.
+  return `${id}${typeof variant === 'string' && variant && variant !== 'default' ? ` #${variant}` : ''}`;
 }
 
 function modelsFromAgentList(response: unknown): Record<string, string> {
@@ -1424,6 +1450,7 @@ export function getContrastForeground(
 export interface SidebarSessionView {
   state?: SessionPresetState;
   nativeModel?: string;
+  selectedModel?: string;
   taskModel?: (sessionID: string) => string | undefined;
 }
 
@@ -1597,6 +1624,15 @@ export function renderSidebar(
             text({ fg: theme.textMuted, wrapMode: 'none', truncate: true }, [
               `Current model: ${sessionView.nativeModel ?? 'Unknown'}`,
             ]),
+            ...(sessionView.selectedModel &&
+            sessionView.selectedModel !== sessionView.nativeModel
+              ? [
+                  text(
+                    { fg: theme.textMuted, wrapMode: 'none', truncate: true },
+                    [`Next prompt: ${sessionView.selectedModel}`],
+                  ),
+                ]
+              : []),
             text({ fg: theme.textMuted, marginTop: 1 }, [
               sessionView.state?.pending
                 ? 'Team update pending · new work blocked'
@@ -1951,7 +1987,11 @@ interface V2TuiContext extends V2PresetManagerContext {
   client?: unknown;
   data?: V2PresetManagerContext['data'] & {
     on?: (type: string, handler: (event: unknown) => void) => unknown;
-    session?: { get?: (sessionID: string) => { model?: unknown } | undefined };
+    session?: {
+      get?: (
+        sessionID: string,
+      ) => { model?: unknown; parentID?: unknown; agent?: unknown } | undefined;
+    };
   };
   renderer: { requestRender: () => void; getSelection?: () => unknown };
   theme: V2TuiThemeTokens;
@@ -1961,6 +2001,12 @@ interface V2TuiContext extends V2PresetManagerContext {
       current: () => { type?: string; sessionID?: string };
       /** Optional navigation capability; absent on hosts that don't expose it. */
       navigate?: (route: { type: string; sessionID: string }) => void;
+    };
+    model?: {
+      /** The prompt's selected model; variant undefined = model default. */
+      current?: () =>
+        | { providerID: string; modelID: string; variant?: string }
+        | undefined;
     };
   };
 }
@@ -2011,6 +2057,48 @@ interface SidebarRuntimeAdapter {
   ) => Promise<SessionPresetState>;
   getSessionModel?: (sessionID: string) => string | undefined;
   onMultiplexerConfig?: (type: MultiplexerType) => void;
+  /** Root picker selection, separate from committed models and saved team targets. */
+  getSelectedRootModel?: () => string | undefined;
+}
+
+/**
+ * Resolve the live picker selection without changing any saved team target.
+ *
+ * Gate 1 — route: only a session route yields a sessionID; the home
+ * screen's selection belongs to a session that does not exist yet.
+ * Gate 2 — session shape: child sessions (parentID) own their own agent
+ * rows, and a root session under another primary agent is not the
+ * plugin's orchestrator row.
+ * Gate 3 — selection shape: the host's picker payload must carry usable
+ * providerID/modelID strings.
+ */
+export function resolveSelectedRootModel(input: {
+  route: { type?: string; sessionID?: string } | undefined;
+  sessionInfo?: { parentID?: unknown; agent?: unknown } | undefined;
+  selected?:
+    | { providerID?: unknown; modelID?: unknown; variant?: unknown }
+    | undefined;
+}): string | undefined {
+  const sessionID = input.route
+    ? resolveRouteSessionId(input.route)
+    : undefined;
+  if (!sessionID) return undefined;
+  const info = input.sessionInfo;
+  if (!info || info.parentID) return undefined;
+  if (typeof info.agent === 'string' && info.agent !== 'orchestrator') {
+    return undefined;
+  }
+  const selected = input.selected;
+  if (
+    !selected ||
+    typeof selected.providerID !== 'string' ||
+    !selected.providerID ||
+    typeof selected.modelID !== 'string' ||
+    !selected.modelID
+  ) {
+    return undefined;
+  }
+  return formatSidebarModel(selected);
 }
 
 /** One refresh/animation/interaction lifecycle for both host slot contracts. */
@@ -2197,6 +2285,9 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
           ? {
               state: isCurrentProjection ? projection?.state : undefined,
               nativeModel: adapter.getSessionModel?.(visible),
+              // Read the host's reactive picker here, not in the async snapshot
+              // refresh: selection changes must show before a prompt or RPC.
+              selectedModel: adapter.getSelectedRootModel?.(),
               taskModel: adapter.getSessionModel,
             }
           : undefined;
@@ -2362,6 +2453,17 @@ async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
     hostFlavor: 'v2',
     getDirectory: () => ctx.location?.directory ?? process.cwd(),
     getVisibleSession: () => resolveRouteSessionId(ctx.ui.router.current()),
+    getSelectedRootModel: () => {
+      const route = ctx.ui.router.current();
+      const sessionID = resolveRouteSessionId(route);
+      return resolveSelectedRootModel({
+        route,
+        sessionInfo: sessionID
+          ? ctx.data?.session?.get?.(sessionID)
+          : undefined,
+        selected: ctx.ui.model?.current?.(),
+      });
+    },
     client: ctx.client,
     renderer: ctx.renderer,
     theme: () => v2ThemeView(ctx.theme),
@@ -2377,18 +2479,8 @@ async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
     },
     readSessionPreset: (directory, sessionID) =>
       readSessionPreset(ctx, sessionID, directory),
-    getSessionModel: (sessionID) => {
-      const model = ctx.data?.session?.get?.(sessionID)?.model;
-      const id = remoteModelId(model);
-      const variant =
-        model && typeof model === 'object' && 'variant' in model
-          ? model.variant
-          : undefined;
-      // The native "default" variant is the host's no-override sentinel.
-      return id
-        ? `${id}${typeof variant === 'string' && variant !== 'default' ? ` #${variant}` : ''}`
-        : undefined;
-    },
+    getSessionModel: (sessionID) =>
+      formatSidebarModel(ctx.data?.session?.get?.(sessionID)?.model),
     getPresetRow: (directory, presetName, sessionLabel) => {
       const name = presetName ?? '(none)';
       if (!canOpenPresetManagerV2(ctx)) return { name, sessionLabel };
