@@ -1685,6 +1685,58 @@ describe('createV2Setup e2e', () => {
     },
   );
 
+  test('real capture publisher failure rejects admission and is retried rather than cached as success', async () => {
+    const { ctx, calls } = makeMockV2Context(projectDir);
+    const id = 'ses_publish_retry';
+    const record = {
+      schemaVersion: 2,
+      revision: 1,
+      parentID: 'root',
+      preserveModel: true,
+      explicitModel: false,
+      bundle: {
+        presetName: null,
+        fallbackEnabled: false,
+        profiles: { explorer: { sidebarModel: 'default', temperature: 0.2 } },
+        chains: {},
+        inheritance: {},
+      },
+    };
+    await ctx.storage?.set(`session-preset/v1/${id}`, record);
+    ctx.session.get = async ({ sessionID }) => ({
+      id: sessionID,
+      parentID: 'root',
+      directory: projectDir,
+      agent: 'explorer',
+    });
+    const publish = ForegroundFallbackManager.prototype.publishSessionRevision;
+    let attempts = 0;
+    const failure = new Error('fallback model switch is still in flight');
+    const spy = spyOn(
+      ForegroundFallbackManager.prototype,
+      'publishSessionRevision',
+    ).mockImplementation(function (...args) {
+      if (args[0] === id && ++attempts === 1) throw failure;
+      return publish.apply(this, args);
+    });
+    const cleanup = await createV2Setup()(ctx);
+    const prompt = {
+      sessionID: id,
+      messageID: 'attempt-one',
+      prompt: { text: 'work' },
+    };
+    try {
+      await expect(calls.promptHookCb?.(prompt)).rejects.toBe(failure);
+      await calls.promptHookCb?.({ ...prompt, messageID: 'attempt-two' });
+      expect(attempts).toBe(2);
+      await calls.promptHookCb?.({ ...prompt, messageID: 'attempt-three' });
+      expect(attempts).toBe(2);
+    } finally {
+      spy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test('returns cleanly without registering when disabled by env', async () => {
     process.env.OH_MY_OPENCODE_SLIM_DISABLE = '1';
     const { ctx, calls } = makeMockV2Context(projectDir);

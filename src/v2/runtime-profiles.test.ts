@@ -1194,6 +1194,66 @@ describe('createSessionProfileBridge', () => {
     });
   });
 
+  test.each(['null', 'model-less', 'preserveModel'])(
+    'failed %s capture publication is shared, remains unpublished, and retries successfully',
+    async (kind) => {
+      let attempts = 0;
+      let revision = 1;
+      const ready = Promise.withResolvers<void>();
+      const entered = Promise.withResolvers<void>();
+      const profile =
+        kind === 'null'
+          ? undefined
+          : kind === 'model-less'
+            ? { sidebarModel: 'default', temperature: 0.2 }
+            : PROFILES.explorer;
+      const failure = new Error('fallback model switch is still in flight');
+      const bridge = createSessionProfileBridge({
+        profiles: () => ({}),
+        profilesForSession: async () => {
+          entered.resolve();
+          await ready.promise;
+          return profile ? { explorer: profile } : {};
+        },
+        pluginAgents: new Set(['explorer']),
+        session: undefined,
+        preserveSessionModel: () => kind === 'preserveModel',
+        revisionForSession: () => revision,
+        onSessionCaptured: () => {
+          attempts++;
+          expect(bridge.size()).toBe(0);
+          expect(bridge.profileForSession('child')).toBeUndefined();
+          if (attempts === 1) throw failure;
+        },
+      });
+      const identity = { parentID: 'root', agent: 'explorer' };
+      const first = bridge
+        .ensureSessionProfile('child', identity)
+        .catch((error) => error);
+      await entered.promise;
+      const concurrent = bridge
+        .ensureSessionProfile('child', identity)
+        .catch((error) => error);
+      ready.resolve();
+      expect(await first).toBe(failure);
+      expect(await concurrent).toBe(failure);
+      expect(attempts).toBe(1);
+      expect(bridge.size()).toBe(0);
+      expect(bridge.profileForSession('child')).toBeUndefined();
+      await bridge.ensureSessionProfile('child', identity);
+      expect(attempts).toBe(2);
+      expect(bridge.size()).toBe(1);
+      expect(bridge.profileForSession('child')).toBe(profile);
+      await bridge.ensureSessionProfile('child', identity);
+      expect(attempts).toBe(2);
+      revision = 2;
+      await bridge.ensureSessionProfile('child', identity);
+      expect(attempts).toBe(3);
+      bridge.retire();
+      await bridge.drain();
+    },
+  );
+
   test('pins chains before the awaited model switch (refresh-race guard)', async () => {
     const gate = Promise.withResolvers<void>();
     const switchEntered = Promise.withResolvers<void>();

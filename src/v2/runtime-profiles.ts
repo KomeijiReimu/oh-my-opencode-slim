@@ -332,6 +332,7 @@ export function createSessionProfileBridge(
     const revision = options.revisionForSession?.(sessionID);
     if (captured.has(sessionID) && revisions.get(sessionID) !== revision) {
       captured.delete(sessionID);
+      revisions.delete(sessionID);
     }
     if (
       captured.has(sessionID) ||
@@ -370,16 +371,18 @@ export function createSessionProfileBridge(
         ? await options.profilesForSession(sessionID)
         : options.profiles();
       checkActive();
-      revisions.set(sessionID, options.revisionForSession?.(sessionID));
+      const captureRevision = options.revisionForSession?.(sessionID);
       const profile = profiles[resolved.agent];
       if (!profile) {
         // Plugin-managed but absent from the profile table (e.g. a
         // marketplace-agent child: the registry registers it yet the table
         // is built from createAgents, which has no marketplace handling).
-        // Freeze null so admission proceeds on the host-registered model
-        // with no temperature/options applied — never reject the prompt hook.
-        captured.set(sessionID, null);
+        // Freeze null only after publishing its matching chain generation.
+        // A failed publisher rejects admission and must be retried.
         options.onSessionCaptured?.(sessionID);
+        checkActive();
+        captured.set(sessionID, null);
+        revisions.set(sessionID, captureRevision);
         prune();
         emitLog('[v2][profile] child session captured without a profile', {
           sessionID,
@@ -396,8 +399,10 @@ export function createSessionProfileBridge(
           !sameModel(resolved.model, registered))
       ) {
         // Nothing to switch, or the host already runs a per-call model.
-        captured.set(sessionID, profile);
         options.onSessionCaptured?.(sessionID);
+        checkActive();
+        captured.set(sessionID, profile);
+        revisions.set(sessionID, captureRevision);
         prune();
         emitLog('[v2][profile] child session captured without a model switch', {
           sessionID,
@@ -439,6 +444,7 @@ export function createSessionProfileBridge(
         throw err;
       }
       captured.set(sessionID, profile);
+      revisions.set(sessionID, captureRevision);
       prune();
       emitLog('[v2][profile] applied model to child session', {
         sessionID,
