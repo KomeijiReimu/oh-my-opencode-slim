@@ -91,9 +91,17 @@ preset fallback chain. A later team change can select a new preset model;
 an ordinary continuation with unchanged settings preserves the current model
 and fallback state.
 
-For a managed continuation, explicit model/variant availability is checked
-before starting a configuration change. Failure at that check leaves the saved
-execution unchanged; the native tool still validates the selection again.
+For a managed same-agent continuation, the native tool authorizes the delegation
+first. Slim then validates any explicit model or variant and installs the
+inference configuration before the tool submits its prompt. A rejected
+authorization or unavailable explicit selection leaves the child's configuration
+unchanged. Unbound historical children retain native model validation.
+
+Concurrent continuations of a running child can reach this step in approval
+order, rather than invocation order. Each configuration change uses the team
+captured by that invocation. Avoid changing the child's agent manually while a
+continuation is waiting: the host does not provide an atomic boundary between
+that external change and the continuation.
 
 ### Start a session with a preset
 
@@ -117,6 +125,13 @@ session ID rather than creating another session. An unfinished initialization
 blocks messages until binding succeeds. A failed navigation does not undo a
 successful creation; open the recorded session from the session list.
 
+Creation retries must use the original directory and workspace, even when two
+workspaces share a directory. Older prerelease creation records that lack this
+workspace information cannot be retried by this version; completed sessions
+remain usable. The workspace check preserves the original creation target. It
+cannot detect a later move to another workspace at the same directory, because
+the host's public session lookup does not expose that identity.
+
 To stop retrying that creation, choose **Forget local retry record** and confirm.
 This releases the window for a new creation, including in another workspace.
 It leaves server state unchanged: the earlier request may still finish, so
@@ -136,6 +151,9 @@ in progress, new managed requests and tool calls are rejected. A provider
 request or tool invocation that has already passed its own admission check can
 finish. The next request or tool invocation is checked again, even within the
 same host run, and can use the new configuration once the transition completes.
+This can reject a request whose context was prepared under the previous revision
+but which has not yet passed model-request admission. Such a request is not sent
+with mixed settings or automatically retried.
 
 If a transition fails, retry the recorded target explicitly. A restart does not
 clear the pending state, and retry does not substitute the latest default or
@@ -150,6 +168,7 @@ discard-to-old-configuration action. If a native model change never finishes,
 stop the OpenCode server executing it before restarting and retrying. This
 interrupts that server's running sessions; closing a connected TUI or timing out
 a request does not cancel the server's operation.
+Plugin reload or unload also waits for an in-flight native model change.
 
 ### Testing and downgrading
 
@@ -157,7 +176,9 @@ New bindings and explicit updates use storage format v2. Existing v1 bindings
 remain readable; ordinary reads and unchanged continuations do not migrate
 them. Apply or an execution change writes the new format.
 
-The previous v1-only reader rejects v2 records; there is no automatic downgrade.
+The previous v1-only reader rejects v2 records. Earlier prerelease builds of this
+feature also reject new creation records containing workspace scope. There is
+no automatic downgrade.
 For a reversible trial, use separate OpenCode configuration and data directories,
 or stop the host and back up its data before testing with your usual sessions.
 Restoring the previous plugin reference alone does not convert records back or
@@ -180,6 +201,10 @@ Unreadable or corrupt stored records are errors, not unbound-session fallbacks.
 Session isolation requires the host's plugin storage and session identity APIs.
 Reduced hosts without these APIs retain the previous execution behavior and
 cannot apply a session-only preset; they do not report a persistent binding.
+Managed continuations with an explicit model or variant also require the host's
+model-list API. Bound empty-session creation requires its full location context.
+Reduced hosts lacking these APIs reject the corresponding operation; they do
+not bypass validation or infer a workspace from its directory.
 
 User and project configuration files are still watched, including `.json`
 and `.jsonc` candidates created after startup. A successful configuration
