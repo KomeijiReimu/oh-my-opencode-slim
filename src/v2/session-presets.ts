@@ -169,8 +169,8 @@ export function delegationSelection(value: unknown): ModelRef | undefined {
 }
 
 /** Public model.list and native subagent validation both read models.available.
- * This preflight protects persisted transitions, not the later native check:
- * availability can still change before native execution. */
+ * Managed resumes validate here after native authorization; new/legacy calls
+ * retain native validation. This lookup is not an availability lease. */
 export function assertAvailableDelegationSelection(
   value: string,
   response: unknown,
@@ -406,11 +406,7 @@ export function createSessionPresets(options: {
     assertStable(id, record);
     return record;
   }
-  async function ensure(
-    id: string,
-    signal?: AbortSignal,
-    explicitModel = false,
-  ) {
+  async function ensure(id: string, signal?: AbortSignal) {
     check(signal);
     if (!available) return undefined;
     await admit(id);
@@ -424,16 +420,6 @@ export function createSessionPresets(options: {
       if (existing) {
         if (existing.parentID !== parentID)
           throw new Error('Session preset parent identity mismatch');
-        if (
-          explicitModel &&
-          (!existing.explicitModel || !existing.preserveModel)
-        ) {
-          return write(
-            id,
-            { ...existing, explicitModel: true, preserveModel: true },
-            signal,
-          );
-        }
         return existing;
       }
       if (parentID) {
@@ -636,6 +622,38 @@ export function createSessionPresets(options: {
       throw error;
     }
   }
+  async function resumeRecord(
+    id: string,
+    parentID: string,
+    admission: SessionTeamAdmission,
+    agent: string,
+  ) {
+    const info = await identity(id);
+    if (info.parentID !== parentID)
+      throw new Error('Subagent resume identity mismatch');
+    const previous = await read(id);
+    assertStable(id, previous);
+    // Historical children remain native-owned, even with a managed parent.
+    if (!previous || !admission.bundle) return undefined;
+    if (info.agent !== agent)
+      throw new Error('Subagent resume identity mismatch');
+    if (previous.parentID !== parentID)
+      throw new Error('Subagent parent identity mismatch');
+    return previous;
+  }
+  async function inspectResume(
+    id: string,
+    parentID: string,
+    admission: SessionTeamAdmission,
+    agent: string,
+    signal?: AbortSignal,
+  ) {
+    requireAvailable();
+    await admit(id);
+    const record = await resumeRecord(id, parentID, admission, agent);
+    check(signal);
+    return record !== undefined;
+  }
   async function resumeChild(
     id: string,
     parentID: string,
@@ -647,17 +665,10 @@ export function createSessionPresets(options: {
     requireAvailable();
     await admit(id);
     return serial(id, async () => {
-      const info = await identity(id);
-      if (info.parentID !== parentID)
-        throw new Error('Subagent resume identity mismatch');
-      const previous = await read(id);
-      assertStable(id, previous);
-      // Historical children have no recoverable snapshot. Keep native behavior.
-      if (!previous || !admission.bundle) return previous;
-      if (info.agent !== agent)
-        throw new Error('Subagent resume identity mismatch');
-      if (previous.parentID !== parentID)
-        throw new Error('Subagent parent identity mismatch');
+      const previous = await resumeRecord(id, parentID, admission, agent);
+      if (!previous || !admission.bundle)
+        throw new Error('Managed subagent resume binding lost');
+      check(signal);
       const changed = !isDeepStrictEqual(
         previous.execution ?? previous.bundle,
         admission.bundle,
@@ -666,8 +677,14 @@ export function createSessionPresets(options: {
         // Parent re-delegation owns the future team even after a child Apply.
         // Only that team changes: leave this execution's model/fallback alone.
         if (isDeepStrictEqual(previous.bundle, admission.bundle))
-          return previous;
-        return write(id, { ...previous, bundle: admission.bundle }, signal);
+          return { record: previous };
+        return {
+          record: await write(
+            id,
+            { ...previous, bundle: admission.bundle },
+            signal,
+          ),
+        };
       }
       execution?.assertIdle(id);
       // Only managed execution revisions need a preflight. Keep it inside
@@ -712,7 +729,10 @@ export function createSessionPresets(options: {
           },
           signal,
         );
-        return await complete(id, record, signal);
+        return {
+          record: await complete(id, record, signal),
+          committedOperationID: operationID,
+        };
       } finally {
         changing.delete(id);
       }
@@ -836,6 +856,7 @@ export function createSessionPresets(options: {
             previous.pending?.kind === 'createBound'
               ? previous.pending.input
               : previous.createdBy;
+          if (original) assertCreationScope(original);
           if (!original || !isDeepStrictEqual(original, frozenInput))
             throw new Error(
               'Bound session creation conflicts with existing operation',
@@ -905,6 +926,8 @@ export function createSessionPresets(options: {
       return serial(id, async () => {
         const record = await read(id);
         if (!record) throw new Error('Session preset operation not found');
+        if (record.createdBy?.operationID === operationID)
+          assertCreationScope(record.createdBy);
         if (record.pending?.operationID !== operationID) {
           if (
             record.completedOperationID === operationID ||
@@ -974,28 +997,34 @@ export function wrapSessionPresetSubagent(options: {
     const existingID =
       typeof args.sessionID === 'string' ? args.sessionID : undefined;
     let configuredOperation: string | undefined;
-    // Resume identity/snapshot must be restored BEFORE native model selection.
+    let managed = false;
+    // Read-only classification before native authorization. Revalidate inside
+    // the coordinator after permission succeeds; do not publish anything here.
     if (existingID) {
       if (options.presets.available) {
-        const validateSelection = options.validateSelection;
-        const record = await options.presets.resumeChild(
+        managed = await options.presets.inspectResume(
           existingID,
           context.sessionID,
           admission,
           String(args.agent),
           context.signal,
-          validateSelection
-            ? () => validateSelection(String(selection))
-            : undefined,
         );
-        configuredOperation = record?.completedOperationID;
       } else await options.presets.ensure(existingID, context.signal);
     }
     options.presets.checkActive(context.signal);
-    // The transition already installed the new selection. Native execute may
-    // still reject the continuation; never replay its prompt from retry().
+    let nativeInput = input;
+    if (managed) {
+      // This prevents native model writes only while the agent stays the same.
+      // A concurrent manual agent change can still activate native defaults
+      // before progress; the public API offers no fence for that race.
+      const { model: _model, ...rest } = args;
+      nativeInput = rest;
+    }
+    // Memoize the awaited installation, including rejection, for duplicate
+    // progress notifications. This is one existing coordinator transaction.
+    let installation: Promise<void> | undefined;
     try {
-      return await options.execute(input, {
+      return await options.execute(nativeInput, {
         ...context,
         progress: async (update: Record<string, unknown>) => {
           options.presets.checkActive(context.signal);
@@ -1003,7 +1032,23 @@ export function wrapSessionPresetSubagent(options: {
             if (existingID) {
               if (update.sessionID !== existingID)
                 throw new Error('Subagent resume identity changed');
-              await options.presets.ensure(existingID, context.signal);
+              if (managed) {
+                installation ??= (async () => {
+                  const validateSelection = options.validateSelection;
+                  const result = await options.presets.resumeChild(
+                    existingID,
+                    context.sessionID,
+                    admission,
+                    String(args.agent),
+                    context.signal,
+                    validateSelection
+                      ? () => validateSelection(String(selection))
+                      : undefined,
+                  );
+                  configuredOperation = result.committedOperationID;
+                })();
+                await installation;
+              } else await options.presets.ensure(existingID, context.signal);
             } else if (bundle) {
               await options.presets.bindChild(
                 update.sessionID,

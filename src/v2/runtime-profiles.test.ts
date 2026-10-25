@@ -858,7 +858,8 @@ describe('durable session team presets', () => {
         ]),
       capture: async () => ({ bundle: f.bundle('B'), explicitModel: true }),
       execute: async (args, raw) => {
-        expect(args).toBe(resumedInput);
+        expect(args).toEqual({ agent: 'explorer', sessionID: 'child' });
+        expect(resumedInput.model).toBe('manual/changed#low');
         await (raw as { progress: (data: unknown) => Promise<void> }).progress({
           sessionID: 'child',
           status: 'running',
@@ -967,7 +968,7 @@ describe('durable session team presets', () => {
   });
 
   test.each(['reject', 'cancel', 'retire'])(
-    'explicit resume preflight %s cannot publish a pending revision or execute',
+    'authorized resume preflight %s cannot publish a pending revision or prompt',
     async (failure) => {
       const f = fixture();
       const presets = f.create();
@@ -981,6 +982,7 @@ describe('durable session team presets', () => {
       let retirement: Promise<void> | undefined;
       let drained = false;
       let nativeCalls = 0;
+      let prompts = 0;
       const execute = wrapSessionPresetSubagent({
         presets,
         capture: async () => ({ bundle: f.bundle('B'), explicitModel: true }),
@@ -988,8 +990,15 @@ describe('durable session team presets', () => {
           entered.resolve();
           await validation.promise;
         },
-        execute: async () => {
+        execute: async (_args, raw) => {
           nativeCalls++;
+          await (
+            raw as { progress: (data: unknown) => Promise<void> }
+          ).progress({
+            sessionID: 'child',
+            status: 'running',
+          });
+          prompts++;
         },
       });
       const outcome = execute(
@@ -1027,7 +1036,8 @@ describe('durable session team presets', () => {
       expect([...f.values]).toEqual(before);
       expect(f.order).toHaveLength(writes);
       expect(f.installs).toHaveLength(0);
-      expect(nativeCalls).toBe(0);
+      expect(nativeCalls).toBe(1);
+      expect(prompts).toBe(0);
       if (retirement) {
         await retirement;
         expect(drained).toBe(true);

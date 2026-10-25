@@ -611,6 +611,8 @@ describe('createV2Setup e2e', () => {
     const stored = new Map<string, any>();
     const availableModels = [
       { providerID: 'manual', id: 'resumed', variants: [{ id: 'low' }] },
+      { providerID: 'test', id: 'C', variants: [] },
+      { providerID: 'test', id: 'D', variants: [] },
     ];
     (ctx as any).model = { list: async () => availableModels };
     const identities = new Map<string, any>([
@@ -710,6 +712,8 @@ describe('createV2Setup e2e', () => {
     let nativeCalls = 0;
     let nativeFailure: Error | undefined;
     let nativeResult: unknown;
+    let authorize: (input: any, context: any) => Promise<void> = async () => {};
+    let reportRunning = false;
     const launches: subagentWrapper.SubagentStructuredLaunch[] = [];
     const createWrapper = subagentWrapper.createSubagentExecutorWrapper;
     const wrapperSpy = spyOn(
@@ -729,6 +733,9 @@ describe('createV2Setup e2e', () => {
       execute: async (input: any, context: any) => {
         nativeCalls++;
         nativeInputs.push({ ...input });
+        // Fixed native 2.1.4 ordering: agent authorization precedes get,
+        // optional model switching, awaited progress, and prompt.
+        await authorize(input, context);
         const id = input.sessionID ?? `ses_child-${nativeCalls}`;
         const [selection, variant] = String(input.model ?? 'test/a#high').split(
           '#',
@@ -764,8 +771,13 @@ describe('createV2Setup e2e', () => {
           metadata: { sessionID: id },
           // Exercise the real structured lane once; later legacy-shaped
           // results keep the existing compatibility coverage unchanged.
-          ...(nativeCalls === 1
-            ? { output: { sessionID: id, status: 'completed' } }
+          ...(nativeCalls === 1 || reportRunning
+            ? {
+                output: {
+                  sessionID: id,
+                  status: reportRunning ? 'running' : 'completed',
+                },
+              }
             : {}),
         };
         nativeResult = result;
@@ -1108,8 +1120,69 @@ describe('createV2Setup e2e', () => {
         expect([...stored]).toEqual(before);
         expect(identities.get('ses_child-1').model).toEqual(selected);
         expect(switches).toHaveLength(switchCount);
-        expect(nativeCalls).toBe(callCount);
+        expect(nativeCalls).toBe(callCount + 1); // authorized, but progress rejects before prompt
+        expect(nativeInputs.at(-1)).not.toHaveProperty('model');
         expect(launches).toHaveLength(launchCount);
+      }
+      // Agent-specific denial happens INSIDE native execute (not the outer
+      // wholly-disabled-tool check), before any preset/profile mutation.
+      const denied = new Error('Subagent denied: explorer');
+      const deniedRecord = structuredClone([...stored]);
+      const deniedSelection = structuredClone(
+        identities.get('ses_child-1').model,
+      );
+      const deniedSwitchCount = switches.length;
+      const deniedPromptCount = order.filter((entry) =>
+        entry.startsWith('prompt:'),
+      ).length;
+      authorize = async () => {
+        throw denied;
+      };
+      try {
+        expect(
+          await launch('denied-agent-resume', 'root', {
+            sessionID: 'ses_child-1',
+            model: 'test/C',
+          }).catch((error) => error),
+        ).toBe(denied);
+        expect([...stored]).toEqual(deniedRecord);
+        expect(identities.get('ses_child-1').model).toEqual(deniedSelection);
+        expect(switches).toHaveLength(deniedSwitchCount);
+        expect(
+          order.filter((entry) => entry.startsWith('prompt:')),
+        ).toHaveLength(deniedPromptCount);
+      } finally {
+        authorize = async () => {};
+      }
+
+      // Terminal ownership still keeps its lease while native authorization
+      // is pending; no second continuation can enter native execute.
+      const terminalEntered = Promise.withResolvers<void>();
+      const terminalRelease = Promise.withResolvers<void>();
+      authorize = async (_input, context) => {
+        if (context.id === 'terminal-first') {
+          terminalEntered.resolve();
+          await terminalRelease.promise;
+        }
+      };
+      const terminalFirst = launch('terminal-first', 'root', {
+        sessionID: 'ses_child-1',
+        model: 'test/C',
+      });
+      try {
+        await terminalEntered.promise;
+        const enteredCalls = nativeCalls;
+        await expect(
+          launch('terminal-second', 'root', {
+            sessionID: 'ses_child-1',
+            model: 'test/D',
+          }),
+        ).rejects.toThrow('cannot be resumed safely');
+        expect(nativeCalls).toBe(enteredCalls);
+      } finally {
+        terminalRelease.resolve();
+        await terminalFirst;
+        authorize = async () => {};
       }
       await launch('explicit-resume-call', 'root', {
         sessionID: 'ses_child-1',
@@ -1271,6 +1344,20 @@ describe('createV2Setup e2e', () => {
       });
       expect(switches).toHaveLength(fallbackSwitchCount);
       expect(identities.get('ses_child-1').model).toEqual(fallbackModel);
+      // An unchanged continuation keeps the existing fallback selection and
+      // must not decorate a native error using an older completedOperationID.
+      const unchangedFailure = new Error('unchanged native prompt failed');
+      nativeFailure = unchangedFailure;
+      try {
+        expect(
+          await launch('unchanged-error', 'root', {
+            sessionID: 'ses_child-1',
+          }).catch((error) => error),
+        ).toBe(unchangedFailure);
+        expect(switches).toHaveLength(fallbackSwitchCount);
+      } finally {
+        nativeFailure = undefined;
+      }
       // Leave the original test's subsequent independent launches on B.
       await rpc.apply(
         { sessionID: 'root', presetName: 'B' },
@@ -1498,6 +1585,86 @@ describe('createV2Setup e2e', () => {
         ),
       ).rejects.toThrow('config load failed');
       await Bun.write(configPath, config);
+      // Running steering deliberately does not hold the terminal lease. Both
+      // calls can pass native authorization in reverse order: each awaited
+      // progress installs its own frozen bundle/model as one serial revision.
+      await rpc.apply(
+        { sessionID: 'root', presetName: 'A' },
+        { signal: new AbortController().signal },
+      );
+      reportRunning = true;
+      const runningChild = await launch('running-spawn', 'root', {
+        background: true,
+      });
+      const runningEntered = Promise.withResolvers<void>();
+      const runningRelease = Promise.withResolvers<void>();
+      authorize = async (_input, context) => {
+        if (context.id === 'running-first') {
+          runningEntered.resolve();
+          await runningRelease.promise;
+        }
+      };
+      const runningFirst = launch('running-first', 'root', {
+        sessionID: runningChild,
+        model: 'test/C',
+        background: true,
+      });
+      try {
+        await runningEntered.promise;
+        expect(stored.get(`session-preset/v1/${runningChild}`).revision).toBe(
+          0,
+        );
+        await rpc.apply(
+          { sessionID: 'root', presetName: 'B' },
+          { signal: new AbortController().signal },
+        );
+        await launch('running-second', 'root', {
+          sessionID: runningChild,
+          model: 'test/D',
+          background: true,
+        });
+        expect(identities.get(runningChild).model).toMatchObject({ id: 'D' });
+        expect(stored.get(`session-preset/v1/${runningChild}`)).toMatchObject({
+          revision: 1,
+          bundle: { presetName: 'B' },
+          executionModel: { id: 'D' },
+        });
+        runningRelease.resolve();
+        await runningFirst;
+        expect(identities.get(runningChild).model).toMatchObject({ id: 'C' });
+        expect(stored.get(`session-preset/v1/${runningChild}`)).toMatchObject({
+          revision: 2,
+          bundle: { presetName: 'A' },
+          executionModel: { id: 'C' },
+        });
+        const runningContext = {
+          ...crossProviderContext,
+          sessionID: runningChild,
+          model: identities.get(runningChild).model,
+          options: {},
+        };
+        await calls.contextHookCb?.(runningContext);
+        await requestHook?.({
+          ...request,
+          sessionID: runningChild,
+          model: runningContext.model,
+        });
+        expect(runningContext.options).toMatchObject({
+          temperature: 0.35,
+          reasoning: 'A',
+        });
+        const beforeExplicitFallback = switches.length;
+        await retry(runningChild, 'test', 'C');
+        expect(switches).toHaveLength(beforeExplicitFallback);
+        expect(nativeInputs.slice(-2).every((args) => !('model' in args))).toBe(
+          true,
+        );
+      } finally {
+        runningRelease.resolve();
+        await runningFirst;
+        authorize = async () => {};
+        reportRunning = false;
+      }
       // The inner structured wrapper must see the host's ORIGINAL error,
       // before the outer preset wrapper adds its committed-operation warning.
       nativeFailure = new Error('Subagent failed (sessionID: ses_child-1)');
@@ -1562,282 +1729,6 @@ describe('createV2Setup e2e', () => {
       wrapperSpy.mockRestore();
       await cleanup();
     }
-  }, 20_000);
-
-  test.each([false, true])(
-    'setup cleanup drains actual fallback native switch before replacement publication (other cleanup throws: %s)',
-    async (cleanupThrows) => {
-      const { ctx, calls, events } = makeMockV2Context(projectDir);
-      const id = 'ses_real_fallback_drain';
-      const record = {
-        schemaVersion: 2,
-        revision: 0,
-        parentID: 'root',
-        preserveModel: true,
-        explicitModel: false,
-        bundle: {
-          presetName: null,
-          fallbackEnabled: true,
-          profiles: {
-            explorer: {
-              model: { providerID: 'test', id: 'A' },
-              sidebarModel: 'test/A',
-            },
-          },
-          chains: { explorer: [{ id: 'test/A' }, { id: 'test/B' }] },
-          inheritance: {},
-        },
-      };
-      await ctx.storage?.set(`session-preset/v1/${id}`, record);
-      let selected = { providerID: 'test', id: 'A' };
-      ctx.session.get = async ({ sessionID }) => ({
-        id: sessionID,
-        parentID: 'root',
-        directory: projectDir,
-        agent: 'explorer',
-        model: selected,
-      });
-      const entered = Promise.withResolvers<void>();
-      const release = Promise.withResolvers<void>();
-      ctx.session.switchModel = async ({ model }) => {
-        entered.resolve();
-        await release.promise;
-        selected = model;
-      };
-      let retryHook: ((event: any) => Promise<void>) | undefined;
-      const hook = ctx.session.hook;
-      (ctx.session as any).hook = (name: string, callback: any) => {
-        if (name === 'retry') retryHook = callback;
-        return hook.call(ctx.session, name as never, callback);
-      };
-      const cleanup = await createV2Setup()(ctx);
-      const prompt = {
-        sessionID: id,
-        messageID: 'prepare',
-        prompt: { text: 'work' },
-      };
-      await calls.promptHookCb?.(prompt);
-      expect(retryHook).toBeFunction();
-      const retry = retryHook?.({
-        sessionID: id,
-        agent: 'explorer',
-        model: selected,
-        error: { message: 'Rate limit exceeded' },
-        decision: { retry: false },
-      });
-      await entered.promise;
-      const retiring = Promise.withResolvers<void>();
-      const disposeFallback = ForegroundFallbackManager.prototype.dispose;
-      const disposeSpy = spyOn(
-        ForegroundFallbackManager.prototype,
-        'dispose',
-      ).mockImplementation(function () {
-        const drain = disposeFallback.call(this);
-        retiring.resolve();
-        return drain;
-      });
-      const exit = CompanionManager.prototype.onExit;
-      const exitSpy = cleanupThrows
-        ? spyOn(CompanionManager.prototype, 'onExit').mockImplementation(
-            function () {
-              exit.call(this);
-              throw new Error('other cleanup failed');
-            },
-          )
-        : undefined;
-      let finished = false;
-      const draining = cleanup().then(() => {
-        finished = true;
-      });
-      try {
-        await retiring.promise;
-        await tick();
-        expect(finished).toBe(false);
-        expect(events.isReturnCalled()).toBe(true);
-        expect(selected.id).toBe('A');
-        release.resolve();
-        await draining;
-        await retry;
-        expect(selected.id).toBe('B');
-        exitSpy?.mockRestore();
-        disposeSpy.mockRestore();
-        const next = makeMockV2Context(projectDir);
-        (next.ctx as any).storage = ctx.storage;
-        next.ctx.session.get = ctx.session.get;
-        const disposeNext = await createV2Setup()(next.ctx);
-        try {
-          // The next generation's FIRST real publisher must not see an old
-          // global inProgress owner after the previous setup cleanup resolved.
-          await next.calls.promptHookCb?.({
-            ...prompt,
-            messageID: 'next-generation',
-          });
-        } finally {
-          await disposeNext();
-        }
-      } finally {
-        release.resolve();
-        await retry;
-        await draining;
-        exitSpy?.mockRestore();
-        disposeSpy.mockRestore();
-      }
-    },
-  );
-
-  test('real capture publisher failure rejects admission and is retried rather than cached as success', async () => {
-    const { ctx, calls } = makeMockV2Context(projectDir);
-    const id = 'ses_publish_retry';
-    const record = {
-      schemaVersion: 2,
-      revision: 1,
-      parentID: 'root',
-      preserveModel: true,
-      explicitModel: false,
-      bundle: {
-        presetName: null,
-        fallbackEnabled: false,
-        profiles: { explorer: { sidebarModel: 'default', temperature: 0.2 } },
-        chains: {},
-        inheritance: {},
-      },
-    };
-    await ctx.storage?.set(`session-preset/v1/${id}`, record);
-    ctx.session.get = async ({ sessionID }) => ({
-      id: sessionID,
-      parentID: 'root',
-      directory: projectDir,
-      agent: 'explorer',
-    });
-    const publish = ForegroundFallbackManager.prototype.publishSessionRevision;
-    let attempts = 0;
-    const failure = new Error('fallback model switch is still in flight');
-    const spy = spyOn(
-      ForegroundFallbackManager.prototype,
-      'publishSessionRevision',
-    ).mockImplementation(function (...args) {
-      if (args[0] === id && ++attempts === 1) throw failure;
-      return publish.apply(this, args);
-    });
-    const cleanup = await createV2Setup()(ctx);
-    const prompt = {
-      sessionID: id,
-      messageID: 'attempt-one',
-      prompt: { text: 'work' },
-    };
-    try {
-      await expect(calls.promptHookCb?.(prompt)).rejects.toBe(failure);
-      await calls.promptHookCb?.({ ...prompt, messageID: 'attempt-two' });
-      expect(attempts).toBe(2);
-      await calls.promptHookCb?.({ ...prompt, messageID: 'attempt-three' });
-      expect(attempts).toBe(2);
-    } finally {
-      spy.mockRestore();
-      await cleanup();
-    }
-  });
-
-  test('managed context revision survives >1024 interleaved contexts, rejects stale preparation, and clears on deletion', async () => {
-    const { ctx, calls, events } = makeMockV2Context(projectDir);
-    const stored = new Map<string, any>();
-    const binding = {
-      schemaVersion: 2,
-      revision: 1,
-      parentID: 'root',
-      preserveModel: true,
-      bundle: {
-        presetName: 'frozen',
-        fallbackEnabled: false,
-        profiles: {
-          explorer: {
-            model: { providerID: 'test', id: 'prepared' },
-            sidebarModel: 'test/prepared',
-            temperature: 0.2,
-          },
-        },
-        chains: {},
-        inheritance: {},
-      },
-    };
-    const id = 'ses_prepared_child';
-    const key = `session-preset/v1/${id}`;
-    const deleted = Promise.withResolvers<void>();
-    (ctx as any).storage = {
-      get: async (entry: string) => structuredClone(stored.get(entry)),
-      set: async (entry: string, value: unknown) => {
-        stored.set(entry, structuredClone(value));
-      },
-      remove: async (entry: string) => {
-        stored.delete(entry);
-        if (entry === key) deleted.resolve();
-      },
-      scan: async () => ({ entries: [] }),
-    };
-    ctx.session.get = async ({ sessionID }) => ({
-      id: sessionID,
-      parentID: 'root',
-      directory: projectDir,
-      agent: 'explorer',
-      model: { providerID: 'test', id: 'prepared' },
-    });
-    let requestHook: ((event: any) => Promise<void>) | undefined;
-    const originalHook = ctx.session.hook;
-    (ctx.session as any).hook = (name: string, callback: any) => {
-      if (name === 'model.request') requestHook = callback;
-      return originalHook.call(ctx.session, name as never, callback);
-    };
-    const context = (sessionID: string) => ({
-      sessionID,
-      agent: 'explorer',
-      model: { providerID: 'test', id: 'prepared' },
-      options: {},
-      system: [],
-      messages: [],
-      tools: {},
-    });
-    const request = {
-      sessionID: id,
-      kind: 'primary',
-      model: { providerID: 'test', id: 'prepared' },
-      headers: {},
-    };
-    stored.set(key, structuredClone(binding));
-    const cleanup = await createV2Setup()(ctx);
-    try {
-      expect(requestHook).toBeFunction();
-      // A current persistent record is not a context-preparation credential.
-      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
-      await calls.contextHookCb?.(context(id));
-      await requestHook?.(request);
-      for (let index = 0; index < 1025; index++) {
-        const otherID = `ses_interleaved_${index}`;
-        stored.set(`session-preset/v1/${otherID}`, structuredClone(binding));
-        await calls.contextHookCb?.(context(otherID));
-      }
-      // All interleaved sessions are managed children: merely skipping roots
-      // or refreshing a FIFO/LRU entry cannot make this assertion safe.
-      await requestHook?.(request);
-      stored.set(key, { ...structuredClone(binding), revision: 2 });
-      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
-      stored.set(key, structuredClone(binding));
-      await requestHook?.(request);
-      events.push({
-        id: 'evt_delete_prepared',
-        type: 'session.deleted',
-        location: { directory: projectDir },
-        data: { sessionID: id },
-      });
-      await deleted.promise;
-      // Reusing the ID and exact revision after deletion must not resurrect
-      // the old preparation credential, even though public identity matches.
-      stored.set(key, structuredClone(binding));
-      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
-      await calls.contextHookCb?.(context(id));
-      await requestHook?.(request);
-    } finally {
-      await cleanup();
-    }
-    await expect(requestHook?.(request)).rejects.toThrow('retired');
   }, 20_000);
 
   test('native automatic model survives real before/wrapper admission and options-only revision while stale prepared requests reject', async () => {
@@ -2055,6 +1946,282 @@ describe('createV2Setup e2e', () => {
       await cleanup();
     }
   });
+
+  test('real capture publisher failure rejects admission and is retried rather than cached as success', async () => {
+    const { ctx, calls } = makeMockV2Context(projectDir);
+    const id = 'ses_publish_retry';
+    const record = {
+      schemaVersion: 2,
+      revision: 1,
+      parentID: 'root',
+      preserveModel: true,
+      explicitModel: false,
+      bundle: {
+        presetName: null,
+        fallbackEnabled: false,
+        profiles: { explorer: { sidebarModel: 'default', temperature: 0.2 } },
+        chains: {},
+        inheritance: {},
+      },
+    };
+    await ctx.storage?.set(`session-preset/v1/${id}`, record);
+    ctx.session.get = async ({ sessionID }) => ({
+      id: sessionID,
+      parentID: 'root',
+      directory: projectDir,
+      agent: 'explorer',
+    });
+    const publish = ForegroundFallbackManager.prototype.publishSessionRevision;
+    let attempts = 0;
+    const failure = new Error('fallback model switch is still in flight');
+    const spy = spyOn(
+      ForegroundFallbackManager.prototype,
+      'publishSessionRevision',
+    ).mockImplementation(function (...args) {
+      if (args[0] === id && ++attempts === 1) throw failure;
+      return publish.apply(this, args);
+    });
+    const cleanup = await createV2Setup()(ctx);
+    const prompt = {
+      sessionID: id,
+      messageID: 'attempt-one',
+      prompt: { text: 'work' },
+    };
+    try {
+      await expect(calls.promptHookCb?.(prompt)).rejects.toBe(failure);
+      await calls.promptHookCb?.({ ...prompt, messageID: 'attempt-two' });
+      expect(attempts).toBe(2);
+      await calls.promptHookCb?.({ ...prompt, messageID: 'attempt-three' });
+      expect(attempts).toBe(2);
+    } finally {
+      spy.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test.each([false, true])(
+    'setup cleanup drains actual fallback native switch before replacement publication (other cleanup throws: %s)',
+    async (cleanupThrows) => {
+      const { ctx, calls, events } = makeMockV2Context(projectDir);
+      const id = 'ses_real_fallback_drain';
+      const record = {
+        schemaVersion: 2,
+        revision: 0,
+        parentID: 'root',
+        preserveModel: true,
+        explicitModel: false,
+        bundle: {
+          presetName: null,
+          fallbackEnabled: true,
+          profiles: {
+            explorer: {
+              model: { providerID: 'test', id: 'A' },
+              sidebarModel: 'test/A',
+            },
+          },
+          chains: { explorer: [{ id: 'test/A' }, { id: 'test/B' }] },
+          inheritance: {},
+        },
+      };
+      await ctx.storage?.set(`session-preset/v1/${id}`, record);
+      let selected = { providerID: 'test', id: 'A' };
+      ctx.session.get = async ({ sessionID }) => ({
+        id: sessionID,
+        parentID: 'root',
+        directory: projectDir,
+        agent: 'explorer',
+        model: selected,
+      });
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      ctx.session.switchModel = async ({ model }) => {
+        entered.resolve();
+        await release.promise;
+        selected = model;
+      };
+      let retryHook: ((event: any) => Promise<void>) | undefined;
+      const hook = ctx.session.hook;
+      (ctx.session as any).hook = (name: string, callback: any) => {
+        if (name === 'retry') retryHook = callback;
+        return hook.call(ctx.session, name as never, callback);
+      };
+      const cleanup = await createV2Setup()(ctx);
+      const prompt = {
+        sessionID: id,
+        messageID: 'prepare',
+        prompt: { text: 'work' },
+      };
+      await calls.promptHookCb?.(prompt);
+      expect(retryHook).toBeFunction();
+      const retry = retryHook?.({
+        sessionID: id,
+        agent: 'explorer',
+        model: selected,
+        error: { message: 'Rate limit exceeded' },
+        decision: { retry: false },
+      });
+      await entered.promise;
+      const retiring = Promise.withResolvers<void>();
+      const disposeFallback = ForegroundFallbackManager.prototype.dispose;
+      const disposeSpy = spyOn(
+        ForegroundFallbackManager.prototype,
+        'dispose',
+      ).mockImplementation(function () {
+        const drain = disposeFallback.call(this);
+        retiring.resolve();
+        return drain;
+      });
+      const exit = CompanionManager.prototype.onExit;
+      const exitSpy = cleanupThrows
+        ? spyOn(CompanionManager.prototype, 'onExit').mockImplementation(
+            function () {
+              exit.call(this);
+              throw new Error('other cleanup failed');
+            },
+          )
+        : undefined;
+      let finished = false;
+      const draining = cleanup().then(() => {
+        finished = true;
+      });
+      try {
+        await retiring.promise;
+        await tick();
+        expect(finished).toBe(false);
+        expect(events.isReturnCalled()).toBe(true);
+        expect(selected.id).toBe('A');
+        release.resolve();
+        await draining;
+        await retry;
+        expect(selected.id).toBe('B');
+        exitSpy?.mockRestore();
+        disposeSpy.mockRestore();
+        const next = makeMockV2Context(projectDir);
+        (next.ctx as any).storage = ctx.storage;
+        next.ctx.session.get = ctx.session.get;
+        const disposeNext = await createV2Setup()(next.ctx);
+        try {
+          // The next generation's FIRST real publisher must not see an old
+          // global inProgress owner after the previous setup cleanup resolved.
+          await next.calls.promptHookCb?.({
+            ...prompt,
+            messageID: 'next-generation',
+          });
+        } finally {
+          await disposeNext();
+        }
+      } finally {
+        release.resolve();
+        await retry;
+        await draining;
+        exitSpy?.mockRestore();
+        disposeSpy.mockRestore();
+      }
+    },
+  );
+
+  test('managed context revision survives >1024 interleaved contexts, rejects stale preparation, and clears on deletion', async () => {
+    const { ctx, calls, events } = makeMockV2Context(projectDir);
+    const stored = new Map<string, any>();
+    const binding = {
+      schemaVersion: 2,
+      revision: 1,
+      parentID: 'root',
+      preserveModel: true,
+      bundle: {
+        presetName: 'frozen',
+        fallbackEnabled: false,
+        profiles: {
+          explorer: {
+            model: { providerID: 'test', id: 'prepared' },
+            sidebarModel: 'test/prepared',
+            temperature: 0.2,
+          },
+        },
+        chains: {},
+        inheritance: {},
+      },
+    };
+    const id = 'ses_prepared_child';
+    const key = `session-preset/v1/${id}`;
+    const deleted = Promise.withResolvers<void>();
+    (ctx as any).storage = {
+      get: async (entry: string) => structuredClone(stored.get(entry)),
+      set: async (entry: string, value: unknown) => {
+        stored.set(entry, structuredClone(value));
+      },
+      remove: async (entry: string) => {
+        stored.delete(entry);
+        if (entry === key) deleted.resolve();
+      },
+      scan: async () => ({ entries: [] }),
+    };
+    ctx.session.get = async ({ sessionID }) => ({
+      id: sessionID,
+      parentID: 'root',
+      directory: projectDir,
+      agent: 'explorer',
+      model: { providerID: 'test', id: 'prepared' },
+    });
+    let requestHook: ((event: any) => Promise<void>) | undefined;
+    const originalHook = ctx.session.hook;
+    (ctx.session as any).hook = (name: string, callback: any) => {
+      if (name === 'model.request') requestHook = callback;
+      return originalHook.call(ctx.session, name as never, callback);
+    };
+    const context = (sessionID: string) => ({
+      sessionID,
+      agent: 'explorer',
+      model: { providerID: 'test', id: 'prepared' },
+      options: {},
+      system: [],
+      messages: [],
+      tools: {},
+    });
+    const request = {
+      sessionID: id,
+      kind: 'primary',
+      model: { providerID: 'test', id: 'prepared' },
+      headers: {},
+    };
+    stored.set(key, structuredClone(binding));
+    const cleanup = await createV2Setup()(ctx);
+    try {
+      expect(requestHook).toBeFunction();
+      // A current persistent record is not a context-preparation credential.
+      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
+      await calls.contextHookCb?.(context(id));
+      await requestHook?.(request);
+      for (let index = 0; index < 1025; index++) {
+        const otherID = `ses_interleaved_${index}`;
+        stored.set(`session-preset/v1/${otherID}`, structuredClone(binding));
+        await calls.contextHookCb?.(context(otherID));
+      }
+      // All interleaved sessions are managed children: merely skipping roots
+      // or refreshing a FIFO/LRU entry cannot make this assertion safe.
+      await requestHook?.(request);
+      stored.set(key, { ...structuredClone(binding), revision: 2 });
+      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
+      stored.set(key, structuredClone(binding));
+      await requestHook?.(request);
+      events.push({
+        id: 'evt_delete_prepared',
+        type: 'session.deleted',
+        location: { directory: projectDir },
+        data: { sessionID: id },
+      });
+      await deleted.promise;
+      // Reusing the ID and exact revision after deletion must not resurrect
+      // the old preparation credential, even though public identity matches.
+      stored.set(key, structuredClone(binding));
+      await expect(requestHook?.(request)).rejects.toThrow('revision mismatch');
+      await calls.contextHookCb?.(context(id));
+      await requestHook?.(request);
+    } finally {
+      await cleanup();
+    }
+    await expect(requestHook?.(request)).rejects.toThrow('retired');
+  }, 20_000);
 
   test('returns cleanly without registering when disabled by env', async () => {
     process.env.OH_MY_OPENCODE_SLIM_DISABLE = '1';
