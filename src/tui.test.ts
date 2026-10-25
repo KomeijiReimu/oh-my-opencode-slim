@@ -2961,14 +2961,14 @@ describe('clickable sidebar sessions', () => {
             );
             expect(defaultRow).toBeGreaterThan(0);
             expect(lines[defaultRow]).toContain('Default (none)');
-            expect(lines[defaultRow + 1]).toContain(
-              'Session team snapshot: Unavailable',
-            );
+            expect(lines[defaultRow + 1]).toContain('Session: Unavailable');
             expect(spans[defaultRow + 1][0]).toEqual([
-              'Session team snapshot: Unavailable',
+              'Session: Unavailable',
               [170, 170, 170, 255],
               [0, 0, 0, 0],
             ]);
+            expect(lines[defaultRow + 2]).toContain('Current model: Unknown');
+            expect(frame).toContain('Team · next delegation');
             if (process.env.OMO_REVIEW_SIDEBAR_FRAMES === '1') {
               console.log(JSON.stringify({ key, frame, spans }, null, 2));
             }
@@ -2984,8 +2984,9 @@ describe('clickable sidebar sessions', () => {
         }
       }
     }
-    // Session-preset baseline: removing only the new default/snapshot block
-    // (including its top margin) reproduced all 24 pre-change frame+color hashes.
+    // Session-team baseline includes the current model, next-delegation team,
+    // and separate task models. RPC-unavailable fixtures intentionally show
+    // Unknown rather than substituting the directory's current definitions.
     // Review updates with OMO_REVIEW_SIDEBAR_FRAMES=1 bun test src/tui.test.ts
     // -t 'sidebar frame text and colors remain byte-identical'; inspect frames
     // and colors before copying the printed hashes to sidebar-frame-golden.json.

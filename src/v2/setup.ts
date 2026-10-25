@@ -100,6 +100,7 @@ import {
 } from './runtime-profiles';
 import {
   createSessionPresets,
+  delegationSelection,
   type SessionTeamAdmission,
   type SessionTeamBundle,
   wrapSessionPresetSubagent,
@@ -2073,6 +2074,7 @@ export function adaptMcpServer(v1: McpConfig): Record<string, unknown> {
 export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
   return async (ctx: V2Context): Promise<V2Cleanup> => {
     let retireSessionPresets: (() => Promise<void>) | undefined;
+    let retireSessionProfiles: (() => Promise<void>) | undefined;
     initLogger();
     // First logged line: identify the build that produced every following
     // log entry (logging-only — build info never enters prompt payloads).
@@ -2540,6 +2542,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         storage: ctx.storage,
         session: ctx.session,
         directory,
+        agents: () => ctx.agent.list(),
         current: () => {
           if (!currentBundle)
             throw new Error('Session team snapshot unavailable');
@@ -2584,6 +2587,10 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
           read: ({ sessionID }) => sessionPresets.readState(sessionID),
           apply: ({ sessionID, presetName }, { signal }) =>
             sessionPresets.apply(sessionID, presetName, signal),
+          createBound: (input, { signal }) =>
+            sessionPresets.createBound(input, signal),
+          retry: ({ sessionID, operationID }, { signal }) =>
+            sessionPresets.retry(sessionID, operationID, signal),
         });
         disposers.push(() => registration.dispose());
       }
@@ -2875,6 +2882,19 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       };
       const pinBoundSessionChains = (sessionID: string) => {
         const record = sessionPresets.peek(sessionID);
+        const publish = v1Hooks['v2.publishSessionRevision'] as
+          | ForegroundFallbackManager['publishSessionRevision']
+          | undefined;
+        if (record && publish) {
+          const bundle = record.execution ?? record.bundle;
+          publish(
+            sessionID,
+            record.revision ?? 0,
+            record.explicitModel ? {} : bundle.chains,
+            !record.explicitModel && bundle.fallbackEnabled,
+          );
+          return;
+        }
         pinSessionChainsHook['v2.pinSessionChains']?.(
           sessionID,
           record?.explicitModel
@@ -2911,6 +2931,8 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         },
         preserveSessionModel: (sessionID) =>
           sessionPresets.peek(sessionID)?.preserveModel === true,
+        revisionForSession: (sessionID) =>
+          sessionPresets.peek(sessionID)?.revision,
         registeredProfiles,
         pluginAgents,
         session: ctx.session,
@@ -2920,6 +2942,10 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
           pinSessionChainsHook['v2.releaseSessionChains']?.(sessionID);
         },
       });
+      retireSessionProfiles = () => {
+        sessionProfileBridge.retire();
+        return sessionProfileBridge.drain();
+      };
 
       // Skip session hook registration if ctx.session is unavailable (v1 host
       // embedded v2 core with limited context). On full v2 contexts, session
@@ -2929,6 +2955,42 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
           '[v2] ctx.session unavailable; skipping session hooks (v1 host embedded v2 core)',
         );
       } else {
+        const contextRevisions = new Map<string, number>();
+        const assertTransitionIdle = v1Hooks[
+          'v2.assertSessionTransitionIdle'
+        ] as
+          | ForegroundFallbackManager['assertSessionTransitionIdle']
+          | undefined;
+        const publishRevision = v1Hooks['v2.publishSessionRevision'] as
+          | ForegroundFallbackManager['publishSessionRevision']
+          | undefined;
+        sessionPresets.setExecution({
+          assertIdle: (id) => {
+            sessionProfileBridge.assertIdle(id);
+            assertTransitionIdle?.(id);
+          },
+          install: async (id, record, agent) => {
+            contextRevisions.delete(id);
+            const bundle = record.execution ?? record.bundle;
+            const profile = reconcileRuntimeProfileOptionKeys(
+              registeredProfiles,
+              bundle.profiles,
+            )[agent];
+            await sessionProfileBridge.installSessionProfile(
+              id,
+              profile,
+              record.revision ?? 0,
+              record.executionModel,
+            );
+            sessionPresets.checkActive();
+            publishRevision?.(
+              id,
+              record.revision ?? 0,
+              record.explicitModel ? {} : bundle.chains,
+              !record.explicitModel && bundle.fallbackEnabled,
+            );
+          },
+        });
         // Native per-admission prompt hook (v2): `session.prompt` fires once
         // per admitted input with the eventual inbox User messageID — the
         // identity v1 chat.message consumers key on. With it registered the
@@ -2939,6 +3001,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
           const bridge = createSessionPromptBridge(chatMessage);
           promptBridge = bridge;
           const promptReg = await ctx.session.hook('prompt', async (event) => {
+            await sessionPresets.admit(event.sessionID);
             if (!permissionSnapshotReady) {
               await withTimeout(
                 permissionSnapshotReadiness,
@@ -3016,7 +3079,25 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
               sessionPresets.peek(event.sessionID),
             ),
         });
-        const reg = await ctx.session.hook('context', handler);
+        const reg = await ctx.session.hook('context', async (event) => {
+          const binding = await sessionPresets.ensure(event.sessionID);
+          await sessionProfileBridge.ensureSessionProfile(event.sessionID);
+          sessionPresets.assertStable(event.sessionID);
+          const revision = binding?.revision ?? 0;
+          await handler(event);
+          sessionPresets.assertStable(event.sessionID);
+          if (
+            (sessionPresets.peek(event.sessionID)?.revision ?? 0) !== revision
+          )
+            throw new Error(
+              'Session preset changed during context preparation',
+            );
+          contextRevisions.set(event.sessionID, revision);
+          if (contextRevisions.size > 1024) {
+            const oldest = contextRevisions.keys().next().value;
+            if (oldest !== undefined) contextRevisions.delete(oldest);
+          }
+        });
         disposers.push(() => reg.dispose());
         log('[v2] session context hook registered');
 
@@ -3024,10 +3105,39 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         // HTTP headers; registered unconditionally when the v1
         // hook exists — a failure fails setup rather than silently skipping
         // the Copilot initiator header).
-        if (chatHeadersHook) {
+        {
+          const headers = createChatHeadersBridge(chatHeaderStates);
           const headerReg = await ctx.session.hook(
             'model.request',
-            createChatHeadersBridge(chatHeaderStates),
+            async (event) => {
+              const binding = await sessionPresets.admit(event.sessionID);
+              if (
+                !event.model ||
+                typeof event.model.providerID !== 'string' ||
+                !event.model.providerID ||
+                typeof event.model.id !== 'string' ||
+                !event.model.id ||
+                (event.model.variant !== undefined &&
+                  (typeof event.model.variant !== 'string' ||
+                    !event.model.variant))
+              )
+                throw new Error('Invalid native request Model.Ref');
+              if (chatHeadersHook) await headers(event);
+              if (binding?.parentID && event.kind === 'primary') {
+                const revision = binding.revision ?? 0;
+                if (
+                  revision > 0 &&
+                  contextRevisions.get(event.sessionID) !== revision
+                )
+                  throw new Error('Session preset request revision mismatch');
+                await sessionPresets.assertRequestSelection(
+                  event.sessionID,
+                  event.model,
+                  revision,
+                );
+              }
+              sessionPresets.assertStable(event.sessionID);
+            },
           );
           disposers.push(() => headerReg.dispose());
           log('[v2] chat.headers bridge registered (session.model.request)');
@@ -3062,10 +3172,35 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                 name: 'retry',
                 cb: (event: never) => Promise<void>,
               ) => ReturnType<V2Context['session']['hook']>
-            )('retry', (event) =>
-              retryHook(event, (id, model) =>
-                switchModel.call(ctx.session, { sessionID: id, model }),
-              ),
+            )(
+              'retry',
+              async (
+                event: Parameters<
+                  ForegroundFallbackManager['handleV2Retry']
+                >[0],
+              ) => {
+                const binding = await sessionPresets.admit(event.sessionID);
+                const revision = binding?.revision;
+                if (binding?.parentID)
+                  await sessionPresets.assertRequestSelection(
+                    event.sessionID,
+                    event.model,
+                    revision ?? 0,
+                  );
+                await retryHook(event, async (id, model) => {
+                  sessionPresets.assertStable(id);
+                  if (sessionPresets.peek(id)?.revision !== revision)
+                    throw new Error(
+                      'Session preset fallback revision mismatch',
+                    );
+                  const result = await switchModel.call(ctx.session, {
+                    sessionID: id,
+                    model,
+                  });
+                  sessionPresets.assertStable(id);
+                  return result;
+                });
+              },
             );
             disposers.push(() => reg.dispose());
             log('[v2] retry hook registered');
@@ -3130,9 +3265,8 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                 | { providerID: string; id: string; variant?: string }
                 | undefined;
               if (
-                typeof args.task_id !== 'string' &&
-                (bundle?.inheritance[agentType] ??
-                  bundle?.inheritance[AGENT_ALIASES[agentType] ?? agentType])
+                bundle?.inheritance[agentType] ??
+                bundle?.inheritance[AGENT_ALIASES[agentType] ?? agentType]
               ) {
                 const response = await ctx.session.get?.({
                   sessionID: parentSessionID,
@@ -3166,9 +3300,19 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                       : {}),
                   };
               }
+              const selected = explicitModel
+                ? String(args.model)
+                : resolveDelegatedModel?.({
+                    agentType,
+                    parentSessionID,
+                    bundle,
+                    ...(parentModel ? { parentModel } : {}),
+                  });
+              const resolvedModel = delegationSelection(selected);
               captures.set(captureKey(parentSessionID, callID), {
                 bundle,
                 explicitModel,
+                ...(resolvedModel ? { resolvedModel } : {}),
                 ...(parentModel
                   ? { inheritedProviderID: parentModel.providerID }
                   : {}),
@@ -3183,17 +3327,13 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
               }
               if (typeof args.task_id === 'string' || explicitModel)
                 return undefined;
-              return resolveDelegatedModel?.({
-                agentType,
-                parentSessionID,
-                bundle,
-                ...(parentModel ? { parentModel } : {}),
-              });
+              return selected;
             },
           );
           if (before) {
             const reg = await ctx.tool.hook('execute.before', async (event) => {
               try {
+                await sessionPresets.admit(event.sessionID);
                 await bridges.beforeBridge(event as never);
               } catch (err) {
                 captures.delete(captureKey(event.sessionID, event.id));
@@ -3487,6 +3627,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       return async () => {
         log('[v2] dispose invoked');
         generationDisposed = true;
+        const profileDrain = retireSessionProfiles?.();
         const presetDrain = retireSessionPresets?.();
         eventDirectoryScope.release();
         registryBridge?.retire();
@@ -3509,6 +3650,9 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         }
         await permissionDrain;
         await presetDrain;
+        // A timeout cannot cancel native switchModel. Do not hand off to a
+        // replacement generation while an old operation can still change it.
+        await profileDrain;
         // FIFO is intentional: the success path preserves the historical
         // registration-order teardown; only the abort path unwinds LIFO.
         for (const d of disposers) {
@@ -3539,7 +3683,9 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       // scope claim here: a leaked live-directory entry would keep other
       // instances from ever reclaiming this location and would block the
       // last-instance wake reset.
-      await retireSessionPresets?.();
+      generationDisposed = true;
+      const profileDrain = retireSessionProfiles?.();
+      const presetDrain = retireSessionPresets?.();
       eventDirectoryScope.release();
       registryBridge?.retire();
       // The original cause MUST reach the plugin log and stderr before the
@@ -3561,6 +3707,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         causes.join('\ncaused by: '),
       );
       console.error('[oh-my-opencode-slim][v2] setup failed:', err);
+      await Promise.all([presetDrain, profileDrain]);
       // Best-effort abort-path cleanup: LIFO over the saved disposers,
       // each isolated so a failing disposer cannot mask the original
       // error, then the v1 dispose hook, then rethrow unchanged.

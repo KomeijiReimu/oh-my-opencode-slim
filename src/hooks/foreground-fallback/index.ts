@@ -602,6 +602,34 @@ export class ForegroundFallbackManager {
     );
   }
   private readonly sessionRetryEnabled = new Map<string, boolean>();
+  private readonly executionRevisions = new Map<string, number>();
+
+  assertSessionTransitionIdle(sessionID: string): void {
+    if (this.inProgress.has(sessionID))
+      throw new Error(
+        'Fallback model switch is still in flight; retry after it settles',
+      );
+  }
+
+  publishSessionRevision(
+    sessionID: string,
+    revision: number,
+    chains: Record<string, ReadonlyArray<ForegroundFallbackModel>>,
+    enabled: boolean,
+  ): void {
+    this.assertSessionTransitionIdle(sessionID);
+    if (this.executionRevisions.get(sessionID) !== revision) {
+      this.noteExternalTurn(
+        sessionID,
+        this.lastUserMessageID.get(sessionID) ?? '',
+      );
+      this.sessionTried.delete(sessionID);
+      this.activeFallback.delete(sessionID);
+      this.sessionModel.delete(sessionID);
+      this.executionRevisions.set(sessionID, revision);
+    }
+    this.pinSessionChains(sessionID, chains, enabled);
+  }
   private retryEnabledFor(sessionID: string): boolean {
     return this.sessionRetryEnabled.get(sessionID) ?? this.v2RetryEnabled;
   }
@@ -1214,6 +1242,7 @@ export class ForegroundFallbackManager {
     this.sessionAgent.delete(id);
     this.sessionTried.delete(id);
     this.sessionChains.delete(id);
+    this.executionRevisions.delete(id);
     this.sessionRetryEnabled.delete(id);
     this.unknownFinishStreak.delete(id);
     this.v2RetryNotices.delete(id);
@@ -1772,6 +1801,7 @@ export class ForegroundFallbackManager {
   ): Promise<void> {
     let picked: string | undefined;
     let switchRequest: Promise<unknown> | undefined;
+    const revision = this.executionRevisions.get(event.sessionID);
     const from = `${event.model.providerID}/${event.model.id}`;
     try {
       const { sessionID } = event;
@@ -1848,17 +1878,27 @@ export class ForegroundFallbackManager {
       if (!selected || selected === 'exhausted') return;
       const { agentName, nextModel, ref, variant } = selected;
       picked = nextModel;
-      switchRequest = switchModel(sessionID, {
-        providerID: ref.providerID,
-        id: ref.modelID,
-        ...(variant ? { variant } : {}),
-      });
+      this.inProgress.add(sessionID);
+      switchRequest = Promise.resolve().then(() =>
+        switchModel(sessionID, {
+          providerID: ref.providerID,
+          id: ref.modelID,
+          ...(variant ? { variant } : {}),
+        }),
+      );
+      // The timeout does not cancel the native switch. Keep the real flight
+      // fenced until settlement, including across a plugin-generation reload.
+      void switchRequest.then(
+        () => this.inProgress.delete(sessionID),
+        () => this.inProgress.delete(sessionID),
+      );
       await withTimeout(
         switchRequest,
         HOST_CALL_TIMEOUT_MS,
         'foreground retry model switch timed out',
       );
-      if (this.disposed) return;
+      if (this.disposed || this.executionRevisions.get(sessionID) !== revision)
+        return;
       event.decision = { retry: true, delay: this.retryDelayMs };
       this.commitSwitch(sessionID, from, nextModel, event.error);
       this.showFallbackToast(agentName, nextModel, event.error);
@@ -1884,6 +1924,7 @@ export class ForegroundFallbackManager {
             const observedModel = this.sessionModel.get(event.sessionID);
             if (
               this.disposed ||
+              this.executionRevisions.get(event.sessionID) !== revision ||
               (observedModel !== from && observedModel !== target)
             )
               return;

@@ -53,9 +53,11 @@ import {
   canOpenPresetManagerV2,
   openPresetManagerV2,
   readSessionPreset,
+  sessionPresetLabel,
   type V2PresetManagerContext,
   type V2PresetUiSurface,
 } from './v2/preset-manager';
+import type { SessionPresetState } from './v2/preset-rpc';
 
 const PLUGIN_NAME = 'oh-my-opencode-slim';
 const CONFIG_WARNING_COLOR = 'orange';
@@ -541,6 +543,8 @@ export interface SidebarSessionTarget {
   agentName: string;
   alias?: string;
   status?: 'busy' | 'retry' | 'reusable' | 'stopped';
+  /** Host session selection, separate from the saved future-delegation team. */
+  actualModel?: string;
   /**
    * 1-based position among the active sessions of the same agent sharing
    * this session's parent scope. Present only when that scope runs more
@@ -825,7 +829,7 @@ export interface SidebarInteraction {
  */
 export interface SidebarPresetRow {
   name: string;
-  /** V2-only: server-owned inference binding for future children, not a model. */
+  /** V2-only: server-owned inference binding for future delegations, not a model. */
   sessionLabel?: string;
   onActivate?: () => void;
 }
@@ -1325,6 +1329,19 @@ function sessionTargetRow(
         },
         [label],
       ),
+      ...(target.actualModel !== undefined
+        ? [
+            text(
+              {
+                fg: theme.textMuted,
+                flexShrink: 1,
+                wrapMode: 'none',
+                truncate: true,
+              },
+              [` · ${target.actualModel}`],
+            ),
+          ]
+        : []),
       ...(annotation !== undefined
         ? [
             text(
@@ -1402,6 +1419,37 @@ export function getContrastForeground(
   return RGBA.fromInts(255, 255, 255);
 }
 
+export interface SidebarSessionView {
+  state?: SessionPresetState;
+  nativeModel?: string;
+  taskModel?: (sessionID: string) => string | undefined;
+}
+
+/** Window-local view only. Never writes the directory-wide TuiSnapshot. */
+export function projectSidebarTeam(
+  snapshot: TuiSnapshot,
+  state?: SessionPresetState,
+): TuiSnapshot {
+  const team = state?.team;
+  const names = new Set([
+    ...getSidebarAgentNames(snapshot),
+    ...Object.keys(team?.agentModels ?? {}),
+    ...Object.keys(team?.inheritance ?? {}),
+  ]);
+  return {
+    ...snapshot,
+    agentModels: Object.fromEntries(
+      [...names].map((name) => [
+        name,
+        team?.inheritance[name]
+          ? `Inherits ${team.inheritance[name]}`
+          : (team?.agentModels[name] ?? 'Unknown'),
+      ]),
+    ),
+    agentVariants: { ...team?.agentVariants },
+  };
+}
+
 export function renderSidebar(
   snapshot: TuiSnapshot,
   version: string,
@@ -1423,6 +1471,7 @@ export function renderSidebar(
   interaction?: SidebarInteraction,
   presetRow?: SidebarPresetRow,
   modelNames?: ReadonlyMap<string, string>,
+  sessionView?: SidebarSessionView,
 ): JSX.Element {
   const configStatusRow = buildConfigStatusRow(configInvalid, theme);
   const presetRowEl = presetRow
@@ -1495,6 +1544,18 @@ export function renderSidebar(
     [
       header,
       ...(sidebarOpen ? [configStatusRow, presetRowEl] : []),
+      ...(sidebarOpen && sessionView
+        ? [
+            text({ fg: theme.textMuted, wrapMode: 'none', truncate: true }, [
+              `Current model: ${sessionView.nativeModel ?? 'Unknown'}`,
+            ]),
+            text({ fg: theme.textMuted, marginTop: 1 }, [
+              sessionView.state?.pending
+                ? 'Team update pending · new work blocked'
+                : 'Team · next delegation',
+            ]),
+          ]
+        : []),
       ...(sidebarOpen
         ? getSidebarAgentNames(snapshot).flatMap((agentName) => {
             const model = snapshot.agentModels[agentName] ?? 'pending';
@@ -1520,7 +1581,16 @@ export function renderSidebar(
                         : 'reusable',
                 }),
               );
-            const mergedTargets = [...sessions, ...reusableTargets];
+            const mergedTargets = [...sessions, ...reusableTargets].map(
+              (target) =>
+                sessionView
+                  ? {
+                      ...target,
+                      actualModel:
+                        sessionView.taskModel?.(target.sessionID) ?? 'Unknown',
+                    }
+                  : target,
+            );
             const history = reusableTargets.some(
               (target) =>
                 target.status === 'reusable' || target.status === 'stopped',
@@ -1572,7 +1642,23 @@ export function renderSidebar(
             const agentRowEl = compactSidebar
               ? compactAgentRow(rowOptions)
               : agentRow(rowOptions);
-            if (!expanded) return [agentRowEl];
+            if (!expanded)
+              return [
+                agentRowEl,
+                ...(sessionView && mergedTargets.length === 1
+                  ? [
+                      text(
+                        {
+                          fg: theme.textMuted,
+                          paddingLeft: 2,
+                          wrapMode: 'none',
+                          truncate: true,
+                        },
+                        [`Task: ${mergedTargets[0].actualModel}`],
+                      ),
+                    ]
+                  : []),
+              ];
             return [
               agentRowEl,
               ...allTargets.map((target) =>
@@ -1665,7 +1751,7 @@ function buildPresetRow(
       : box({ width: '100%', flexDirection: 'column' }, [
           row,
           text({ fg: theme.textMuted, wrapMode: 'none', truncate: true }, [
-            `Session team snapshot: ${presetRow.sessionLabel}`,
+            `Session: ${presetRow.sessionLabel}`,
           ]),
         ]);
   if (!clickable) return content;
@@ -1817,6 +1903,7 @@ interface V2TuiContext extends V2PresetManagerContext {
   client?: unknown;
   data?: V2PresetManagerContext['data'] & {
     on?: (type: string, handler: (event: unknown) => void) => unknown;
+    session?: { get?: (sessionID: string) => { model?: unknown } | undefined };
   };
   renderer: { requestRender: () => void; getSelection?: () => unknown };
   theme: V2TuiThemeTokens;
@@ -1870,7 +1957,11 @@ interface SidebarRuntimeAdapter {
     presetName?: string,
     sessionLabel?: string,
   ) => SidebarPresetRow | undefined;
-  readSessionPreset?: (directory: string, sessionID: string) => Promise<string>;
+  readSessionPreset?: (
+    directory: string,
+    sessionID: string,
+  ) => Promise<SessionPresetState>;
+  getSessionModel?: (sessionID: string) => string | undefined;
   onMultiplexerConfig?: (type: MultiplexerType) => void;
 }
 
@@ -1907,6 +1998,7 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
     directory: string;
     sessionID: string;
     label: string;
+    state?: SessionPresetState;
   }>();
   let disposed = false;
   let unregisterConfigListener = () => {};
@@ -1959,11 +2051,13 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
     }
     if (adapter.readSessionPreset && currentSession) {
       let label: string;
+      let state: SessionPresetState | undefined;
       try {
-        label = await adapter.readSessionPreset(
+        state = await adapter.readSessionPreset(
           currentDirectory,
           currentSession,
         );
+        label = sessionPresetLabel(state);
       } catch {
         label = 'Unavailable';
       }
@@ -1977,12 +2071,14 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
       if (
         previous?.directory !== currentDirectory ||
         previous?.sessionID !== currentSession ||
-        previous?.label !== label
+        previous?.label !== label ||
+        JSON.stringify(previous?.state) !== JSON.stringify(state)
       ) {
         setSessionPreset({
           directory: currentDirectory,
           sessionID: currentSession,
           label,
+          state,
         });
         stateChanged = true;
       }
@@ -2015,10 +2111,9 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
           log('[v2][tui] config state read failed', String(err));
           return { ok: false, reason: String(err) };
         }
-        if (changed) {
-          adapter.renderer.requestRender();
-          scheduleRefresh();
-        }
+        if (changed) adapter.renderer.requestRender();
+        // Same-name Apply may change the saved team without changing config.
+        scheduleRefresh();
         return { ok: true };
       },
     );
@@ -2046,6 +2141,17 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
       const visible = adapter.getVisibleSession();
       const currentSnapshot = snapshot();
       const projection = sessionPreset();
+      const isCurrentProjection =
+        projection?.directory === adapter.getDirectory() &&
+        projection.sessionID === visible;
+      const sessionView: SidebarSessionView | undefined =
+        adapter.readSessionPreset && visible
+          ? {
+              state: isCurrentProjection ? projection?.state : undefined,
+              nativeModel: adapter.getSessionModel?.(visible),
+              taskModel: adapter.getSessionModel,
+            }
+          : undefined;
       const sessionLabel = !adapter.readSessionPreset
         ? undefined
         : visible === undefined
@@ -2061,7 +2167,9 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
           : resolveTuiSnapshotRoot(currentSnapshot, visible),
       );
       return renderSidebar(
-        currentSnapshot,
+        sessionView
+          ? projectSidebarTeam(currentSnapshot, sessionView.state)
+          : currentSnapshot,
         adapter.version,
         adapter.theme(),
         configInvalid,
@@ -2071,6 +2179,7 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
         interaction,
         adapter.getPresetRow?.(configDirectory, presetName, sessionLabel),
         modelNames(),
+        sessionView,
       );
     }),
   );
@@ -2099,6 +2208,11 @@ async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
       notifyConfigChanged(directory, 'preset-manager');
     augmented.getSessionID = () =>
       resolveRouteSessionId(ctx.ui.router.current());
+    augmented.isHome = () => ctx.ui.router.current().type === 'home';
+    if (ctx.ui.router.navigate) {
+      augmented.openSession = (sessionID) =>
+        ctx.ui.router.navigate?.({ type: 'session', sessionID });
+    }
     return augmented;
   };
   // Tracks the runtime's effective `multiplexer.type` (onMultiplexerConfig).
@@ -2213,11 +2327,19 @@ async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
       warnPaneUnsupported();
       void reconcilePaneWiring();
     },
-    readSessionPreset: async (directory, sessionID) => {
-      const state = await readSessionPreset(ctx, sessionID, directory);
-      return state.status === 'bound'
-        ? (state.presetName ?? '(no named preset)')
-        : 'Not bound';
+    readSessionPreset: (directory, sessionID) =>
+      readSessionPreset(ctx, sessionID, directory),
+    getSessionModel: (sessionID) => {
+      const model = ctx.data?.session?.get?.(sessionID)?.model;
+      const id = remoteModelId(model);
+      const variant =
+        model && typeof model === 'object' && 'variant' in model
+          ? model.variant
+          : undefined;
+      // The native "default" variant is the host's no-override sentinel.
+      return id
+        ? `${id}${typeof variant === 'string' && variant !== 'default' ? ` #${variant}` : ''}`
+        : undefined;
     },
     getPresetRow: (directory, presetName, sessionLabel) => {
       const name = presetName ?? '(none)';

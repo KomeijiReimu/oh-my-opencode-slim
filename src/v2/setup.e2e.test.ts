@@ -684,14 +684,21 @@ describe('createV2Setup e2e', () => {
           ]
         : [];
     let retryHook: ((event: any) => Promise<void>) | undefined;
+    let requestHook: ((event: any) => Promise<void>) | undefined;
     const originalSessionHook = (ctx.session as any).hook;
     (ctx.session as any).hook = (name: string, callback: any) => {
       if (name === 'retry') retryHook = callback;
+      if (name === 'model.request') requestHook = callback;
       return originalSessionHook.call(ctx.session, name, callback);
     };
     const switches: unknown[] = [];
+    let pendingSwitch: Promise<void> | undefined;
+    let switchEntered: (() => void) | undefined;
     ctx.session.switchModel = async (input) => {
       switches.push(input);
+      switchEntered?.();
+      if (pendingSwitch) await pendingSwitch;
+      identities.get(input.sessionID).model = input.model;
     };
     let nativeCalls = 0;
     const nativeInputs: Array<Record<string, unknown>> = [];
@@ -926,7 +933,11 @@ describe('createV2Setup e2e', () => {
         retryHook?.({
           sessionID,
           agent: 'explorer',
-          model: { providerID, id },
+          model: {
+            providerID,
+            id,
+            variant: identities.get(sessionID)?.model?.variant,
+          },
           error: { message: 'quota exceeded' },
           decision: { retry: true },
         });
@@ -1027,10 +1038,165 @@ describe('createV2Setup e2e', () => {
       });
       expect(
         stored.get('session-preset/v1/ses_child-1').bundle.presetName,
-      ).toBe('A');
+      ).toBe('B');
       const beforeResumeRetry = switches.length;
       await retry('ses_child-1', 'manual', 'resumed');
       expect(switches).toHaveLength(beforeResumeRetry);
+      // The next parent dispatch updates this SAME ID. A failed switch is
+      // durable and blocks every new admission, including a final request
+      // whose context was prepared before the transition.
+      await rpc.apply(
+        { sessionID: 'root', presetName: 'A' },
+        { signal: new AbortController().signal },
+      );
+      const entered = Promise.withResolvers<void>();
+      const blocked = Promise.withResolvers<void>();
+      pendingSwitch = blocked.promise;
+      switchEntered = entered.resolve;
+      const transitioning = launch('transition-call', 'root', {
+        sessionID: 'ses_child-1',
+      }).catch((error: Error) => error);
+      await entered.promise;
+      const transitioningState = await rpc.read({ sessionID: 'ses_child-1' });
+      expect(transitioningState.status).toBe('transitioning');
+      const prompt = {
+        sessionID: 'ses_child-1',
+        messageID: 'blocked-prompt',
+        prompt: { text: 'must not run' },
+      };
+      const request = {
+        sessionID: 'ses_child-1',
+        agent: 'explorer',
+        kind: 'primary',
+        model: { providerID: 'manual', id: 'resumed', variant: 'low' },
+        headers: {},
+      };
+      await expect(calls.promptHookCb?.(prompt)).rejects.toThrow('pending');
+      await expect(
+        calls.contextHookCb?.({
+          ...crossProviderContext,
+          sessionID: 'ses_child-1',
+        }),
+      ).rejects.toThrow('pending');
+      await expect(requestHook?.(request)).rejects.toThrow('pending');
+      await expect(
+        calls.toolBeforeCb?.({
+          tool: 'read',
+          sessionID: 'ses_child-1',
+          id: 'blocked-tool',
+          input: {},
+        }),
+      ).rejects.toThrow('pending');
+      await expect(retry('ses_child-1', 'manual', 'resumed')).rejects.toThrow(
+        'pending',
+      );
+      blocked.reject(new Error('transition switch failed'));
+      expect(await transitioning).toMatchObject({
+        message: 'transition switch failed',
+      });
+      pendingSwitch = undefined;
+      switchEntered = undefined;
+      const nativeCallsBeforeRetry = nativeCalls;
+      await rpc.retry(
+        {
+          sessionID: 'ses_child-1',
+          operationID: transitioningState.pending.operationID,
+        },
+        { signal: new AbortController().signal },
+      );
+      expect(nativeCalls).toBe(nativeCallsBeforeRetry); // configuration only
+      expect(identities.get('ses_child-1').model).toEqual({
+        providerID: 'test',
+        id: 'a',
+        variant: 'high',
+      });
+      const resumedContext = {
+        ...crossProviderContext,
+        sessionID: 'ses_child-1',
+        model: { providerID: 'test', id: 'a', variant: 'high' },
+        options: {},
+      };
+      await calls.contextHookCb?.(resumedContext);
+      await expect(requestHook?.(request)).rejects.toThrow(
+        'model/variant mismatch',
+      );
+      await expect(
+        requestHook?.({
+          ...request,
+          model: { ...resumedContext.model, variant: 'low' },
+        }),
+      ).rejects.toThrow('model/variant mismatch');
+      expect(requestHook).toBeFunction();
+      await requestHook?.({ ...request, model: resumedContext.model });
+      expect(resumedContext.options).toMatchObject({
+        temperature: 0.35,
+        reasoning: 'A',
+      });
+      // A real native model selection is not a stale preset request. Its
+      // actual request ref is checked against current host selection, while
+      // a previously selected A ref still waiting for admission is rejected.
+      const manualModel = {
+        providerID: 'manual',
+        id: 'native-choice',
+        variant: 'medium',
+      };
+      await ctx.session.switchModel?.({
+        sessionID: 'ses_child-1',
+        model: manualModel,
+      });
+      await expect(
+        requestHook?.({ ...request, model: resumedContext.model }),
+      ).rejects.toThrow('model/variant mismatch');
+      const manualContext = {
+        ...resumedContext,
+        model: manualModel,
+        options: {},
+      };
+      await calls.contextHookCb?.(manualContext);
+      await requestHook?.({ ...request, model: manualModel });
+      expect(manualContext.options).toEqual({ temperature: 0.35 });
+      // Child Apply selects its own future team; a subsequent parent
+      // re-delegation restores the parent's team without touching execution.
+      await rpc.apply(
+        { sessionID: 'ses_child-1', presetName: 'B' },
+        { signal: new AbortController().signal },
+      );
+      const revisionBeforeTeamReset = stored.get(
+        'session-preset/v1/ses_child-1',
+      ).revision;
+      const count = switches.length;
+      await launch('same-team-resume', 'root', { sessionID: 'ses_child-1' });
+      expect(switches).toHaveLength(count);
+      expect(identities.get('ses_child-1').model).toEqual(manualModel);
+      expect(stored.get('session-preset/v1/ses_child-1')).toMatchObject({
+        bundle: { presetName: 'A' },
+        revision: revisionBeforeTeamReset,
+      });
+      expect(stored.get('session-preset/v1/ses_child-1').explicitModel).toBe(
+        false,
+      );
+      await ctx.session.switchModel?.({
+        sessionID: 'ses_child-1',
+        model: resumedContext.model,
+      });
+      await retry('ses_child-1', 'test', 'a');
+      const fallbackModel = identities.get('ses_child-1').model;
+      expect(fallbackModel).toMatchObject({ providerID: 'backup', id: 'a' });
+      await rpc.apply(
+        { sessionID: 'ses_child-1', presetName: 'B' },
+        { signal: new AbortController().signal },
+      );
+      const fallbackSwitchCount = switches.length;
+      await launch('same-execution-fallback', 'root', {
+        sessionID: 'ses_child-1',
+      });
+      expect(switches).toHaveLength(fallbackSwitchCount);
+      expect(identities.get('ses_child-1').model).toEqual(fallbackModel);
+      // Leave the original test's subsequent independent launches on B.
+      await rpc.apply(
+        { sessionID: 'root', presetName: 'B' },
+        { signal: new AbortController().signal },
+      );
       const cancelled = {
         tool: 'subagent',
         sessionID: 'root',
@@ -3735,7 +3901,7 @@ describe('createV2Setup e2e', () => {
     expect(logText).not.toContain('[v2] v1 dispose failed');
   }, 20_000);
 
-  test('disabled_hooks chat-headers skips the model.request bridge registration', async () => {
+  test('disabled chat-headers still registers the independent preset admission gate', async () => {
     await Bun.write(
       path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
       JSON.stringify({
@@ -3746,10 +3912,8 @@ describe('createV2Setup e2e', () => {
     const { ctx, calls } = makeMockV2Context(projectDir);
     const cleanup = await createV2Setup()(ctx);
 
-    // The v1 chat.headers key is absent, so the v2 bridge skips both the
-    // marker observer and the model.request registration; the rest of the
-    // session hooks still register.
-    expect(calls.hooks).not.toContain('session:model.request');
+    // Disabling header injection must not disable request admission safety.
+    expect(calls.hooks).toContain('session:model.request');
     expect(calls.hooks).toContain('session:context');
     expect(calls.hooks).toContain('session:prompt');
 

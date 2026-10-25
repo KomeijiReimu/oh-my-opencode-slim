@@ -293,11 +293,9 @@ describe('v2 tui preset plugin', () => {
         expect(stub.toasts).toHaveLength(1);
         expect(stub.toasts[0]).toContain('Saved preset "cheap"');
         expect(stub.toasts[0]).toContain('Live refresh requested');
-        expect(stub.toasts[0]).toStartWith(
-          'Saved preset "cheap" to user config.',
-        );
+        expect(stub.toasts[0]).toStartWith('Saved preset "cheap".');
         expect(stub.toasts[0]).not.toContain('Global default saved');
-        expect(stub.toasts[0]).toContain('bound sessions unchanged');
+        expect(stub.toasts[0]).toContain('existing bindings unchanged');
         expect(stub.toasts[0]).not.toContain('Reload OpenCode');
         expect(readUserConfig().preset).toBe('cheap');
       } finally {
@@ -315,14 +313,10 @@ describe('v2 tui preset plugin', () => {
 
       expect(readUserConfig().preset).toBe('cheap');
       expect(stub.toasts).toHaveLength(1);
-      expect(stub.toasts[0]).toStartWith(
-        'Saved preset "cheap" to user config,',
-      );
+      expect(stub.toasts[0]).toStartWith('Saved preset "cheap".');
       expect(stub.toasts[0]).not.toContain('Global default saved');
-      expect(stub.toasts[0]).toContain('live refresh request failed');
-      expect(stub.toasts[0]).toContain(
-        'Reload OpenCode to refresh the default',
-      );
+      expect(stub.toasts[0]).toContain('Refresh request failed');
+      expect(stub.toasts[0]).toContain('Reload OpenCode');
       expect(stub.toasts[0]).not.toContain('Live refresh requested');
     });
 
@@ -392,7 +386,7 @@ describe('v2 tui preset plugin', () => {
       Object.assign(stub.ctx, {
         client: {
           rpc: (contract: { id: string }) => {
-            expect(contract.id).toBe('oh-my-opencode-slim.session-preset.v1');
+            expect(contract.id).toBe('oh-my-opencode-slim.session-preset.v2');
             return {
               read: async (input: unknown, options: unknown) => {
                 reads.push({ input, options });
@@ -400,7 +394,7 @@ describe('v2 tui preset plugin', () => {
                   sessionID: 'visible-root',
                   status: 'unbound',
                   presetName: null,
-                  affects: 'future-children-only',
+                  affects: 'future-delegations',
                 };
               },
               apply: async (input: unknown, options: unknown) => {
@@ -409,7 +403,7 @@ describe('v2 tui preset plugin', () => {
                   sessionID: 'visible-root',
                   status: 'bound',
                   presetName: 'cheap',
-                  affects: 'future-children-only',
+                  affects: 'future-delegations',
                 };
               },
             };
@@ -429,12 +423,68 @@ describe('v2 tui preset plugin', () => {
       expect(applies).toEqual([
         {
           input: { sessionID: 'visible-root', presetName: 'cheap' },
-          options: { location: { directory: projectDir } },
+          options: {
+            location: { directory: projectDir },
+            signal: expect.any(AbortSignal),
+          },
         },
       ]);
-      expect(stub.toasts[0]).toContain('Session team snapshot: "cheap"');
+      expect(stub.toasts[0]).toContain('Team: "cheap"');
       expect(fs.readFileSync(userConfigPath(), 'utf-8')).toBe(before);
       expect(stub.reloadCalls()).toBe(0);
+    });
+
+    test('home manager forwards agent, native model and navigation to createBound', async () => {
+      writeUserConfig(makeConfig() as unknown as Record<string, unknown>);
+      const before = readUserConfig();
+      const stub = makeStubCtx({
+        selects: ['cheap', 'create-session', 'primary', 'open'],
+        confirms: [true],
+      });
+      const opened: unknown[] = [];
+      const created: unknown[] = [];
+      Object.assign(stub.ctx.ui, {
+        router: {
+          current: () => ({ type: 'home' }),
+          navigate: (route: unknown) => opened.push(route),
+        },
+        model: {
+          current: () => ({ providerID: 'native', modelID: 'selected' }),
+        },
+      });
+      Object.assign(stub.ctx, {
+        data: {
+          location: {
+            agent: {
+              list: () => [{ id: 'primary', mode: 'primary', hidden: false }],
+            },
+          },
+        },
+        client: {
+          rpc: () => ({
+            createBound: async (input: { sessionID: string }) => {
+              created.push(input);
+              return {
+                sessionID: input.sessionID,
+                status: 'bound',
+                presetName: 'cheap',
+                affects: 'future-delegations',
+              };
+            },
+          }),
+        },
+      });
+      await runPresetFlow(stub.ctx);
+      expect(created).toEqual([
+        expect.objectContaining({
+          agent: 'primary',
+          model: { providerID: 'native', id: 'selected' },
+        }),
+      ]);
+      expect(opened).toEqual([
+        { type: 'session', sessionID: expect.stringMatching(/^ses_/) },
+      ]);
+      expect(readUserConfig()).toEqual(before);
     });
 
     test('bare /preset on home rejects Current session without RPC or a global write', async () => {
@@ -486,7 +536,7 @@ describe('v2 tui preset plugin', () => {
       await runPresetFlow(stub.ctx);
 
       expect(stub.toasts).toHaveLength(1);
-      expect(stub.toasts[0]).toContain('dialog API');
+      expect(stub.toasts[0]).toContain('Dialogs unavailable');
       expect(readUserConfig().preset).toBeUndefined();
     });
 
@@ -627,6 +677,19 @@ describe('v2 tui preset plugin', () => {
         finishSecondRead = resolve;
       });
       const requests: unknown[] = [];
+      let teamModel = 'saved/old-team';
+      let nativeVariant = 'default';
+      stub.ctx.data = {
+        session: {
+          get: () => ({
+            model: {
+              providerID: 'native',
+              id: 'main-model',
+              variant: nativeVariant,
+            },
+          }),
+        },
+      };
       stub.ctx.client = {
         rpc: () => ({
           read: async (input: { sessionID: string }, options: unknown) => {
@@ -639,7 +702,12 @@ describe('v2 tui preset plugin', () => {
               sessionID: input.sessionID,
               status: 'bound',
               presetName: 'server-alpha',
-              affects: 'future-children-only',
+              affects: 'future-delegations',
+              team: {
+                agentModels: { oracle: teamModel },
+                agentVariants: {},
+                inheritance: {},
+              },
             };
           },
         }),
@@ -662,16 +730,30 @@ describe('v2 tui preset plugin', () => {
         await screen.renderOnce();
         expect(screen.captureCharFrame()).toContain('Default');
         expect(screen.captureCharFrame()).toContain('balanced');
+        expect(screen.captureCharFrame()).toContain('Session: server-alpha');
+        expect(screen.captureCharFrame()).toContain('old-team');
         expect(screen.captureCharFrame()).toContain(
-          'Session team snapshot: server-alpha',
+          'Current model: native/main-model',
+        );
+        expect(screen.captureCharFrame()).not.toContain('#default');
+        const refreshed = new Promise<void>((resolve) => {
+          notifyRendered = resolve;
+        });
+        teamModel = 'saved/new-team';
+        nativeVariant = 'high';
+        await notifyConfigChanged(projectDir, 'same-name-apply');
+        await refreshed;
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).toContain('new-team');
+        expect(screen.captureCharFrame()).not.toContain('old-team');
+        expect(screen.captureCharFrame()).toContain(
+          'Current model: native/main-model #high',
         );
 
         setRoute({ type: 'session', sessionID: 'root-b' });
         await screen.renderOnce();
         expect(screen.captureCharFrame()).not.toContain('server-alpha');
-        expect(screen.captureCharFrame()).toContain(
-          'Session team snapshot: Loading',
-        );
+        expect(screen.captureCharFrame()).toContain('Session: Loading');
         writeUserConfig({
           ...makeConfig(),
           preset: 'cheap',
@@ -684,12 +766,12 @@ describe('v2 tui preset plugin', () => {
           sessionID: 'root-b',
           status: 'bound',
           presetName: 'late-beta',
-          affects: 'future-children-only',
+          affects: 'future-delegations',
         });
         await screen.renderOnce();
         expect(screen.captureCharFrame()).not.toContain('late-beta');
         expect(screen.captureCharFrame()).not.toContain('server-alpha');
-        expect(requests[1]).toEqual({
+        expect(requests[2]).toEqual({
           input: { sessionID: 'root-b' },
           options: {
             location: { directory: projectDir },
@@ -699,14 +781,14 @@ describe('v2 tui preset plugin', () => {
         setRoute({ type: 'home', sessionID: '' });
         await screen.renderOnce();
         expect(screen.captureCharFrame()).toContain(
-          'Session team snapshot: No session displayed',
+          'Session: No session displayed',
         );
       } finally {
         finishSecondRead({
           sessionID: 'root-b',
           status: 'unbound',
           presetName: null,
-          affects: 'future-children-only',
+          affects: 'future-delegations',
         });
         cleanup?.();
         screen?.renderer.destroy();
@@ -734,7 +816,7 @@ describe('v2 tui preset plugin', () => {
         expect(layer?.mode).toBe('global');
         const command = layer?.commands[0];
         expect(command?.id).toBe('omo.preset');
-        expect(command?.title).toBe('OMO: switch preset');
+        expect(command?.title).toBe('OMO: manage presets');
         expect(command?.group).toBe('System');
         expect(command?.palette).toBe(true);
         expect(command?.slash).toEqual({ name: 'preset', arguments: true });

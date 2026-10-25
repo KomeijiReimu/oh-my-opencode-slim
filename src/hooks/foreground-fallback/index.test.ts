@@ -2111,7 +2111,11 @@ describe('ForegroundFallbackManager v2 retry hook', () => {
 
   test.each([
     { kind: 'reconciles B', advance: false, calls: ['test/B'] },
-    { kind: 'does not roll C back to B', advance: true, calls: ['test/C'] },
+    {
+      kind: 'blocks a second switch until B settles',
+      advance: true,
+      calls: ['test/B'],
+    },
   ])('late-landing switch $kind', async ({ advance, calls }) => {
     jest.useFakeTimers();
     try {
@@ -2130,12 +2134,18 @@ describe('ForegroundFallbackManager v2 retry hook', () => {
       jest.advanceTimersByTime(2_500);
       await pending;
       expect(observed).toEqual([]);
+      expect(() =>
+        mgr.publishSessionRevision(sid, 1, { explorer: ['test/C'] }, true),
+      ).toThrow('still in flight');
       if (advance)
         await mgr.handleV2Retry(retryEvent(sid, 'B'), async () => {});
-      // A late B must reconcile only if no later retry has advanced to C.
+      // A timeout never releases the real native model-switch fence.
       resolveSwitch();
       for (let i = 0; i < 10; i++) await Promise.resolve();
       expect(observed).toEqual(calls);
+      expect(() =>
+        mgr.publishSessionRevision(sid, 1, { explorer: ['test/C'] }, true),
+      ).not.toThrow();
     } finally {
       jest.useRealTimers();
     }

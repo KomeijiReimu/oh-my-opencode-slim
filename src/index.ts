@@ -2461,6 +2461,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     'v2.backgroundDefaultFlip': backgroundDefaultFlip,
     'v2.session.retry':
       foregroundFallback.handleV2Retry.bind(foregroundFallback),
+    'v2.assertSessionTransitionIdle':
+      foregroundFallback.assertSessionTransitionIdle.bind(foregroundFallback),
+    'v2.publishSessionRevision':
+      foregroundFallback.publishSessionRevision.bind(foregroundFallback),
     // v2-only extension hook: pin the chain generation in effect when a
     // child session registers — the same generation as its frozen profile.
     'v2.pinSessionChains': (
@@ -3665,6 +3669,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       enabled?: boolean,
     ) => void;
     'v2.releaseSessionChains': (sessionID: string) => void;
+    'v2.assertSessionTransitionIdle': ForegroundFallbackManager['assertSessionTransitionIdle'];
+    'v2.publishSessionRevision': ForegroundFallbackManager['publishSessionRevision'];
   };
 
   return hooks;

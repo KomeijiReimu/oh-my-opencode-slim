@@ -182,8 +182,11 @@ apply subagent inference settings to **Current session** or change the
 **Global default**. `/preset <name>` and manual configuration edits change
 defaults; existing work and its future subagents retain their saved
 configuration until you explicitly reapply a preset to that session.
-Already-created children keep their own configuration. Main-session models,
-prompts, tools, skills and MCPs are not switched by the session action.
+An existing child adopts the parent's selected team when explicitly resumed,
+keeping its session ID and history. The manager shows **Default** and **Session**
+separately and can create an empty session with a preset already bound.
+Main-session models, prompts, tools, skills and MCPs are not switched by the
+session action.
 On v1, reload OpenCode after applying a preset. See
 [Preset Switching](docs/preset-switching.md) for scope and timing, and
 [Configuration](docs/configuration.md#preset-inheritance) for the inheritance

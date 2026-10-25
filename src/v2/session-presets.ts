@@ -1,8 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import type { V2AgentRuntimeProfiles } from './runtime-profiles';
-import type { V2Context } from './types';
+import type { ModelRef, V2Context } from './types';
 
 const model = z
   .object({
@@ -40,9 +41,10 @@ const bundleSchema = z
     inheritance: z.record(z.string(), z.enum(['session', 'orchestrator'])),
   })
   .strict();
-const recordSchema = z
+const stableSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.union([z.literal(1), z.literal(2)]),
+    revision: z.number().int().nonnegative().optional(),
     parentID: z.string().optional(),
     bundle: bundleSchema,
     // Applying to a child changes its descendants, not its own inference.
@@ -50,6 +52,41 @@ const recordSchema = z
     preserveModel: z.boolean().optional(),
     explicitModel: z.boolean().optional(),
     inheritedProviderID: z.string().min(1).optional(),
+    executionModel: model.optional(),
+  })
+  .strict();
+const createInputSchema = z
+  .object({
+    directory: z.string().min(1),
+    operationID: z.string().min(1),
+    presetName: z.string().min(1),
+    agent: z.string().min(1),
+    model,
+  })
+  .strict();
+const recordSchema = stableSchema
+  .extend({
+    pending: z
+      .discriminatedUnion('kind', [
+        z
+          .object({
+            kind: z.literal('transition'),
+            operationID: z.string().min(1),
+            agent: z.string().min(1),
+            target: stableSchema,
+          })
+          .strict(),
+        z
+          .object({
+            kind: z.literal('createBound'),
+            operationID: z.string().min(1),
+            input: createInputSchema,
+          })
+          .strict(),
+      ])
+      .optional(),
+    createdBy: createInputSchema.optional(),
+    completedOperationID: z.string().optional(),
   })
   .strict();
 
@@ -68,9 +105,20 @@ export type SessionPresetRecord = Omit<
 };
 export type SessionPresetState = {
   sessionID: string;
-  status: 'bound' | 'unbound';
+  status: 'bound' | 'unbound' | 'initializing' | 'transitioning';
   presetName: string | null;
-  affects: 'future-children-only';
+  affects: 'future-delegations';
+  team?: {
+    agentModels: Record<string, string>;
+    agentVariants: Record<string, string>;
+    inheritance: Record<string, 'session' | 'orchestrator'>;
+  };
+  executionPresetName?: string | null;
+  pending?: {
+    kind: 'createBound' | 'transition';
+    operationID: string;
+    presetName: string | null;
+  };
 };
 /** Per-call execution intent is separate from the inherited team bundle. */
 export type SessionTeamAdmission = {
@@ -78,7 +126,39 @@ export type SessionTeamAdmission = {
   bundle: SessionTeamBundle | null;
   explicitModel: boolean;
   inheritedProviderID?: string;
+  resolvedModel?: ModelRef;
 };
+
+export type SessionPresetExecution = {
+  assertIdle: (id: string) => void;
+  install: (
+    id: string,
+    record: SessionPresetRecord,
+    agent: string,
+  ) => Promise<void>;
+};
+
+export function sameSelection(actual: unknown, expected: ModelRef): boolean {
+  if (!actual || typeof actual !== 'object') return false;
+  const ref = actual as ModelRef;
+  return (
+    ref.providerID === expected.providerID &&
+    ref.id === expected.id &&
+    (ref.variant ?? 'default') === (expected.variant ?? 'default')
+  );
+}
+
+export function delegationSelection(value: unknown): ModelRef | undefined {
+  if (typeof value !== 'string') return undefined;
+  const [selection, variant] = value.split('#');
+  const slash = selection.indexOf('/');
+  if (slash <= 0 || slash === selection.length - 1) return undefined;
+  return {
+    providerID: selection.slice(0, slash),
+    id: selection.slice(slash + 1),
+    ...(variant ? { variant } : {}),
+  };
+}
 
 function assertJSON(value: unknown): void {
   if (value === null || typeof value === 'string' || typeof value === 'boolean')
@@ -115,9 +195,13 @@ export function createSessionPresets(options: {
   directory: string;
   current: () => SessionTeamBundle;
   named: (name: string) => Promise<SessionTeamBundle>;
+  agents?: () => Promise<unknown>;
 }) {
   const cache = new Map<string, SessionPresetRecord>();
   const pending = new Map<string, Promise<unknown>>();
+  const changing = new Set<string>();
+  const writeEpochs = new Map<string, number>();
+  let execution: SessionPresetExecution | undefined;
   const available =
     typeof options.storage?.get === 'function' &&
     typeof options.storage?.set === 'function' &&
@@ -160,8 +244,11 @@ export function createSessionPresets(options: {
   async function read(id: string): Promise<SessionPresetRecord | undefined> {
     check();
     try {
+      const epoch = writeEpochs.get(id);
       const value = await storage().get(key(id));
       check();
+      // A slow KV read must not overwrite a newer local commit's cache.
+      if (writeEpochs.get(id) !== epoch) return read(id);
       if (value === undefined) {
         cache.delete(id);
         return undefined;
@@ -188,6 +275,7 @@ export function createSessionPresets(options: {
       recordSchema.parse(JSON.parse(JSON.stringify(value))),
     );
     check(signal);
+    writeEpochs.set(id, (writeEpochs.get(id) ?? 0) + 1);
     try {
       await storage().set(key(id), record);
     } catch (error) {
@@ -195,6 +283,8 @@ export function createSessionPresets(options: {
       // last-good cache entry instead of consulting KV on the next attempt.
       cache.delete(id);
       throw error;
+    } finally {
+      writeEpochs.set(id, (writeEpochs.get(id) ?? 0) + 1);
     }
     // KV commit is authoritative even if cancellation arrived while awaiting
     // it. Still reject the caller/prompt, but do not serve the old cache.
@@ -223,6 +313,22 @@ export function createSessionPresets(options: {
     }
     return info;
   }
+  function assertStable(id: string, record?: SessionPresetRecord) {
+    check();
+    if (changing.has(id) || record?.pending) {
+      throw new Error(
+        `Session preset pending for ${id}; retry operation ${record?.pending?.operationID ?? 'shown by read'}. No prompt was sent.`,
+      );
+    }
+  }
+  async function admit(id: string) {
+    check();
+    if (!available) return undefined;
+    assertStable(id, cache.get(id));
+    const record = await read(id);
+    assertStable(id, record);
+    return record;
+  }
   async function ensure(
     id: string,
     signal?: AbortSignal,
@@ -230,10 +336,12 @@ export function createSessionPresets(options: {
   ) {
     check(signal);
     if (!available) return undefined;
+    await admit(id);
     return serial(id, async () => {
       const info = await identity(id);
       check(signal);
       const existing = await read(id);
+      assertStable(id, existing);
       const parentID =
         typeof info.parentID === 'string' ? info.parentID : undefined;
       if (existing) {
@@ -259,7 +367,11 @@ export function createSessionPresets(options: {
       }
       // First admission of an old, unbound root is migration, not recovery
       // of historical settings. Capture now, not at its first delegation.
-      return write(id, { schemaVersion: 1, bundle: options.current() }, signal);
+      return write(
+        id,
+        { schemaVersion: 2, revision: 0, bundle: options.current() },
+        signal,
+      );
     });
   }
   async function bindChild(
@@ -279,6 +391,7 @@ export function createSessionPresets(options: {
       if (info.parentID !== parentID)
         throw new Error('Subagent parent identity mismatch');
       const existing = await read(id);
+      assertStable(id, existing);
       if (existing) {
         if (
           existing.parentID !== parentID ||
@@ -294,7 +407,8 @@ export function createSessionPresets(options: {
       return write(
         id,
         {
-          schemaVersion: 1,
+          schemaVersion: 2,
+          revision: 0,
           parentID,
           bundle,
           ...(selection?.preserveModel ? { preserveModel: true } : {}),
@@ -312,35 +426,256 @@ export function createSessionPresets(options: {
     record?: SessionPresetRecord,
   ): SessionPresetState => ({
     sessionID: id,
-    status: record ? 'bound' : 'unbound',
+    status: record?.pending
+      ? record.pending.kind === 'createBound'
+        ? 'initializing'
+        : 'transitioning'
+      : record
+        ? 'bound'
+        : 'unbound',
     presetName: record?.bundle.presetName ?? null,
-    affects: 'future-children-only',
+    affects: 'future-delegations',
+    ...(record
+      ? {
+          team: {
+            agentModels: Object.fromEntries(
+              Object.entries(record.bundle.profiles)
+                .filter(([, profile]) => profile.model)
+                .map(([agent, profile]) => [
+                  agent,
+                  `${profile.model?.providerID}/${profile.model?.id}`,
+                ]),
+            ),
+            agentVariants: Object.fromEntries(
+              Object.entries(record.bundle.profiles).flatMap(
+                ([agent, profile]) =>
+                  profile.model?.variant
+                    ? [[agent, profile.model.variant]]
+                    : [],
+              ),
+            ),
+            inheritance: { ...record.bundle.inheritance },
+          },
+          ...(record.parentID
+            ? {
+                executionPresetName: (record.execution ?? record.bundle)
+                  .presetName,
+              }
+            : {}),
+          ...(record.pending
+            ? {
+                pending: {
+                  kind: record.pending.kind,
+                  operationID: record.pending.operationID,
+                  presetName:
+                    record.pending.kind === 'transition'
+                      ? record.pending.target.bundle.presetName
+                      : record.bundle.presetName,
+                },
+              }
+            : {}),
+        }
+      : {}),
   });
+  async function complete(
+    id: string,
+    record: SessionPresetRecord,
+    signal?: AbortSignal,
+  ) {
+    const operation = record.pending;
+    if (!operation) return record;
+    check(signal);
+    if (operation.kind === 'transition') {
+      if (!execution)
+        throw new Error('Session preset execution publisher unavailable');
+      // An unresolved native flight is known locally: reject retry before
+      // awaiting another host identity lookup or occupying its serial queue.
+      execution.assertIdle(id);
+      const info = await identity(id);
+      if (info.parentID !== record.parentID || info.agent !== operation.agent)
+        throw new Error('Session preset transition identity mismatch');
+      await execution.install(id, operation.target, operation.agent);
+      check(signal);
+      return write(
+        id,
+        {
+          ...operation.target,
+          ...(record.createdBy ? { createdBy: record.createdBy } : {}),
+          completedOperationID: operation.operationID,
+        },
+        signal,
+      );
+    }
+    const { input } = operation;
+    if (input.directory !== path.resolve(options.directory))
+      throw new Error('Session preset initialization location mismatch');
+    const create = options.session.create;
+    if (!create) throw new Error('Bound session creation unavailable');
+    // Native create is idempotent by caller-supplied ID. On retry a created
+    // session is verified, not recreated or silently replaced by another ID.
+    const found = await lookup(id);
+    if (!found) {
+      await create.call(options.session, {
+        id,
+        agent: input.agent,
+        model: input.model,
+        location: { directory: options.directory },
+      });
+    }
+    check(signal);
+    const info = await identity(id);
+    if (
+      info.parentID ||
+      info.agent !== input.agent ||
+      !sameSelection(info.model, input.model)
+    )
+      throw new Error('Bound session initialization identity mismatch');
+    const { pending: _pending, ...stable } = record;
+    return write(
+      id,
+      {
+        ...stable,
+        createdBy: input,
+        completedOperationID: operation.operationID,
+      },
+      signal,
+    );
+  }
+  async function lookup(id: string): Promise<unknown> {
+    try {
+      return await options.session.get?.({ sessionID: id });
+    } catch (error) {
+      // Only a proven not-found is absence. Transport/auth failures must not
+      // authorize creation of a possibly existing session.
+      const value = error as { _tag?: string; name?: string };
+      if (
+        value?._tag === 'Session.NotFoundError' ||
+        value?.name === 'Session.NotFoundError'
+      )
+        return undefined;
+      throw error;
+    }
+  }
+  async function resumeChild(
+    id: string,
+    parentID: string,
+    admission: SessionTeamAdmission,
+    agent: string,
+    signal?: AbortSignal,
+  ) {
+    requireAvailable();
+    await admit(id);
+    return serial(id, async () => {
+      const info = await identity(id);
+      if (info.parentID !== parentID)
+        throw new Error('Subagent resume identity mismatch');
+      const previous = await read(id);
+      assertStable(id, previous);
+      // Historical children have no recoverable snapshot. Keep native behavior.
+      if (!previous || !admission.bundle) return previous;
+      if (info.agent !== agent)
+        throw new Error('Subagent resume identity mismatch');
+      if (previous.parentID !== parentID)
+        throw new Error('Subagent parent identity mismatch');
+      const changed = !isDeepStrictEqual(
+        previous.execution ?? previous.bundle,
+        admission.bundle,
+      );
+      if (!changed && !admission.explicitModel) {
+        // Parent re-delegation owns the future team even after a child Apply.
+        // Only that team changes: leave this execution's model/fallback alone.
+        if (isDeepStrictEqual(previous.bundle, admission.bundle))
+          return previous;
+        return write(id, { ...previous, bundle: admission.bundle }, signal);
+      }
+      execution?.assertIdle(id);
+      const target = stableSchema.parse({
+        schemaVersion: 2,
+        revision: (previous.revision ?? 0) + 1,
+        parentID,
+        bundle: admission.bundle,
+        preserveModel: true,
+        explicitModel: admission.explicitModel,
+        ...((admission.resolvedModel ?? admission.bundle.profiles[agent]?.model)
+          ? {
+              executionModel:
+                admission.resolvedModel ??
+                admission.bundle.profiles[agent]?.model,
+            }
+          : {}),
+        ...(admission.inheritedProviderID
+          ? { inheritedProviderID: admission.inheritedProviderID }
+          : {}),
+      });
+      const operationID = randomUUID();
+      changing.add(id);
+      try {
+        const record = await write(
+          id,
+          {
+            ...previous,
+            schemaVersion: 2,
+            pending: { kind: 'transition', operationID, agent, target },
+          },
+          signal,
+        );
+        return await complete(id, record, signal);
+      } finally {
+        changing.delete(id);
+      }
+    });
+  }
   return {
     available,
+    setExecution: (publisher: SessionPresetExecution) => {
+      execution = publisher;
+    },
+    admit,
+    async assertRequestSelection(
+      id: string,
+      actual: ModelRef,
+      revision: number,
+    ) {
+      // Compare the REAL request ref with the host's authoritative selection.
+      // A native/manual selection is valid even outside the preset; an old
+      // request ref is not relabelled with the session's newer model.
+      const info = await identity(id);
+      const record = cache.get(id);
+      assertStable(id, record);
+      if ((record?.revision ?? 0) !== revision)
+        throw new Error('Session preset request revision mismatch');
+      if (!sameSelection(info.model, actual))
+        throw new Error('Session preset request model/variant mismatch');
+    },
+    assertStable: (id: string) => assertStable(id, cache.get(id)),
+    resumeChild,
     ensure,
     bindChild,
     checkActive: check,
     peek: (id: string) => cache.get(id),
     async readState(id: string) {
       requireAvailable();
-      return serial(id, async () => {
-        const info = await identity(id);
-        const record = await read(id);
-        if (
-          record &&
-          record.parentID !==
-            (typeof info.parentID === 'string' ? info.parentID : undefined)
-        )
-          throw new Error('Session preset parent identity mismatch');
+      const record = await read(id);
+      if (record?.pending?.kind === 'createBound') {
+        if (record.pending.input.directory !== path.resolve(options.directory))
+          throw new Error('Session preset initialization location mismatch');
         return state(id, record);
-      });
+      }
+      const info = await identity(id);
+      if (
+        record &&
+        record.parentID !==
+          (typeof info.parentID === 'string' ? info.parentID : undefined)
+      )
+        throw new Error('Session preset parent identity mismatch');
+      return state(id, record);
     },
     async apply(id: string, name: string, signal?: AbortSignal) {
       requireAvailable();
       return serial(id, async () => {
         const info = await identity(id);
         const previous = await read(id);
+        assertStable(id, previous);
         const parentID =
           typeof info.parentID === 'string' ? info.parentID : undefined;
         if (previous && previous.parentID !== parentID)
@@ -351,14 +686,8 @@ export function createSessionPresets(options: {
         const record = await write(
           id,
           {
-            schemaVersion: 1,
-            ...(previous?.preserveModel ? { preserveModel: true } : {}),
-            ...(previous?.explicitModel !== undefined
-              ? { explicitModel: previous.explicitModel }
-              : {}),
-            ...(previous?.inheritedProviderID
-              ? { inheritedProviderID: previous.inheritedProviderID }
-              : {}),
+            ...previous,
+            schemaVersion: 2,
             ...(parentID && previous
               ? { parentID, execution: previous.execution ?? previous.bundle }
               : {}),
@@ -369,13 +698,126 @@ export function createSessionPresets(options: {
         return state(id, record);
       });
     },
+    async createBound(
+      input: Omit<z.infer<typeof createInputSchema>, 'directory'> & {
+        sessionID: string;
+      },
+      signal?: AbortSignal,
+    ) {
+      requireAvailable();
+      if (!options.session.create)
+        throw new Error('Bound session creation unavailable');
+      const { sessionID: id, ...intent } = input;
+      const frozenInput = createInputSchema.parse({
+        ...intent,
+        directory: path.resolve(options.directory),
+      });
+      return serial(id, async () => {
+        const previous = await read(id);
+        if (previous) {
+          const original =
+            previous.pending?.kind === 'createBound'
+              ? previous.pending.input
+              : previous.createdBy;
+          if (!original || !isDeepStrictEqual(original, frozenInput))
+            throw new Error(
+              'Bound session creation conflicts with existing operation',
+            );
+          if (!previous.pending) return state(id, previous);
+          if (previous.pending.kind !== 'createBound')
+            return state(id, previous);
+          changing.add(id);
+          try {
+            return state(id, await complete(id, previous, signal));
+          } finally {
+            changing.delete(id);
+          }
+        }
+        if (await lookup(id))
+          throw new Error(
+            'Bound session creation requires an unused session ID',
+          );
+        const response = await options.agents?.();
+        const agents =
+          response && typeof response === 'object' && 'data' in response
+            ? response.data
+            : response;
+        if (
+          !Array.isArray(agents) ||
+          !agents.some((entry) => {
+            const agent = entry as {
+              id?: string;
+              mode?: string;
+              hidden?: boolean;
+            };
+            return (
+              agent.id === intent.agent &&
+              !agent.hidden &&
+              (agent.mode === 'primary' || agent.mode === 'all')
+            );
+          })
+        )
+          throw new Error(
+            'Bound session creation requires a visible primary/all agent',
+          );
+        const bundle = await options.named(intent.presetName);
+        changing.add(id);
+        try {
+          const record = await write(
+            id,
+            {
+              schemaVersion: 2,
+              revision: 0,
+              bundle,
+              pending: {
+                kind: 'createBound',
+                operationID: intent.operationID,
+                input: frozenInput,
+              },
+            },
+            signal,
+          );
+          return state(id, await complete(id, record, signal));
+        } finally {
+          changing.delete(id);
+        }
+      });
+    },
+    async retry(id: string, operationID: string, signal?: AbortSignal) {
+      requireAvailable();
+      return serial(id, async () => {
+        const record = await read(id);
+        if (!record) throw new Error('Session preset operation not found');
+        if (record.pending?.operationID !== operationID) {
+          if (
+            record.completedOperationID === operationID ||
+            record.createdBy?.operationID === operationID
+          )
+            return state(id, record);
+          throw new Error('Session preset operation mismatch');
+        }
+        changing.add(id);
+        try {
+          return state(id, await complete(id, record, signal));
+        } finally {
+          changing.delete(id);
+        }
+      });
+    },
     async remove(id: string) {
       check();
       if (!available) return;
       await serial(id, async () => {
         check();
-        await storage().remove(key(id));
-        cache.delete(id);
+        writeEpochs.set(id, (writeEpochs.get(id) ?? 0) + 1);
+        try {
+          await storage().remove(key(id));
+        } finally {
+          // Removal may commit before reporting failure. A read from either
+          // side of this operation must re-read KV, never resurrect its cache.
+          writeEpochs.set(id, (writeEpochs.get(id) ?? 0) + 1);
+          cache.delete(id);
+        }
       });
     },
     async dispose() {
@@ -408,44 +850,64 @@ export function wrapSessionPresetSubagent(options: {
     const { bundle } = admission;
     options.presets.checkActive(context.signal);
     const args = input as Record<string, unknown>;
+    if (admission.explicitModel)
+      admission.resolvedModel = delegationSelection(args.model);
     const existingID =
       typeof args.sessionID === 'string' ? args.sessionID : undefined;
+    let configuredOperation: string | undefined;
     // Resume identity/snapshot must be restored BEFORE native model selection.
-    if (existingID)
-      await options.presets.ensure(
-        existingID,
-        context.signal,
-        admission.explicitModel,
-      );
+    if (existingID) {
+      if (options.presets.available) {
+        const record = await options.presets.resumeChild(
+          existingID,
+          context.sessionID,
+          admission,
+          String(args.agent),
+          context.signal,
+        );
+        configuredOperation = record?.completedOperationID;
+      } else await options.presets.ensure(existingID, context.signal);
+    }
     options.presets.checkActive(context.signal);
-    return options.execute(input, {
-      ...context,
-      progress: async (update: Record<string, unknown>) => {
-        options.presets.checkActive(context.signal);
-        if (typeof update.sessionID === 'string') {
-          if (existingID) {
-            if (update.sessionID !== existingID)
-              throw new Error('Subagent resume identity changed');
-            await options.presets.ensure(existingID, context.signal);
-          } else if (bundle) {
-            await options.presets.bindChild(
-              update.sessionID,
-              context.sessionID,
-              bundle,
-              context.signal,
-              {
-                preserveModel: typeof args.model === 'string',
-                explicitModel: admission.explicitModel,
-                ...(admission.inheritedProviderID
-                  ? { inheritedProviderID: admission.inheritedProviderID }
-                  : {}),
-              },
-            );
+    // The transition already installed the new selection. Native execute may
+    // still reject the continuation; never replay its prompt from retry().
+    try {
+      return await options.execute(input, {
+        ...context,
+        progress: async (update: Record<string, unknown>) => {
+          options.presets.checkActive(context.signal);
+          if (typeof update.sessionID === 'string') {
+            if (existingID) {
+              if (update.sessionID !== existingID)
+                throw new Error('Subagent resume identity changed');
+              await options.presets.ensure(existingID, context.signal);
+            } else if (bundle) {
+              await options.presets.bindChild(
+                update.sessionID,
+                context.sessionID,
+                bundle,
+                context.signal,
+                {
+                  preserveModel: typeof args.model === 'string',
+                  explicitModel: admission.explicitModel,
+                  ...(admission.inheritedProviderID
+                    ? { inheritedProviderID: admission.inheritedProviderID }
+                    : {}),
+                },
+              );
+            }
           }
-        }
-        options.presets.checkActive(context.signal);
-        await context.progress(update);
-      },
-    });
+          options.presets.checkActive(context.signal);
+          await context.progress(update);
+        },
+      });
+    } catch (error) {
+      if (configuredOperation)
+        throw new Error(
+          `Session preset configuration committed (${configuredOperation}); native continuation failed: ${String(error)}. Configuration retry does not resend the prompt.`,
+          { cause: error },
+        );
+      throw error;
+    }
   };
 }
