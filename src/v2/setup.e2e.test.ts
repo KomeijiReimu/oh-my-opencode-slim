@@ -34,6 +34,7 @@ import { createEventDirectoryScope } from '../utils/event-directory-scope';
 import { flushLoggerForTesting } from '../utils/logger';
 import { compilePermissionPolicy } from './permissions';
 import { createV2Setup } from './setup';
+import * as subagentWrapper from './subagent-executor-wrapper';
 import type { V2Context, V2PermissionRule } from './types';
 
 type CapturedTool = {
@@ -606,6 +607,10 @@ describe('createV2Setup e2e', () => {
         }),
       );
     const stored = new Map<string, any>();
+    const availableModels = [
+      { providerID: 'manual', id: 'resumed', variants: [{ id: 'low' }] },
+    ];
+    (ctx as any).model = { list: async () => availableModels };
     const identities = new Map<string, any>([
       [
         'root',
@@ -660,7 +665,7 @@ describe('createV2Setup e2e', () => {
     }: {
       sessionID: string;
     }) =>
-      sessionID === 'ses_child-1'
+      sessionID === 'ses_child-1' || sessionID === 'ses_host-created'
         ? [
             {
               id: 'msg_delivered_user',
@@ -701,6 +706,21 @@ describe('createV2Setup e2e', () => {
       identities.get(input.sessionID).model = input.model;
     };
     let nativeCalls = 0;
+    let nativeFailure: Error | undefined;
+    let nativeResult: unknown;
+    const launches: subagentWrapper.SubagentStructuredLaunch[] = [];
+    const createWrapper = subagentWrapper.createSubagentExecutorWrapper;
+    const wrapperSpy = spyOn(
+      subagentWrapper,
+      'createSubagentExecutorWrapper',
+    ).mockImplementation((options) =>
+      createWrapper({
+        register: (launch) => {
+          launches.push(launch);
+          return options.register(launch);
+        },
+      }),
+    );
     const nativeInputs: Array<Record<string, unknown>> = [];
     const native = {
       description: 'native',
@@ -736,7 +756,18 @@ describe('createV2Setup e2e', () => {
           prompt: { text: 'work' },
         });
         order.push(`prompt:${id}`);
-        return { content: 'native-result', metadata: { sessionID: id } };
+        if (nativeFailure) throw nativeFailure;
+        const result = {
+          content: 'native-result',
+          metadata: { sessionID: id },
+          // Exercise the real structured lane once; later legacy-shaped
+          // results keep the existing compatibility coverage unchanged.
+          ...(nativeCalls === 1
+            ? { output: { sessionID: id, status: 'completed' } }
+            : {}),
+        };
+        nativeResult = result;
+        return result;
       },
     };
     let replay: (() => void) | undefined;
@@ -802,7 +833,7 @@ describe('createV2Setup e2e', () => {
       const execute = native.execute;
       replay?.();
       expect(native.execute).toBe(execute); // replay never nests wrappers
-      await native.execute(event.input, {
+      const firstResult = await native.execute(event.input, {
         sessionID: 'root',
         id: 'call-1',
         signal: new AbortController().signal,
@@ -811,6 +842,17 @@ describe('createV2Setup e2e', () => {
         },
       });
       expect(nativeCalls).toBe(1);
+      expect(firstResult).toBe(nativeResult);
+      expect(launches).toEqual([
+        {
+          callID: 'call-1',
+          parentSessionID: 'root',
+          childTaskID: 'ses_child-1',
+          state: 'completed',
+          background: false,
+          result: 'native-result',
+        },
+      ]);
       // No execute.after was delivered. The wrapper itself consumed the
       // handoff, so replaying the same call cannot create another child.
       await expect(
@@ -822,6 +864,7 @@ describe('createV2Setup e2e', () => {
         }),
       ).rejects.toThrow('admission capture missing');
       expect(nativeCalls).toBe(1);
+      expect(launches).toHaveLength(1);
       expect(order.slice(-4)).toEqual([
         'create:ses_child-1',
         'persist:ses_child-1',
@@ -958,13 +1001,29 @@ describe('createV2Setup e2e', () => {
           },
         };
         await calls.toolBeforeCb?.(call);
-        const result = await native.execute(call.input, {
-          sessionID: parentID,
-          id: callID,
-          signal: new AbortController().signal,
-          progress: async () => {},
-        });
-        return result.metadata.sessionID as string;
+        let result: Awaited<ReturnType<typeof native.execute>> | undefined;
+        let error: unknown;
+        try {
+          result = await native.execute(call.input, {
+            sessionID: parentID,
+            id: callID,
+            signal: new AbortController().signal,
+            progress: async () => {},
+          });
+          return result.metadata.sessionID as string;
+        } catch (failure) {
+          error = failure;
+          throw failure;
+        } finally {
+          // Real hosts always close the call, including preflight failures;
+          // release the existing lifecycle lease before another continuation.
+          await calls.toolAfterCb?.({
+            ...call,
+            status: error ? 'error' : 'completed',
+            result,
+            error,
+          });
+        }
       };
       // Automatic before injection is not a user override: preset fallback
       // still runs, but a cross-vendor retry must not reuse preset options.
@@ -1032,6 +1091,24 @@ describe('createV2Setup e2e', () => {
         model: { providerID: 'backup', id: 'b' },
       });
       // A cached, already-profiled child gets the same protection on resume.
+      for (const model of ['missing/model', 'manual/resumed#unavailable']) {
+        const before = structuredClone([...stored]);
+        const selected = structuredClone(identities.get('ses_child-1').model);
+        const switchCount = switches.length;
+        const callCount = nativeCalls;
+        const launchCount = launches.length;
+        await expect(
+          launch(`invalid-${model}`, 'root', {
+            sessionID: 'ses_child-1',
+            model,
+          }),
+        ).rejects.toThrow('not available');
+        expect([...stored]).toEqual(before);
+        expect(identities.get('ses_child-1').model).toEqual(selected);
+        expect(switches).toHaveLength(switchCount);
+        expect(nativeCalls).toBe(callCount);
+        expect(launches).toHaveLength(launchCount);
+      }
       await launch('explicit-resume-call', 'root', {
         sessionID: 'ses_child-1',
         model: 'manual/resumed#low',
@@ -1211,6 +1288,7 @@ describe('createV2Setup e2e', () => {
       const abort = new AbortController();
       abort.abort();
       const callsBeforeCancel = nativeCalls;
+      const launchesBeforeCancel = launches.length;
       await expect(
         native.execute(cancelled.input, {
           sessionID: 'root',
@@ -1228,28 +1306,50 @@ describe('createV2Setup e2e', () => {
         }),
       ).rejects.toThrow('admission capture missing');
       expect(nativeCalls).toBe(callsBeforeCancel);
+      expect(launches).toHaveLength(launchesBeforeCancel);
       // Historical/host-command children stay honestly unmanaged. Their
       // native workflow and descendants work, but acquire no guessed team.
-      identities.set('host-created', {
-        id: 'host-created',
+      identities.set('ses_host-created', {
+        id: 'ses_host-created',
         parentID: 'root',
         directory: projectDir,
         agent: 'explorer',
         model: { providerID: 'native', id: 'historical' },
       });
       await calls.promptHookCb?.({
-        sessionID: 'host-created',
+        sessionID: 'ses_host-created',
         messageID: 'host-created-first',
         prompt: { text: 'legacy work' },
       });
-      const compatChild = await launch('compat-child-call', 'host-created', {});
-      for (const sessionID of ['host-created', compatChild]) {
+      const modelDomain = (ctx as any).model;
+      delete (ctx as any).model;
+      const legacyNativeCalls = nativeCalls;
+      const legacySwitches = switches.length;
+      try {
+        expect(
+          await launch('legacy-explicit-resume', 'root', {
+            sessionID: 'ses_host-created',
+            model: 'manual/resumed#low',
+          }),
+        ).toBe('ses_host-created');
+        expect(nativeCalls).toBe(legacyNativeCalls + 1);
+        expect(switches).toHaveLength(legacySwitches);
+        expect(stored.has('session-preset/v1/ses_host-created')).toBe(false);
+      } finally {
+        (ctx as any).model = modelDomain;
+      }
+      const compatChild = await launch(
+        'compat-child-call',
+        'ses_host-created',
+        {},
+      );
+      for (const sessionID of ['ses_host-created', compatChild]) {
         expect(stored.has(`session-preset/v1/${sessionID}`)).toBe(false);
         expect((await rpc.read({ sessionID })).status).toBe('unbound');
       }
       await expect(
         rpc.apply(
-          { sessionID: 'host-created', presetName: 'B' },
+          { sessionID: 'ses_host-created', presetName: 'B' },
           { signal: new AbortController().signal },
         ),
       ).rejects.toThrow('unbound child');
@@ -1396,7 +1496,51 @@ describe('createV2Setup e2e', () => {
         ),
       ).rejects.toThrow('config load failed');
       await Bun.write(configPath, config);
+      // The inner structured wrapper must see the host's ORIGINAL error,
+      // before the outer preset wrapper adds its committed-operation warning.
+      nativeFailure = new Error('Subagent failed (sessionID: ses_child-1)');
+      const launchesBeforeFailure = launches.length;
+      const nativeBeforeFailure = nativeCalls;
+      const failure = await launch('native-failure', 'root', {
+        sessionID: 'ses_child-1',
+        model: 'manual/resumed#low',
+      }).catch((error: Error) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).cause).toBe(nativeFailure);
+      expect(String(failure)).toContain('configuration committed');
+      expect(nativeCalls).toBe(nativeBeforeFailure + 1);
+      expect(launches).toHaveLength(launchesBeforeFailure + 1);
+      expect(launches.at(-1)).toMatchObject({
+        callID: 'native-failure',
+        childTaskID: 'ses_child-1',
+        state: 'error',
+        result: nativeFailure.message,
+      });
+      nativeFailure = undefined;
+      const retiredCall = {
+        tool: 'subagent',
+        sessionID: 'root',
+        id: 'retired-call',
+        input: {
+          agent: 'explorer',
+          prompt: 'never execute',
+          background: false,
+        },
+      };
+      await calls.toolBeforeCb?.(retiredCall);
       await cleanup();
+      const retiredNativeCount = nativeCalls;
+      const retiredLaunchCount = launches.length;
+      await expect(
+        native.execute(retiredCall.input, {
+          sessionID: 'root',
+          id: 'retired-call',
+          signal: new AbortController().signal,
+          progress: async () => {},
+        }),
+      ).rejects.toThrow();
+      expect(nativeCalls).toBe(retiredNativeCount);
+      expect(launches).toHaveLength(retiredLaunchCount);
       native.execute = nativeExecute;
       cleanup = await createV2Setup()(ctx);
       await calls.promptHookCb?.({
@@ -1413,6 +1557,7 @@ describe('createV2Setup e2e', () => {
         'B',
       );
     } finally {
+      wrapperSpy.mockRestore();
       await cleanup();
     }
   }, 20_000);

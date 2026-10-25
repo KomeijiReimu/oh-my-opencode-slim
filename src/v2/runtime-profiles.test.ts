@@ -7,6 +7,7 @@ import {
   resolveV2EventPayload,
 } from './runtime-profiles';
 import {
+  assertAvailableDelegationSelection,
   createSessionPresets,
   type SessionTeamBundle,
   wrapSessionPresetSubagent,
@@ -730,6 +731,66 @@ describe('durable session team presets', () => {
     }
   });
 
+  test.each(['missing', 'rejecting'])(
+    'legacy explicit resume bypasses %s model availability preflight without binding',
+    async (availability) => {
+      const f = fixture();
+      const presets = f.create();
+      const bundle = (await presets.ensure('root')).bundle;
+      f.parents.set('legacy-child', 'root');
+      const before = structuredClone([...f.values]);
+      let validations = 0;
+      let nativeCalls = 0;
+      let progressCalls = 0;
+      const input = {
+        sessionID: 'legacy-child',
+        agent: 'explorer',
+        model: 'manual/chosen#low',
+      };
+      const result = { content: 'native legacy result' };
+      const execute = wrapSessionPresetSubagent({
+        presets,
+        capture: async () => ({ bundle, explicitModel: true }),
+        ...(availability === 'rejecting'
+          ? {
+              validateSelection: async () => {
+                validations++;
+                throw new Error('legacy must not require model.list');
+              },
+            }
+          : {}),
+        execute: async (args, raw) => {
+          nativeCalls++;
+          expect(args).toBe(input);
+          await (
+            raw as { progress: (update: unknown) => Promise<void> }
+          ).progress({ sessionID: 'legacy-child', status: 'running' });
+          return result;
+        },
+      });
+      try {
+        expect(
+          await execute(input, {
+            sessionID: 'root',
+            id: 'legacy-explicit',
+            signal: new AbortController().signal,
+            progress: async () => {
+              progressCalls++;
+            },
+          }),
+        ).toBe(result);
+        expect(validations).toBe(0);
+        expect(nativeCalls).toBe(1);
+        expect(progressCalls).toBe(1);
+        expect([...f.values]).toEqual(before);
+        expect(await presets.ensure('legacy-child')).toBeUndefined();
+        expect(f.installs).toHaveLength(0);
+      } finally {
+        await presets.dispose();
+      }
+    },
+  );
+
   test('native execute is called once; persist → original progress → prompt; resume updates the captured team and explicit selection', async () => {
     const f = fixture();
     const presets = f.create();
@@ -789,6 +850,10 @@ describe('durable session team presets', () => {
     };
     const resumed = wrapSessionPresetSubagent({
       presets,
+      validateSelection: async (selection) =>
+        assertAvailableDelegationSelection(selection, [
+          { providerID: 'manual', id: 'changed', variants: [{ id: 'low' }] },
+        ]),
       capture: async () => ({ bundle: f.bundle('B'), explicitModel: true }),
       execute: async (args, raw) => {
         expect(args).toBe(resumedInput);
@@ -897,6 +962,125 @@ describe('durable session team presets', () => {
     applyRuntimeProfileOptions(legacyEvent, profile);
     expect(legacyEvent.options).toEqual({ temperature: 0.8, reasoning: 'B' });
     await presets.dispose();
+  });
+
+  test.each(['reject', 'cancel', 'retire'])(
+    'explicit resume preflight %s cannot publish a pending revision or execute',
+    async (failure) => {
+      const f = fixture();
+      const presets = f.create();
+      f.parents.set('child', 'root');
+      await presets.bindChild('child', 'root', f.bundle('A'));
+      const before = structuredClone([...f.values]);
+      const writes = f.order.length;
+      const entered = Promise.withResolvers<void>();
+      const validation = Promise.withResolvers<void>();
+      const abort = new AbortController();
+      let retirement: Promise<void> | undefined;
+      let drained = false;
+      let nativeCalls = 0;
+      const execute = wrapSessionPresetSubagent({
+        presets,
+        capture: async () => ({ bundle: f.bundle('B'), explicitModel: true }),
+        validateSelection: async () => {
+          entered.resolve();
+          await validation.promise;
+        },
+        execute: async () => {
+          nativeCalls++;
+        },
+      });
+      const outcome = execute(
+        { sessionID: 'child', agent: 'explorer', model: 'manual/chosen#low' },
+        {
+          sessionID: 'root',
+          id: 'call',
+          signal: abort.signal,
+          progress: async () => {},
+        },
+      ).catch((error: Error) => error);
+      await entered.promise;
+      expect([...f.values]).toEqual(before);
+      if (failure === 'reject')
+        validation.reject(new Error('model list failed'));
+      else {
+        if (failure === 'cancel')
+          abort.abort(new Error('cancelled validation'));
+        else {
+          retirement = presets.dispose().then(() => {
+            drained = true;
+          });
+          // The serial transaction now owns the in-flight preflight too.
+          expect(drained).toBe(false);
+        }
+        validation.resolve();
+      }
+      expect(String(await outcome)).toContain(
+        failure === 'reject'
+          ? 'model list failed'
+          : failure === 'cancel'
+            ? 'cancelled validation'
+            : 'retired',
+      );
+      expect([...f.values]).toEqual(before);
+      expect(f.order).toHaveLength(writes);
+      expect(f.installs).toHaveLength(0);
+      expect(nativeCalls).toBe(0);
+      if (retirement) {
+        await retirement;
+        expect(drained).toBe(true);
+      }
+      await presets.dispose();
+    },
+  );
+
+  test('explicit model availability accepts only exact host model and variant entries', () => {
+    const models = [
+      { providerID: 'manual', id: 'chosen', variants: [{ id: 'low' }] },
+      {
+        providerID: 'router',
+        id: 'vendor/model:v1',
+        variants: [{ id: 'reasoning/high' }],
+      },
+    ];
+    for (const response of [models, { data: models }]) {
+      expect(() =>
+        assertAvailableDelegationSelection('manual/chosen', response),
+      ).not.toThrow();
+      expect(() =>
+        assertAvailableDelegationSelection('manual/chosen#low', response),
+      ).not.toThrow();
+      // Fixed host Model.Ref.parse splits on the first slash, then first #;
+      // it does not reject additional slashes or colons inside IDs.
+      for (const value of [
+        'router/vendor/model:v1',
+        'router/vendor/model:v1#reasoning/high',
+      ]) {
+        expect(() =>
+          assertAvailableDelegationSelection(value, response),
+        ).not.toThrow();
+      }
+      for (const value of ['missing/chosen', 'manual/chosen#high']) {
+        expect(() =>
+          assertAvailableDelegationSelection(value, response),
+        ).toThrow('not available');
+      }
+      for (const value of [
+        'invalid',
+        'manual/chosen#',
+        'manual/chosen#low#x',
+        'manual#invalid/chosen',
+      ]) {
+        expect(() =>
+          assertAvailableDelegationSelection(value, response),
+        ).toThrow('Invalid explicit');
+      }
+    }
+    for (const response of [undefined, {}, { data: {} }]) {
+      expect(() =>
+        assertAvailableDelegationSelection('manual/chosen', response),
+      ).toThrow('cannot be verified');
+    }
   });
 
   test('storage failure, cancellation and retired generation cannot pass the native progress prompt barrier', async () => {

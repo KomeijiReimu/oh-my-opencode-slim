@@ -99,6 +99,7 @@ import {
   type V2AgentRuntimeProfiles,
 } from './runtime-profiles';
 import {
+  assertAvailableDelegationSelection,
   createSessionPresets,
   delegationSelection,
   type SessionTeamAdmission,
@@ -3435,6 +3436,16 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                         execute,
                         presets: sessionPresets,
                         capture: captureTeam,
+                        validateSelection: async (selection) => {
+                          // Runtime-probe the public domain on older hosts.
+                          const host = ctx as V2Context & {
+                            model?: { list?: () => Promise<unknown> };
+                          };
+                          assertAvailableDelegationSelection(
+                            selection,
+                            await host.model?.list?.(),
+                          );
+                        },
                       });
                       wrapped.add(execute);
                       tool.execute = execute;

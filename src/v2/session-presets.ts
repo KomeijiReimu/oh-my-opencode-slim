@@ -160,6 +160,51 @@ export function delegationSelection(value: unknown): ModelRef | undefined {
   };
 }
 
+/** Public model.list and native subagent validation both read models.available.
+ * This preflight protects persisted transitions, not the later native check:
+ * availability can still change before native execution. */
+export function assertAvailableDelegationSelection(
+  value: string,
+  response: unknown,
+): void {
+  const selected = delegationSelection(value);
+  if (
+    !selected ||
+    `${selected.providerID}/${selected.id}${selected.variant ? `#${selected.variant}` : ''}` !==
+      value
+  )
+    throw new Error('Invalid explicit subagent model selection');
+  const models =
+    response && typeof response === 'object' && 'data' in response
+      ? response.data
+      : response;
+  if (!Array.isArray(models))
+    throw new Error('Explicit subagent model availability cannot be verified');
+  const available = models.find(
+    (entry) =>
+      entry &&
+      typeof entry === 'object' &&
+      entry.providerID === selected.providerID &&
+      entry.id === selected.id,
+  );
+  if (!available)
+    throw new Error(`Explicit subagent model '${value}' is not available`);
+  if (
+    selected.variant &&
+    (!Array.isArray(available.variants) ||
+      !available.variants.some(
+        (variant: unknown) =>
+          variant &&
+          typeof variant === 'object' &&
+          'id' in variant &&
+          variant.id === selected.variant,
+      ))
+  )
+    throw new Error(
+      `Explicit subagent variant '${selected.variant}' is not available for '${selected.providerID}/${selected.id}'`,
+    );
+}
+
 function assertJSON(value: unknown): void {
   if (value === null || typeof value === 'string' || typeof value === 'boolean')
     return;
@@ -562,6 +607,7 @@ export function createSessionPresets(options: {
     admission: SessionTeamAdmission,
     agent: string,
     signal?: AbortSignal,
+    preflight?: () => Promise<void>,
   ) {
     requireAvailable();
     await admit(id);
@@ -589,6 +635,18 @@ export function createSessionPresets(options: {
         return write(id, { ...previous, bundle: admission.bundle }, signal);
       }
       execution?.assertIdle(id);
+      // Only managed execution revisions need a preflight. Keep it inside
+      // this serial transaction, after identity/legacy checks and before any
+      // pending write or install; legacy continuations remain native-owned.
+      if (admission.explicitModel) {
+        check(signal);
+        if (!preflight)
+          throw new Error(
+            'Explicit subagent model availability cannot be verified',
+          );
+        await preflight();
+        check(signal);
+      }
       const target = stableSchema.parse({
         schemaVersion: 2,
         revision: (previous.revision ?? 0) + 1,
@@ -836,6 +894,7 @@ export function wrapSessionPresetSubagent(options: {
   execute: (input: unknown, context: unknown) => Promise<unknown>;
   presets: SessionPresets;
   capture: (callID: string, parentID: string) => Promise<SessionTeamAdmission>;
+  validateSelection?: (selection: string) => Promise<void>;
 }) {
   return async (input: unknown, rawContext: unknown): Promise<unknown> => {
     const context = rawContext as {
@@ -850,20 +909,25 @@ export function wrapSessionPresetSubagent(options: {
     const { bundle } = admission;
     options.presets.checkActive(context.signal);
     const args = input as Record<string, unknown>;
+    const selection = args.model;
     if (admission.explicitModel)
-      admission.resolvedModel = delegationSelection(args.model);
+      admission.resolvedModel = delegationSelection(selection);
     const existingID =
       typeof args.sessionID === 'string' ? args.sessionID : undefined;
     let configuredOperation: string | undefined;
     // Resume identity/snapshot must be restored BEFORE native model selection.
     if (existingID) {
       if (options.presets.available) {
+        const validateSelection = options.validateSelection;
         const record = await options.presets.resumeChild(
           existingID,
           context.sessionID,
           admission,
           String(args.agent),
           context.signal,
+          validateSelection
+            ? () => validateSelection(String(selection))
+            : undefined,
         );
         configuredOperation = record?.completedOperationID;
       } else await options.presets.ensure(existingID, context.signal);
