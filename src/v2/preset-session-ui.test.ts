@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
+import { recordTuiAgentDisplayNames } from '../tui-state';
 import {
   openPresetManagerV2,
   type V2PresetManagerContext,
@@ -84,6 +85,62 @@ function harness(script: Array<string | { user: string }>) {
 }
 
 describe('saved session team view', () => {
+  test('folds only registry-backed identities', async () => {
+    recordTuiAgentDisplayNames(
+      {
+        oracle: 'Research Lead',
+        explore: 'explorer',
+        librarian: 'explorer',
+        custom_a: 'Same label',
+        custom_b: 'Same label',
+      },
+      env.projectDir,
+    );
+    const saved: SessionPresetState = {
+      ...bound('ses_root'),
+      team: {
+        agentModels: {
+          'Research Lead': 'saved/model',
+          oracle: 'saved/model',
+          librarian: 'legacy/model',
+          explore: 'legacy/model',
+          explorer: 'saved/model',
+          custom_a: 'saved/model',
+          custom_b: 'saved/model',
+        },
+        agentVariants: { oracle: 'high' },
+        inheritance: {
+          'frontend-ui-ux-engineer': 'session',
+          designer: 'session',
+          fixer: 'orchestrator',
+        },
+      },
+    };
+    const before = structuredClone(saved);
+    const h = harness(['__omo_view_session_team__', '__omo_back__']);
+    h.state.sessionID = 'ses_root';
+    h.ctx.client = { rpc: () => ({ read: async () => saved }) };
+    await openPresetManagerV2(h.ctx, env.projectDir);
+    expect(h.selects[1].options).toEqual([
+      { title: 'custom_a', value: 'custom_a', description: 'saved/model' },
+      { title: 'custom_b', value: 'custom_b', description: 'saved/model' },
+      {
+        title: 'designer',
+        value: 'designer',
+        description: 'Inherits session model',
+      },
+      { title: 'explorer', value: 'explorer', description: 'saved/model' },
+      {
+        title: 'fixer',
+        value: 'fixer',
+        description: 'Inherits orchestrator model',
+      },
+      { title: 'oracle', value: 'oracle', description: 'saved/model #high' },
+      expect.objectContaining({ value: '__omo_back__' }),
+    ]);
+    expect(saved).toEqual(before);
+  });
+
   test('legacy preset names cannot collide with session-view actions', async () => {
     const name = '__omo_view_session_team__';
     env.writeUserConfig({ presets: { [name]: { oracle: { model: 'p/m' } } } });

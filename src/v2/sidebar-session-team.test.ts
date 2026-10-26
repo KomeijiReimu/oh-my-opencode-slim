@@ -31,6 +31,37 @@ function state(model = 'saved/team-model'): SessionPresetState {
 }
 
 describe('window-local sidebar team', () => {
+  test('visible-only saved values and activity resolve through registry identity', () => {
+    const snapshot = readTuiSnapshot(env.projectDir);
+    snapshot.agentModels = { oracle: 'latest/model' };
+    snapshot.agentDisplayNames = { oracle: 'Research Lead' };
+    snapshot.activeSessions = { ses_task: 'Research Lead' };
+    snapshot.reusableByAgent = {
+      ses_root: {
+        'Research Lead': [
+          { taskID: 'ses_task', alias: 'lead-1', running: true },
+        ],
+      },
+    };
+    const saved: SessionPresetState = {
+      ...state(),
+      team: {
+        agentModels: { 'Research Lead': 'saved/model' },
+        agentVariants: { 'Research Lead': 'medium' },
+        inheritance: {},
+      },
+    };
+    const before = structuredClone({ snapshot, saved });
+    const projected = projectSidebarTeam(snapshot, saved);
+    expect(projected.agentModels).toEqual({ oracle: 'saved/model' });
+    expect(projected.agentVariants).toEqual({ oracle: 'medium' });
+    expect(projected.activeSessions).toEqual({ ses_task: 'oracle' });
+    expect(projected.reusableByAgent.ses_root).toEqual({
+      oracle: [{ taskID: 'ses_task', alias: 'lead-1', running: true }],
+    });
+    expect({ snapshot, saved }).toEqual(before);
+  });
+
   test('saved team replaces directory defaults without mutating the shared snapshot', () => {
     const snapshot = readTuiSnapshot(env.projectDir);
     snapshot.agentModels = {
@@ -85,6 +116,7 @@ describe('window-local sidebar team', () => {
       explorer: 'latest/explorer',
     };
     snapshot.agentDisplayNames = {
+      oracle: 'Research Lead',
       explore: 'explorer',
       librarian: 'explorer',
       custom_a: 'custom reviewer',
@@ -101,6 +133,7 @@ describe('window-local sidebar team', () => {
           librarian: 'legacy/librarian',
           explorer: 'capture/b',
           oracle: 'saved/team-model',
+          'Research Lead': 'saved/team-model',
           custom_a: 'saved/custom-model',
           custom_b: 'saved/custom-model',
         },
@@ -178,6 +211,7 @@ describe('window-local sidebar team', () => {
           frame.indexOf('Team · next delegation'),
         );
         expect(frame).toContain('team-model');
+        expect(frame.match(/Research Lead/g)).toHaveLength(1);
         expect(frame).toContain('Task: actual/task-model');
         expect(frame.match(/\bexplorer\b/g)).toHaveLength(1);
         expect(frame.match(/custom reviewer/g)).toHaveLength(2);

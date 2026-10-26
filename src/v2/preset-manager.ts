@@ -69,8 +69,10 @@ import {
   wouldCreatePresetCycle,
   writePreset,
 } from '../tools/preset-switch';
+import { readTuiSnapshot } from '../tui-state';
 import { log } from '../utils/logger';
 import { type SessionPresetState, sessionPresetRpc } from './preset-rpc';
+import { createTeamDisplayIdentity } from './team-display';
 
 // --- v2 host mirror types (subset consumed here, capability-guarded) ---
 
@@ -594,27 +596,30 @@ export function sessionPresetLabel(state: SessionPresetState): string {
 
 export function sessionTeamRows(
   state: SessionPresetState,
+  identities: Readonly<Record<string, string>> = {},
 ): V2PresetDialogOption<string>[] {
   const team = state.team;
   if (!team) return [];
-  return [
-    ...new Set([
-      ...Object.keys(team.agentModels),
-      ...Object.keys(team.inheritance),
-    ]),
-  ]
+  const { projectValues } = createTeamDisplayIdentity(identities);
+  const models = projectValues(team.agentModels);
+  const inheritance = projectValues(team.inheritance);
+  const variants = projectValues(team.agentVariants);
+  return [...new Set([...Object.keys(models), ...Object.keys(inheritance)])]
     .sort()
     .map((agent) => ({
       title: agent,
       value: agent,
-      description: team.inheritance[agent]
-        ? `Inherits ${team.inheritance[agent]} model`
-        : `${team.agentModels[agent] ?? 'Unknown'}${team.agentVariants[agent] ? ` #${team.agentVariants[agent]}` : ''}`,
+      description: inheritance[agent]
+        ? `Inherits ${inheritance[agent]} model`
+        : `${models[agent] ?? 'Unknown'}${variants[agent] ? ` #${variants[agent]}` : ''}`,
     }));
 }
 
 async function showSessionTeam(run: ManagerRun, state: SessionPresetState) {
-  const rows = sessionTeamRows(state);
+  const rows = sessionTeamRows(
+    state,
+    readTuiSnapshot(run.directory).agentDisplayNames,
+  );
   await run.dialog.select({
     title: `Saved team: ${state.presetName ?? '(unnamed)'}`,
     placeholder: [
