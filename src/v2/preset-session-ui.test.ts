@@ -85,7 +85,7 @@ function harness(script: Array<string | { user: string }>) {
 }
 
 describe('saved session team view', () => {
-  test('folds only registry-backed identities', async () => {
+  test('folds only registry-backed identities and preserves inherited variants', async () => {
     recordTuiAgentDisplayNames(
       {
         oracle: 'Research Lead',
@@ -108,7 +108,7 @@ describe('saved session team view', () => {
           custom_a: 'saved/model',
           custom_b: 'saved/model',
         },
-        agentVariants: { oracle: 'high' },
+        agentVariants: { oracle: 'high', designer: 'medium', fixer: 'low' },
         inheritance: {
           'frontend-ui-ux-engineer': 'session',
           designer: 'session',
@@ -127,13 +127,13 @@ describe('saved session team view', () => {
       {
         title: 'designer',
         value: 'designer',
-        description: 'Inherits session model',
+        description: 'Inherits session model #medium',
       },
       { title: 'explorer', value: 'explorer', description: 'saved/model' },
       {
         title: 'fixer',
         value: 'fixer',
-        description: 'Inherits orchestrator model',
+        description: 'Inherits orchestrator model #low',
       },
       { title: 'oracle', value: 'oracle', description: 'saved/model #high' },
       expect.objectContaining({ value: '__omo_back__' }),

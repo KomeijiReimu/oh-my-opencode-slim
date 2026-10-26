@@ -138,11 +138,14 @@ describe('window-local sidebar team', () => {
           custom_b: 'saved/custom-model',
         },
         agentVariants: {
+          designer: 'medium',
+          fixer: 'low',
+          oracle: 'high',
           explore: 'low',
           librarian: 'medium',
           explorer: 'high',
         },
-        inheritance: {},
+        inheritance: { designer: 'session', fixer: 'orchestrator' },
       },
     };
     const savedBefore = structuredClone(saved);
@@ -162,8 +165,15 @@ describe('window-local sidebar team', () => {
         orchestrator: 'capture/root',
         custom_a: 'saved/custom-model',
         custom_b: 'saved/custom-model',
+        designer: 'Inherits session',
+        fixer: 'Inherits orchestrator',
       });
-      expect(projected.agentVariants).toEqual({ explorer: 'high' });
+      expect(projected.agentVariants).toEqual({
+        explorer: 'high',
+        designer: 'medium',
+        fixer: 'low',
+        oracle: 'high',
+      });
       expect(getSidebarAgentTargets(projected, 'ses_root')).toMatchObject([
         {
           agentName: 'explorer',
@@ -212,6 +222,9 @@ describe('window-local sidebar team', () => {
         );
         expect(frame).toContain('team-model');
         expect(frame.match(/Research Lead/g)).toHaveLength(1);
+        expect(frame).toMatch(/Inherits session\s+variant\s+medium/);
+        expect(frame).toMatch(/Inherits orchestrator\s+variant\s+low/);
+        expect(frame).toMatch(/team-model\s+variant\s+high/);
         expect(frame).toContain('Task: actual/task-model');
         expect(frame.match(/\bexplorer\b/g)).toHaveLength(1);
         expect(frame.match(/custom reviewer/g)).toHaveLength(2);

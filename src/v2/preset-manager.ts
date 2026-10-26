@@ -609,9 +609,7 @@ export function sessionTeamRows(
     .map((agent) => ({
       title: agent,
       value: agent,
-      description: inheritance[agent]
-        ? `Inherits ${inheritance[agent]} model`
-        : `${models[agent] ?? 'Unknown'}${variants[agent] ? ` #${variants[agent]}` : ''}`,
+      description: `${inheritance[agent] ? `Inherits ${inheritance[agent]} model` : (models[agent] ?? 'Unknown')}${variants[agent] ? ` #${variants[agent]}` : ''}`,
     }));
 }
 

@@ -511,10 +511,11 @@ export function createSessionPresets(options: {
             ),
             agentVariants: Object.fromEntries(
               Object.entries(record.bundle.profiles).flatMap(
-                ([agent, profile]) =>
-                  profile.model?.variant
-                    ? [[agent, profile.model.variant]]
-                    : [],
+                ([agent, profile]) => {
+                  const variant =
+                    profile.model?.variant ?? profile.sidebarVariant;
+                  return variant === undefined ? [] : [[agent, variant]];
+                },
               ),
             ),
             inheritance: { ...record.bundle.inheritance },

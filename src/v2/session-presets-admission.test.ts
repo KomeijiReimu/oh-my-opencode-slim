@@ -113,6 +113,47 @@ async function managedFixture() {
   };
 }
 
+test('saved team display retains inherited sidebar variants without rewriting the bundle', async () => {
+  const f = storageFixture();
+  const saved: SessionTeamBundle = {
+    ...bundle('A'),
+    profiles: {
+      explorer: { sidebarModel: 'Inherits session', sidebarVariant: 'medium' },
+      fixer: { sidebarModel: 'Inherits orchestrator', sidebarVariant: 'low' },
+      oracle: {
+        model: { providerID: 'test', id: 'A', variant: 'high' },
+        sidebarModel: 'test/A',
+      },
+    },
+    inheritance: { explorer: 'session', fixer: 'orchestrator' },
+  };
+  const before = structuredClone(saved);
+  const presets = createSessionPresets({
+    storage: f.storage,
+    session: {
+      get: async () => ({ id: 'root', directory: '/project' }),
+    } as never,
+    directory: '/project',
+    current: () => saved,
+    named: async () => saved,
+  });
+  try {
+    await presets.ensure('root');
+    const storedBefore = structuredClone(f.values);
+    const writes = f.writes();
+    expect((await presets.readState('root')).team).toEqual({
+      agentModels: { oracle: 'test/A' },
+      agentVariants: { explorer: 'medium', fixer: 'low', oracle: 'high' },
+      inheritance: saved.inheritance,
+    });
+    expect(saved).toEqual(before);
+    expect(f.values).toEqual(storedBefore);
+    expect(f.writes()).toBe(writes);
+  } finally {
+    await presets.dispose();
+  }
+});
+
 describe('authorized managed resume boundary', () => {
   test('native automatic model resolves without a persisted selection at revision zero and after options-only transition', async () => {
     const f = storageFixture();
